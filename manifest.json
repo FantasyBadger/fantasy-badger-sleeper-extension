@@ -1,0 +1,61 @@
+{
+  "manifest_version": 3,
+  "name": "Fantasy Badger: Sleeper Companion",
+  "version": "2026.10.11.750",
+  "version_name": "2026.10.11.0750",
+  "description": "A better Sleeper on the web: managing your team is easier \u2014 lineup calls with the points at stake, ranked wire, live win odds.",
+  "author": "Fantasy Badger",
+  "homepage_url": "https://fantasybadger.com",
+  "action": {
+    "default_icon": {
+      "16": "icons/badger-icon.png",
+      "48": "icons/badger-icon.png"
+    },
+    "default_title": "Fantasy Badger",
+    "default_popup": "popup.html"
+  },
+  "host_permissions": [
+    "https://sleeper.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://sleeper.com/leagues/*"
+      ],
+      "js": [
+        "fb-calc.js",
+        "changelog.js",
+        "league.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/badger-icon.png",
+    "48": "icons/badger-icon.png",
+    "128": "icons/badger-icon.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "league.css",
+        "icons/badger-mascot-128.png",
+        "fonts/ibm-plex-mono-400-latin-ext.woff2",
+        "fonts/ibm-plex-mono-400-latin.woff2",
+        "fonts/ibm-plex-mono-600-latin-ext.woff2",
+        "fonts/ibm-plex-mono-600-latin.woff2",
+        "fonts/nunito-latin-ext.woff2",
+        "fonts/nunito-latin.woff2"
+      ],
+      "matches": [
+        "https://sleeper.com/*"
+      ]
+    }
+  ]
+}

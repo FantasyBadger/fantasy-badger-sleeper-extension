@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fantasy Badger</title>
+<style>
+/* The toolbar popup: one switch, in the league pages' own colours and faces. */
+@font-face { font-family: 'Nunito'; font-weight: 600 800; font-display: swap; src: url(fonts/nunito-latin.woff2) format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-weight: 600; font-display: swap; src: url(fonts/ibm-plex-mono-600-latin.woff2) format('woff2'); }
+:root { color-scheme: dark; --card: #1a2030; --card-2: #202737; --line: #2a3345; --line-2: #354060; --ink: #e6ebf2; --ink-2: #a3aec1; --ink-3: #8591a7; --teal: #20ceb8; --teal-ink: #0d1117; }
+* { box-sizing: border-box; }
+body { margin: 0; width: 300px; background: var(--card); color: var(--ink); font: 600 13px 'Nunito', system-ui, -apple-system, 'Segoe UI', sans-serif; }
+header { display: flex; align-items: center; gap: 9px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+header img { width: 26px; height: 26px; }
+header b { font-weight: 800; font-size: 14px; }
+header span { margin-left: auto; font: 600 11px 'IBM Plex Mono', ui-monospace, Menlo, monospace; color: var(--ink-3); }
+.row { display: flex; align-items: center; gap: 12px; padding: 12px 14px; }
+.row .t { flex: 1; min-width: 0; }
+.row .t b { display: block; font-weight: 800; font-size: 13.5px; }
+.row .t small { display: block; color: var(--ink-3); font-size: 12px; line-height: 1.35; margin-top: 2px; }
+.state { font: 600 11px 'IBM Plex Mono', ui-monospace, Menlo, monospace; letter-spacing: .06em; color: var(--ink-2); width: 26px; text-align: right; }
+button.sw { all: unset; width: 40px; height: 22px; border-radius: 11px; position: relative; flex: none; border: 1px solid var(--line-2); background: var(--card-2); cursor: pointer; box-sizing: border-box; }
+button.sw::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--ink-3); transition: left .15s; }
+button.sw[aria-checked="true"] { background: var(--teal); border-color: var(--teal); }
+button.sw[aria-checked="true"]::after { left: 20px; background: var(--teal-ink); }
+button.sw:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { button.sw::after { transition: none; } }
+</style>
+</head>
+<body>
+<header><img id="icon" alt=""><b>Fantasy Badger</b><span id="ver"></span></header>
+<div class="row">
+  <div class="t"><b id="lab">Fantasy Badger on Sleeper</b><small id="say">Your league pages open in Fantasy Badger.</small></div>
+  <span class="state" id="state" aria-hidden="true">ON</span>
+  <button class="sw" id="sw" role="switch" aria-checked="true" aria-labelledby="lab"></button>
+</div>
+<script src="popup.js"></script>
+</body>
+</html>
