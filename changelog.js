@@ -7,6 +7,21 @@
 // say adds none and rides under the latest one.
 globalThis.BADGER_NOTES = [
     {
+        v: '2026.10.12', when: 'October 12, 2026', title: 'Numbers that say where a player stands',
+        items: [
+            'A new top bar: the pages on the left, <b>Transactions</b> and <b>Chat</b> as buttons on the right, and a <b>Badger</b> menu in the corner for the layout switch, What’s new and feedback. The week picker moved onto the pages that use it.',
+            '<b>Usage</b> on Team and Players is one table with the same columns in the same places for every position, led by <b>OPP PTS</b>: what a player’s share of his offence is usually worth in your league’s scoring. Point at a column header for what it means and how this season’s players at his position compare.',
+            'Every usage number is drawn by where it ranks at his position: bold for the top group, plain for a starter in your league, grey and dim below that. Point at a number for his exact rank, and stay there to see his season week by week against the top group, a typical starter and the middle of his position.',
+            'A rate such as yards per target is ranked only with enough work behind it, so one long catch no longer looks like the best in the league.',
+            'Two quick filters on Players: <b>Underperforming</b>, a starter’s opportunity without the points yet, and <b>Overperforming</b>, late picks scoring well above their workload.',
+            'Standings can count the week in progress as it is projected to finish. <b>Week N as projected</b> gives each game to the team projected to win it, not to the one ahead on the scoreboard with fewer players left.',
+            'An injury designation keeps up during the games: a player ruled out mid-game shows as Out without reloading the page.',
+            'The Scoreboard link says <b>LIVE</b> while games are on, overtime plays read OT, and the play log runs in the order the plays happened.',
+            'Transactions and Chat open under the top bar, so the bar and its menus stay in reach.',
+            'On your roster, the Insight column shows with projections, where it helps set a lineup. Actual and Usage give its room to the numbers.',
+        ],
+    },
+    {
         v: '2026.10.8', when: 'October 8, 2026', title: 'Claims, adds and trades in one place',
         items: [
             'A <b>Transactions</b> tab (⇄) next to Players: your claims and trade offers, what’s waiting on you, and the league’s waiver results and trades.',

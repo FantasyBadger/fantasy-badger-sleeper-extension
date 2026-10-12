@@ -1,4 +1,4 @@
-// The service worker. It puts the What's new dot on the league menu after an
+// The service worker. It puts the What's new dot on the Badger button after an
 // update, and marks the toolbar icon OFF while the popup's switch is off.
 
 // ─── the toolbar switch ──────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ chrome.runtime.onInstalled.addListener(showSwitch);
 chrome.storage.onChanged.addListener((ch, area) => { if (area === 'local' && 'badgerOff' in ch) showSwitch(); });
 
 // What's new: an update that brings notes newer than the version you had puts
-// a dot on the league menu until they are opened. The version is the date and
+// a dot on the Badger button until they are opened. The version is the date and
 // the time of day, and the notes are keyed by the date, so "newer" is a plain
 // comparison of the first three numbers. A fresh install shows none: the store
 // listing already did the introducing. An update with nothing new to say

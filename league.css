@@ -7,6 +7,7 @@
   --bg: #0f131b; --bg-2: #151a24; --card: #1a2030; --card-2: #202737; --line: #2a3345; --line-2: #354060;
   --ink: #e6ebf2; --ink-2: #a3aec1; --ink-3: #8591a7; --teal: #20ceb8; --teal-ink: #0d1117;
   --amber: #e8b04b; --red: #ef5a5a; --green: #4fc46c; --blue: #5b9cf5;
+  --top: #a6f4ea;   /* a number at the top of its position: a pale teal, nobody's warning and not the badge's teal */
   --qb: #ff2a6d; --rb: #00ceb8; --wr: #58a7ff; --te: #ffae58; --k: #bd66ff; --def: #7988a1;   /* Sleeper's own */
   --sans: 'Nunito', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --mono: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
@@ -26,13 +27,15 @@
 .bl .hidden { display: none !important; }
 
 /* top bar */
-.bl .topbar { display: flex; align-items: center; gap: 18px; padding: 10px 18px; background: var(--bg-2); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 30; }
-.bl .topbar .icons, .bl .topbar .week, .bl .topbar .nav { flex: none; }   /* nothing in the bar wraps when it squeezes */
+.bl .topbar { display: flex; align-items: center; gap: 18px; padding: 10px 18px; background: var(--bg-2); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 65; }   /* over an open drawer, so the bar's menus open across one; under a dialog */
+.bl .topbar .icons, .bl .topbar .nav { flex: none; }   /* nothing in the bar wraps when it squeezes: the league's name gives way */
 .bl .brand small { white-space: nowrap; }
+.bl .brand { min-width: 0; }
 .bl .brand > div { min-width: 0; }
+.bl .brand .bname { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bl .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; cursor: pointer; position: relative; background: var(--card-2); border: 1px solid var(--line-2); border-radius: 10px; padding: 5px 9px; }
 .bl .brand:hover { border-color: #3f4c6e; }
-.bl .brand .lg { width: 30px; height: 30px; border-radius: 8px; background: #1c5b7a; display: grid; place-items: center; font-size: 14px; overflow: hidden; }
+.bl .brand .lg { flex: none; width: 30px; height: 30px; border-radius: 8px; background: #1c5b7a; display: grid; place-items: center; font-size: 14px; overflow: hidden; }
 .bl .brand .lg img { width: 100%; height: 100%; object-fit: cover; }
 .bl .brand small { color: var(--ink-3); font-weight: 700; font-size: 11px; display: block; }
 .bl .brand .caret { margin-left: 4px; }
@@ -44,13 +47,72 @@
 .bl .nav { display: flex; gap: 4px; margin-left: 8px; }
 .bl .nav a { padding: 6px 12px; border-radius: 8px; font-weight: 700; color: var(--ink-2); font-size: 13.5px; cursor: pointer; }
 .bl .nav a.on { background: var(--card-2); color: var(--ink); }
+.bl .nav a .navlive { display: inline-flex; align-items: center; gap: 5px; margin-left: 7px; font: 700 11px var(--mono); letter-spacing: .08em; color: var(--red); }   /* NFL games are being played */
+.bl .nav a .navlive i { width: 7px; height: 7px; border-radius: 50%; background: var(--red); flex: none; }
+/* which way a number went, before it: a share against the season under the last four games (up or down; nothing when it held), and any ranked number's last four games against the season */
+.bl td .trend, .bl .gloss .trend { font: 700 11px var(--mono); margin-right: 2px; color: var(--ink-3); }   /* tight, so a four-figure number still fits beside it */
+.bl td .trend.up, .bl .gloss .trend.up { color: var(--teal); }
+.bl td .trend.down, .bl .gloss .trend.down { color: var(--red); }
+/* A number drawn at its level at the position (levelOf in league.js): bold and faintly teal inside the top
+   twelve, plain among the players this league starts, grey for the next twelve, dim beyond. Weight marks the
+   top and brightness the rest, so it reads the same without the hue. His rank is said on hover. */
+.bl table td.lv1, .bl .lvkey .lv1 { color: var(--top); font-weight: 600; }
+.bl table td.lv2, .bl .lvkey .lv2 { color: var(--ink); font-weight: 400; }
+.bl table td.lv3, .bl .lvkey .lv3 { color: #b0bbcc; font-weight: 400; }
+.bl table td.lv4, .bl .lvkey .lv4 { color: var(--ink-3); font-weight: 400; }
+.bl table td.lv0 { color: var(--ink-3); font-weight: 400; }   /* a rate with too little work behind it: not ranked, and never bold */
+.bl .lvkey { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.bl .lvkey b { font-family: var(--mono); font-size: 11px; }
 .bl .nav a .cnt { background: var(--amber); color: var(--teal-ink); border-radius: 99px; font-size: 10px; padding: 0 6px; margin-left: 5px; font-weight: 800; }
-.bl .week { margin-left: auto; display: inline-flex; align-items: center; gap: 2px; background: var(--card); border: 1px solid var(--line); border-radius: 99px; padding: 3px 6px; font-weight: 800; font-size: 13px; white-space: nowrap; flex: none; }
-.bl .week button { background: var(--card-2); border: none; border-radius: 99px; width: 22px; height: 22px; display: grid; place-items: center; color: var(--ink-2); font-size: 12px; cursor: pointer; }
-.bl .icons { display: flex; gap: 6px; }
-.bl .ic { width: 32px; height: 32px; border-radius: 8px; background: var(--card); border: 1px solid var(--line); display: grid; place-items: center; color: var(--ink-2); font-size: 13px; position: relative; cursor: pointer; }
-.bl .ic .dot { position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
-.bl .ic.orig { width: auto; padding: 0 11px; font-size: 11px; font-weight: 800; letter-spacing: 0.04em; white-space: nowrap; }
+.bl .icons { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+/* What opens a drawer: a mark and its word, side by side. */
+.bl .tool { display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 10px; border-radius: 8px; background: var(--card); border: 1px solid var(--line); color: var(--ink-2); font: 700 13px var(--sans); white-space: nowrap; cursor: pointer; position: relative; }
+.bl .tool svg { width: 16px; height: 16px; flex: none; }
+.bl .tool:hover { border-color: #3f4c6e; color: var(--ink); }
+.bl .tool.open { background: rgba(32,206,184,.10); border-color: var(--teal); color: var(--ink); }   /* its drawer is open: press again to close */
+.bl .tool:focus-visible, .bl .opener:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+.bl .tool .cnt { background: var(--amber); color: var(--teal-ink); border-radius: 99px; font-size: 11px; padding: 0 6px; font-weight: 800; }
+.bl .tool.tx.hot { border-color: rgba(232,176,75,.6); color: var(--amber); }
+.bl .tool.tx.open { background: rgba(232,176,75,.12); border-color: var(--amber); color: var(--amber); }
+.bl .tool .txrundot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); flex: none; }
+/* The Badger menu: a field with the drawn caret, like every other menu opener. */
+.bl .bwrap { position: relative; }
+.bl .opener { display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 10px 0 5px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--card-2); color: var(--ink); font: 800 13px var(--sans); white-space: nowrap; cursor: pointer; position: relative; }
+.bl .opener:hover { border-color: #3f4c6e; }
+.bl .opener.open { border-color: var(--teal); }
+.bl .opener .udot { position: absolute; top: -4px; right: -4px; width: 8px; height: 8px; border-radius: 50%; background: var(--teal); border: 2px solid var(--bg-2); }
+.bl .bchip { display: grid; place-items: center; border-radius: 6px; background: var(--teal); flex: none; }
+.bl .bchip img { display: block; }
+.bl .menu.bmenu { top: 40px; left: auto; right: 0; width: 340px; display: flex; flex-direction: column; gap: 2px; cursor: default; }
+.bl .bmenu .bmhead { display: flex; align-items: center; gap: 9px; padding: 8px 10px 9px; }
+.bl .bmenu .bmhead b { font-weight: 800; font-size: 14px; }
+.bl .bmenu .bmver { margin-left: auto; font: 600 11.5px var(--mono); color: var(--ink-3); }
+.bl .bmenu .sep { margin: 3px 0; }
+.bl .bmenu .bmhd { font: 700 11px var(--mono); letter-spacing: .1em; color: var(--ink-3); padding: 9px 10px 6px; }
+.bl .bmenu .bmnote { margin: 0; font-size: 12px; line-height: 1.4; font-weight: 600; color: var(--ink-3); padding: 7px 10px 8px; }
+.bl .bmenu a.bmrow { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 7px; cursor: pointer; }
+.bl .bmenu a.bmrow.hi { background: var(--card-2); }
+.bl .bmenu a:focus-visible, .bl .ltog button:focus-visible { outline: 2px solid var(--teal); outline-offset: 1px; }
+.bl .bmenu .bmt { flex: 1; min-width: 0; }
+.bl .bmenu .bmt b { display: block; font-weight: 700; font-size: 13px; }
+.bl .bmenu .bmt small { display: block; font-weight: 600; font-size: 12px; color: var(--ink-3); }
+.bl .bmenu .bmstamp { font: 700 11px var(--mono); color: var(--ink-2); letter-spacing: .04em; white-space: nowrap; }
+.bl .bmenu .bmnew { font: 700 11px var(--mono); letter-spacing: .06em; color: var(--teal-ink); background: var(--teal); border-radius: 4px; padding: 1px 5px; flex: none; }
+.bl .bmenu svg.bmout { width: 13px; height: 13px; color: var(--ink-3); flex: none; }
+.bl .bmenu .bmfoot { display: flex; align-items: center; gap: 4px; padding: 2px 2px 2px; }
+.bl .bmenu .bmfoot a { display: inline-block; padding: 6px 8px; font-size: 12px; font-weight: 700; color: var(--ink-2); white-space: nowrap; cursor: pointer; }
+.bl .bmenu .bmfoot a:hover { color: var(--ink); }
+/* Badger | Sleeper, at the menu's width, the layout on screen lit. */
+.bl .ltog { display: flex; align-items: center; gap: 2px; height: 36px; margin: 0 10px; padding: 2px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--bg-2); }
+.bl .ltog button { flex: 1; height: 30px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 6px; background: none; color: var(--ink-2); font: 800 11.5px var(--sans); letter-spacing: .04em; white-space: nowrap; cursor: pointer; }
+.bl .ltog button.lit { background: var(--teal); color: var(--teal-ink); cursor: default; }
+.bl .ltog button:not(.lit):hover { color: var(--ink); background: var(--card-2); }
+.bl .ltog img { width: 16px; height: 16px; display: block; }
+.bl .ltog .smark { width: 14px; height: 17px; display: inline-block; background: url(https://sleepercdn.com/images/v2/logos/logo_with_text_2.png) left center / auto 17px no-repeat; }
+/* As the window narrows the two drawer buttons drop their words (their tooltips
+   keep them), then the league's small line goes; the name ends in an ellipsis. */
+@media (max-width: 1080px) { .bl .tool .lbl { display: none; } .bl .tool { padding: 0 9px; } }
+@media (max-width: 900px) { .bl .brand small { display: none; } .bl .topbar { gap: 12px; } .bl .nav a { padding: 6px 9px; } }
 
 /* page grids */
 .bl .page { padding: 18px; display: grid; gap: 14px; max-width: 2200px; margin: 0 auto; }
@@ -174,7 +236,7 @@
 .bl input.bid { width: 72px; text-align: right; font-family: var(--mono); }
 
 /* drawer, toast, modal */
-.bl .drawer { position: fixed; right: 0; top: 0; bottom: 0; width: 360px; background: var(--card); border-left: 1px solid var(--line-2); box-shadow: -18px 0 40px rgba(0,0,0,0.5); z-index: 60; display: flex; flex-direction: column; }
+.bl .drawer { position: fixed; right: 0; top: var(--bar-h, 68px); bottom: 0; width: 360px; background: var(--card); border-left: 1px solid var(--line-2); box-shadow: -18px 0 40px rgba(0,0,0,0.5); z-index: 60; display: flex; flex-direction: column; }
 .bl .drawer .dh { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 800; }
 .bl .drawer .db { flex: 1; overflow-y: auto; padding: 8px 14px; display: flex; flex-direction: column; gap: 2px; }
 .bl .drawer .df { padding: 10px 14px; border-top: 1px solid var(--line); display: flex; gap: 6px; }
@@ -345,9 +407,6 @@
    gold and carry the champion where a week would carry its number. */
 .bl .mi.sea .tro { color: #e5c15a; margin-right: 6px; }
 .bl .mi.sea:hover { background: rgba(240,192,64,.07); }
-.bl .mi.back { color: var(--teal); }
-.bl .ddbtn.vault { color: #e5c15a; }
-.bl .ddbtn .yr { color: var(--ink-3); font-weight: 700; }
 .bl .pdscroll { max-height: 160px; overflow-y: auto; }
 .bl td.oppc { line-height: 1.15; white-space: nowrap; }
 .bl td.oppc div:first-child { font-weight: 600; }
@@ -463,11 +522,6 @@
 .bl .mcard .wbar i.b { background: var(--blue, #5b9cf5); }
 
 /* topbar week dropdown: right-anchored period menu, weeks only */
-.bl .pdd.right .pdmenu { left: auto; right: 0; }
-.bl .week .pdd { display: inline-flex; }
-.bl .week .pdd .ddbtn { display: inline-flex; align-items: center; gap: 4px; width: auto; min-width: 0; white-space: nowrap; background: var(--card-2); border: 1px solid var(--line-2); border-radius: 99px; padding: 2px 9px; font-weight: 800; font-size: 13px; color: var(--ink); cursor: pointer; }
-.bl .week .pdd .ddbtn:hover { border-color: #3f4c6e; }
-.bl .week .pdd .ddbtn .dim { color: var(--ink-2); font-size: 11px; }
 
 /* opponent difficulty rank */
 .bl .oprk { font-size: 9.5px; font-weight: 600; margin-left: 5px; font-family: var(--mono); }
@@ -1404,13 +1458,6 @@
 .bl .gloss { display: flex; flex-wrap: wrap; gap: 5px 16px; padding: 8px 4px 2px; font-size: 11px; color: var(--ink-3); }
 .bl .gloss b { color: var(--ink-2); font-family: var(--mono); font-size: 10.5px; }
 
-/* The column to scan first for a position (keyColFor in league.js). Teal text
-   already means "sorted", so this one is marked differently: the brightest header
-   with a teal bar under it, and its values at full strength on a faint teal wash.
-   The wash is an inset shadow, so the row-hover background cannot wipe it. */
-.bl table.dense th.keycol { color: var(--ink); font-weight: 800; box-shadow: inset 0 -2px 0 var(--teal); }
-.bl table.dense th.keycol.sort { color: var(--teal); }
-.bl table.dense td.keycol { color: var(--ink); font-weight: 700; box-shadow: inset 0 0 0 999px rgba(32, 206, 184, 0.07); }
 .bl .ublock { margin-top: 12px; }
 .bl .uhead { display: grid; grid-template-columns: minmax(0, 1fr) 150px 46px 46px 46px; gap: 8px; font-size: 8.5px; font-weight: 800; letter-spacing: 0.08em; color: var(--ink-3); text-align: right; margin: 8px 0 3px; }
 .bl .uhead span:first-child { text-align: left; }
@@ -1426,7 +1473,7 @@
 .bl .udots .pd.top { fill: var(--ink-2); opacity: 1; }
 .bl .ustrip .pd:hover { fill: var(--ink); opacity: 1; }
 .bl .udots .st { fill: var(--ink-2); }
-.bl .udots .tp { fill: var(--amber); }
+.bl .udots .tp { fill: var(--top); }
 .bl .udots .me line { stroke: var(--teal); stroke-width: 2; }
 .bl .udots .me circle { fill: var(--card); stroke: var(--teal); stroke-width: 2; }
 /* his games under the week's number: pinned below it, so the three numbers stay level and the row keeps its height */
@@ -1456,6 +1503,29 @@
 .bl [data-tip]:focus-visible { box-shadow: 0 0 0 2px var(--teal); border-radius: 3px; }
 .bl .btip { position: fixed; z-index: 90; width: 320px; background: #232b3d; border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; box-shadow: 0 10px 30px rgba(0,0,0,.45); pointer-events: none; text-align: left; white-space: normal; letter-spacing: 0; text-transform: none; font-weight: 600; }
 .bl .btip[hidden] { display: none; }
+.bl .btip.cell { width: auto; max-width: 300px; }   /* a number's own: his rank, and a line or two */
+.bl .btip.cell p:last-child { margin-bottom: 0; }
+/* held there, a number's tooltip draws his season: his games against the position's marks */
+.bl .btip.cell.more { width: 300px; }
+.bl .bt-chart { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line-2); }
+.bl .bt-cap { font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 2px; }
+.bl .bt-note { font-size: 11px; color: var(--ink-3); margin-top: 2px; }
+.bl .btip p.bt-wait { color: var(--ink-3); margin: 8px 0 0; }
+.bl .tsp { display: block; overflow: visible; }
+.bl .tsp .ax { stroke: var(--line-2); stroke-width: 1; }
+.bl .tsp .band { fill: rgba(32,206,184,0.10); }
+.bl .tsp .ln { fill: none; stroke: var(--teal); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+.bl .tsp .pt { fill: var(--teal); }
+.bl .tsp .pt.thin { fill: #232b3d; stroke: var(--teal); stroke-width: 1.3; }
+.bl .tsp .gap { stroke: var(--ink-3); stroke-width: 1.5; }
+.bl .tsp line.rt { stroke: var(--top); stroke-width: 1; }
+.bl .tsp line.rs { stroke: var(--ink-2); stroke-width: 1; stroke-dasharray: 3 2; }
+.bl .tsp line.rm { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 1 3; }
+.bl .tsp text { font: 600 10px var(--mono); }
+.bl .tsp text.lrt { fill: var(--top); }
+.bl .tsp text.lrs { fill: var(--ink-2); }
+.bl .tsp text.lrm { fill: var(--ink-3); }
+.bl .tsp text.wk { font-size: 9px; fill: var(--ink-3); text-anchor: middle; }
 .bl .bt-h { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
 .bl .bt-h b { font-size: 13.5px; font-weight: 900; color: var(--ink); }
 .bl .bt-h span { font-size: 8.5px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
@@ -1470,49 +1540,15 @@
 .bl .filters.fbrow { row-gap: 8px; column-gap: 10px; }
 .bl .filters.fbrow + .filters.fbrow { margin-top: 8px; }
 /* a second line under a number: "from 47%" when a role moved, "3 g" when short of four */
-/* Advanced on the Team page: his rank at the position under each number, the key column lit */
-.bl table.fixedcols td .pc { display: block; height: 3px; margin-top: 3px; border-radius: 2px; background: #262e40; position: relative; overflow: hidden; }
-.bl table.fixedcols td .pc i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; background: var(--ink-3); }
-.bl table.fixedcols td.keycol { color: var(--ink); font-weight: 700; box-shadow: inset 0 0 0 999px rgba(32, 206, 184, 0.07); }
-.bl table.fixedcols td.keycol .pc i { background: var(--teal); }
-.bl table.fixedcols td.lbl.keycol { color: var(--ink); box-shadow: inset 0 -2px 0 var(--teal); }
-.bl td .rk { display: block; font-size: 11px; font-weight: 600; color: var(--ink-3); margin-top: 1px; line-height: 1.1; }
 .bl td .was { display: block; font-size: 9.5px; font-weight: 700; margin-top: 1px; color: var(--ink-3); line-height: 1.1; }
 .bl td .was.up { color: var(--teal); }
 .bl td .was.down { color: var(--red); }
 /* snap share, last 4 vs season */
-.bl .snapcard { margin-bottom: 14px; }
-.bl .snapcard .dbl { display: grid; grid-template-columns: 200px minmax(140px, 1fr) 150px; gap: 12px; align-items: center; padding: 6px 0; border-top: 1px solid var(--line); }
-.bl .snapcard .dbl:first-of-type { border-top: 0; }
-.bl .snapcard .dbw { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 800; font-size: 12.5px; cursor: pointer; }
-.bl .snapcard .dbw span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bl .snapcard .dbt { position: relative; height: 22px; }
-.bl .snapcard .dbt::before { content: ''; position: absolute; left: 0; right: 0; top: 10px; height: 2px; background: #262e40; border-radius: 1px; }
-.bl .snapcard .dbt .ln { position: absolute; top: 9px; height: 4px; border-radius: 2px; opacity: .45; background: var(--ink-2); }
-.bl .snapcard .dbt .dt { position: absolute; top: 5px; width: 12px; height: 12px; margin-left: -6px; border-radius: 50%; background: var(--ink-2); }
-.bl .snapcard .dbt .dt.s { background: var(--bg); border: 2px solid var(--ink-3); }
-.bl .snapcard .dbl.up .ln, .bl .snapcard .dbl.up .dt.a { background: var(--teal); }
-.bl .snapcard .dbl.down .ln, .bl .snapcard .dbl.down .dt.a { background: var(--red); }
-.bl .snapcard .dbv { font-size: 12px; font-weight: 700; text-align: right; line-height: 1.25; color: var(--ink-2); }
-.bl .snapcard .dbl.up .dbv { color: var(--teal); }
-.bl .snapcard .dbl.down .dbv { color: var(--red); }
-.bl .snapcard .dbv small { display: block; font-size: 10px; color: var(--ink-3); font-weight: 600; }
-.bl .snapcard .dbaxis { display: grid; grid-template-columns: 200px minmax(140px, 1fr) 150px; gap: 12px; font-size: 9px; color: var(--ink-3); margin-top: 2px; }
-.bl .snapcard .dbaxis div { display: flex; justify-content: space-between; }
-.bl .snapcard .dblegend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 10.5px; color: var(--ink-3); margin-top: 8px; }
-.bl .snapcard .dblegend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: -1px; margin-right: 5px; background: var(--ink-2); }
-.bl .snapcard .dblegend i.s { background: var(--bg); border: 2px solid var(--ink-3); }
-.bl .snapcard .dblegend i.up { background: var(--teal); }
-.bl .snapcard .dblegend i.down { background: var(--red); }
 /* quick views: chips beside the position filter, reasons on the row */
 .bl .sel.qchip i { font-style: normal; font-size: 10px; color: var(--ink-3); margin-left: 5px; }
 .bl .sel.qchip.on i { color: inherit; }
 .bl .sel.qchip.off { opacity: .45; cursor: default; }
 .bl .qtags { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-top: 3px; font-size: 10.5px; color: var(--ink-3); line-height: 1.3; }
-.bl .qtags .qtag { font-size: 8.5px; font-weight: 800; letter-spacing: .08em; border-radius: 4px; padding: 1px 5px; }
-.bl .qtags .qtag.strong { background: var(--teal); color: #0d1117; }
-.bl .qtags .qtag.cover { background: var(--card-2); color: var(--amber); border: 1px solid var(--line-2); cursor: help; }
-.bl .qtags .qtag.flash { background: var(--card-2); color: var(--ink-2); border: 1px solid var(--line-2); }
 
 /* the card's tabs */
 .bl .ctabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); margin: 2px 0 10px; }
@@ -1556,7 +1592,7 @@
 .bl table.glog tr.foldtr td { padding: 0; }
 .bl .foldlnk { display: inline-flex; align-items: center; gap: 7px; background: none; border: 0; padding: 9px 6px; font: 700 12px var(--sans); color: var(--teal); cursor: pointer; }
 .bl .foldlnk i.car { color: inherit; }
-/* a two-word strip label ("OPP RATING") wraps in the narrow Team columns rather than cutting off */
+/* a two-word strip label ("OPP PTS") wraps in the narrow Team columns rather than cutting off */
 .bl table.fixedcols tr.typerow td.lbl { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.15; vertical-align: bottom; }
 .bl .mu .sub .gsa { white-space: nowrap; }   /* one stat, one unit: the line wraps between them */
 .bl .mu td.me { padding-right: 16px; } .bl .mu td.op { padding-left: 16px; }   /* a gutter before the score, so a long line wraps rather than touching it */
@@ -1958,7 +1994,7 @@
 .bl .drawer button.x { color: var(--ink-3); cursor: pointer; font-size: 12px; flex: none; padding: 0 2px; }
 /* switcher counts */
 .bl .ucount { display: inline-block; margin-left: 6px; background: var(--red); color: #fff; border-radius: 99px; font: 800 10px var(--sans); padding: 0 6px; vertical-align: 1px; }
-.bl .ic .chatcnt { position: absolute; top: -5px; right: -6px; background: var(--red); color: #fff; border-radius: 99px; font: 800 10px var(--sans); padding: 0 5px; line-height: 15px; min-width: 15px; text-align: center; margin: 0; }
+.bl .tool .chatcnt { position: absolute; top: -5px; right: -6px; background: var(--red); color: #fff; border-radius: 99px; font: 800 10px var(--sans); padding: 0 5px; line-height: 15px; min-width: 15px; text-align: center; margin: 0; }
 /* trade status, now */
 .bl .tradec .tstat.open { background: rgba(232,176,75,.15); color: var(--amber); }
 .bl .tradec .tstat.accepted { background: rgba(79,196,108,.15); color: var(--green); }
@@ -2044,9 +2080,10 @@
 /* ── one look for anything that opens a menu ──────────────────────────────── */
 /* A control that opens a menu wears a field: a surface, a border and a caret.
    A control that folds something open in place stays a link with a chevron. */
-.bl .week .pdd .ddbtn { border-color: var(--teal); }
 /* the view row's week picker, with the stepper the top bar's week control has */
-.bl .pdd.pwk { display: inline-flex; align-items: center; gap: 4px; }
+.bl .pdd.pwk, .bl .wkc { display: inline-flex; align-items: center; gap: 4px; }
+.bl .wkc { flex: none; }
+.bl .wkc .ddbtn { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .bl .pstep { background: var(--card-2); border: 1px solid var(--line-2); border-radius: 7px; width: 24px; height: 25px; display: grid; place-items: center; color: var(--ink-2); font-size: 13px; line-height: 1; cursor: pointer; padding: 0; }
 .bl .pstep:hover:not([disabled]) { border-color: var(--teal); color: var(--ink); }
 .bl .pstep:focus-visible { outline: 2px solid var(--teal); outline-offset: 1px; }
@@ -2094,11 +2131,6 @@
    opponent, then this week's projection and rest of season in two fixed
    columns, then an action when the row has one. Section heads use the same
    trailing columns, so their labels sit over the numbers. */
-.bl .ic.txic { font-weight: 800; font-size: 15px; }
-.bl .ic.txic.hot { border-color: var(--amber); color: var(--amber); }
-.bl .ic.txic.on { background: var(--card-2); border-color: var(--line-2); color: var(--ink); }
-.bl .ic .txcnt { position: absolute; top: -5px; right: -6px; background: var(--amber); color: var(--teal-ink); border-radius: 99px; font: 800 10px var(--sans); padding: 0 5px; line-height: 15px; min-width: 15px; text-align: center; }
-.bl .ic .txrundot { position: absolute; top: 4px; right: 4px; width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
 .bl button.lnk { background: none; border: 0; padding: 0; color: var(--teal); font: 800 12px var(--sans); cursor: pointer; }
 .bl button.lnk:hover { text-decoration: underline; }
 .bl .txd .db { gap: 6px; padding: 8px 14px 16px; }
@@ -2259,17 +2291,7 @@
 .bl .txd .tdock .tcols { grid-template-columns: 1fr 1fr; }
 .bl .drawer.txd { max-width: 100vw; }
 
-/* ── the Transactions tab: the mark and a count, in the page tabs ───────────── */
-.bl .nav a.txtab { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-2); color: var(--ink-2); padding: 5px 10px; position: relative; }
-.bl .nav a.txtab .txmark { font-weight: 800; font-size: 15px; line-height: 1; }
-.bl .nav a.txtab .cnt { margin-left: 0; }
-.bl .nav a.txtab.hot { border-color: rgba(232,176,75,.6); color: var(--amber); }
-.bl .nav a.txtab.open { background: rgba(232,176,75,.12); border-color: var(--amber); color: var(--amber); }
-.bl .nav a.txtab:hover { border-color: var(--amber); }
-.bl .nav a.txtab:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
-.bl .nav a.txtab .txrundot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
 /* ── the league menu ──────────────────────────────────────────────────────── */
-.bl .brand .bdot { position: absolute; top: 6px; right: 6px; width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
 .bl .menu.lmenu { width: 330px; padding: 6px; }
 .bl .lmenu .lmhd { font: 700 10px var(--mono); letter-spacing: .1em; color: var(--ink-3); padding: 8px 10px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bl .lmenu a.lmrow { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 8px; min-width: 0; }
@@ -2285,9 +2307,6 @@
 .bl .lmenu .lmpast .yr { font: 700 13px var(--mono); flex: none; }
 .bl .lmenu .lmpast .ch { color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .bl .lmenu .lmpast .chev { margin-left: auto; color: var(--ink-3); flex: none; }
-.bl .lmenu .lmnotes { font-size: 13px; font-weight: 400; }
-.bl .lmenu .lmnotes .v { margin-left: auto; font: 700 11.5px var(--mono); color: var(--teal); }
-.bl .lmenu .ndot { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); flex: none; }
 /* ── what's new ───────────────────────────────────────────────────────────── */
 .bl .wnd .dh > span:first-child { font-weight: 800; }
 .bl .wnd .db { gap: 0; padding: 4px 16px 20px; }
@@ -2389,3 +2408,6 @@
 .bl .lgcard > .card-h.lgtabs > .btn { margin-bottom: 7px; flex: none; }
 .bl .lgcard h3.lgsec { margin: 4px 0 10px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
 .bl .lgcard h3.lgsec:not(:first-child) { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line); }
+
+/* the rank at his position, beside the points it ranks */
+.bl td .rki { font-size: 11px; font-weight: 600; color: var(--ink-3); margin-right: 7px; }

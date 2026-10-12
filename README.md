@@ -5,7 +5,7 @@ your team is easier. Set your lineup by picking two players instead of dragging;
 see what needs doing this week, with the points at stake; follow every matchup
 live, play by play; and research players with usage numbers built from Sleeper's
 own box scores. Everything is worked out for your league's own scoring and
-roster settings, and a toggle in the top right switches back to Sleeper's own
+roster settings, and the Badger menu in the top right switches back to Sleeper's own
 layout at any time.
 
 ## What it reads, and what it sends

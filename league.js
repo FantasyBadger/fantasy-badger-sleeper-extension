@@ -286,6 +286,43 @@ async function loadPlayers(force) {
     S.players = data; S.playersAt = Date.now();
     idbSet('players', { at: S.playersAt, data });
 }
+// A designation is as fresh as the last thing Sleeper sent about the player.
+// The player list above is read when the page opens, an hour old at most; the
+// week's stat and projection rows each carry the player as he stands now. So a
+// starter ruled out during his game kept the chip he kicked off with until the
+// page was reloaded. Each row that arrives brings his standing with it.
+const STANDING = ['injury_status', 'injury_body_part', 'injury_notes', 'injury_start_date', 'news_updated'];
+function foldStanding(pid, now) {
+    const pl = S.players && S.players[pid];
+    if (!pl || !now || !('injury_status' in now)) return false;
+    if (now.news_updated && pl.news_updated && now.news_updated < pl.news_updated) return false;   // the list already knows something later
+    const moved = (pl.injury_status || null) !== (now.injury_status || null) || (pl.injury_body_part || null) !== (now.injury_body_part || null);
+    for (const k of STANDING) if (k in now) pl[k] = now[k];
+    return moved;   // true when the designation itself changed
+}
+// That covers a player once he has a stat line. One who has none yet (his game
+// is still to come, or he was ruled out before it) would keep an old chip for
+// as long as the tab stays open. The week's projection rows carry everyone's
+// standing at a tenth of the player list's size on the wire, so they are read
+// again every ten minutes while a game of the current week kicks off within
+// three hours, and hourly otherwise. Only the standing is taken from them: the
+// projections on screen stay the ones the session loaded, which a player's
+// kickoff projection depends on.
+let standingsAt = 0;   // the last time the current week's rows were read
+const kickoffNear = () => {
+    const m = (S.kickByWeek || {})[S.curWeek] || {}, now = Date.now();
+    for (const t in m) { const g = m[t], at = g ? Date.parse(g.t) : NaN; if (g && !g.started && at - now < 3 * 3600e3 && at - now > -900e3) return true; }
+    return false;
+};
+const standingsDue = () => S.seasonType === 'regular' && !!S.players && !!S.league && Date.now() - standingsAt >= (kickoffNear() ? 600e3 : 3600e3);
+async function refreshStandings() {
+    standingsAt = Date.now();
+    const list = await rest(weekProjUrl(S.curWeek)).catch(() => null);
+    if (!Array.isArray(list)) return false;
+    let moved = false;
+    for (const x of list) if (foldStanding(String(x.player_id), x.player)) moved = true;
+    return moved;
+}
 const P = (pid) => (S.players && S.players[pid]) || (/^[A-Z]{2,3}$/.test(pid) ? { player_id: pid, position: 'DEF', team: pid, first_name: pid, last_name: 'D/ST', full_name: `${pid} D/ST`, fantasy_positions: ['DEF'] } : null);
 const pname = (pid) => { const p = P(pid); return p ? (p.position === 'DEF' ? `${p.team || pid} D/ST` : `${p.first_name || ''} ${p.last_name || ''}`.trim()) : pid; };
 const ppos = (pid) => { const p = P(pid); return p ? p.position : '?'; };
@@ -303,16 +340,17 @@ function scoreStats(stats) {
     // tight end who ran 38 routes and caught nothing.
     return stats.pts_half_ppr ?? stats.pts_ppr ?? stats.pts_std ?? ((stats.gp > 0 || stats.off_snp > 0) ? 0 : null);
 }
+const weekProjUrl = (week) => `${API2}/projections/nfl/${S.season}/${week}?season_type=regular&position[]=QB&position[]=RB&position[]=WR&position[]=TE&position[]=K&position[]=DEF&order_by=pts_half_ppr`;
 async function loadProj(week) {
     if (S.proj[week]) return;
     // Nothing can be scored before the league's scoring settings are in hand —
     // scoreStats returns null without them, and this map is baked once and read
     // all session. Fetching now would cache a league that scores nothing.
     if (!S.league) return;
-    const url = `${API2}/projections/nfl/${S.season}/${week}?season_type=regular&position[]=QB&position[]=RB&position[]=WR&position[]=TE&position[]=K&position[]=DEF&order_by=pts_half_ppr`;
-    const list = await rest(url);
+    const list = await rest(weekProjUrl(week));
     const m = {};
     for (const x of list) m[x.player_id] = { pts: scoreStats(x.stats), opp: x.opponent, game: x.game_id, team: x.team, stats: x.stats };
+    if (week === S.curWeek) { for (const x of list) foldStanding(String(x.player_id), x.player); standingsAt = Date.now(); }
     // An unscored answer is not an answer. scoreStats returns null until the
     // league's scoring settings are in hand, and fourteen of these go out at
     // once when the season sim warms up — so a week fetched a beat too early
@@ -336,6 +374,7 @@ async function loadStats(week) {
     const list = await rest(url).catch(() => []);
     const m = {};
     for (const x of list) m[x.player_id] = { pid: String(x.player_id), pts: scoreStats(x.stats), opp: x.opponent, stats: x.stats };
+    if (week === S.curWeek) for (const x of list) foldStanding(String(x.player_id), x.player);
     S.stats[week] = m;
 }
 async function loadSeasonProj() {
@@ -549,6 +588,9 @@ function gameFracLeft(pid) {
     // left to play (the kickoff map may also still be loading, or be another
     // week's); a week still to come is entirely ahead.
     if (!k) return S.week < S.curWeek ? 0 : 1;
+    return kickFracLeft(k);
+}
+function kickFracLeft(k) {
     if (k.over || k.q === 'F' || /complete|closed/i.test(k.status || '')) return 0;
     if (!k.started && !k.live && Date.parse(k.t) > Date.now()) return 1;
     const qn = k.qn || (/^[1-4]$/.test(k.q || '') ? Number(k.q) : null);
@@ -557,6 +599,27 @@ function gameFracLeft(pid) {
     const [mm, ss] = String(k.tr || '15:00').split(':').map(Number);
     const left = (4 - qn) * 15 + (isFinite(mm) ? mm + (isFinite(ss) ? ss : 0) / 60 : 15);
     return Math.max(0, Math.min(1, left / 60));
+}
+// What a roster's week in progress counts for in the standings: its projected
+// final, the points it has plus the unplayed remainder of its starters'
+// projections. The score so far credited whoever had played more men: ahead by
+// ten with the other side's quarterback still to come is not a win. It reads
+// the live week's own kickoff map and projections, whichever week the viewer
+// is looking at. With neither in hand there is nothing to project with, and
+// the score so far stands; the switch then says "as it stands".
+const liveWeekKicks = () => (S.curWeek === S.kickWeek ? S.kick : (S.kickByWeek || {})[S.curWeek]) || null;
+const liveWeekProjects = () => !!(S.proj[S.curWeek] && liveWeekKicks());
+const liveWord = () => (liveWeekProjects() ? 'as projected' : 'as it stands');
+function countedPoints(m) {
+    const R = rosterById(m.roster_id), km = liveWeekKicks(), pj = S.proj[S.curWeek];
+    if (!R || !km || !pj) return m.points || 0;
+    let tot = 0;
+    for (const pid of muStarters(R, m)) {
+        if (!pid || pid === '0') continue;
+        const k = km[(P(pid) || {}).team], got = (m.players_points || {})[pid] || 0, left = k ? kickFracLeft(k) : (got ? 0 : 1);
+        tot += (left < 1 ? got : 0) + ((pj[pid] || {}).pts || 0) * left;
+    }
+    return Math.round(tot * 100) / 100;
 }
 // A roster's projected final: what it has actually scored, plus the unplayed
 // remainder of every starter's projection.
@@ -810,14 +873,14 @@ const faabLeft = (r) => Math.max(0, ((S.league.settings || {}).waiver_budget || 
 const rosterRank = (lv) => S.rosters.slice().sort((a, b) => lv
     ? (lv[b.roster_id].w - lv[a.roster_id].w) || (lv[b.roster_id].pf - lv[a.roster_id].pf)
     : (b.settings.wins - a.settings.wins) || (pf(b) - pf(a)));
-// Every roster with the week in progress counted as it stands: the settled record
-// and points, plus this week's game so far (the current leader takes it).
+// Every roster with the week in progress counted: the settled record and points,
+// plus this week's game at its projected final (whoever is projected to win takes it).
 function liveStand() {
     const out = {}, ms = S.matchups[S.curWeek] || [];
     for (const R of S.rosters) out[R.roster_id] = { w: R.settings.wins || 0, l: R.settings.losses || 0, t: R.settings.ties || 0, pf: pf(R), pa: pa(R), res: null, pts: 0, opp: 0 };
     const by = {}; for (const m of ms) if (m.matchup_id != null) (by[m.matchup_id] = by[m.matchup_id] || []).push(m);
     for (const pair of Object.values(by)) if (pair.length === 2) {
-        const [x, y] = pair, a = x.points || 0, c = y.points || 0, X = out[x.roster_id], Y = out[y.roster_id]; if (!X || !Y) continue;
+        const [x, y] = pair, a = countedPoints(x), c = countedPoints(y), X = out[x.roster_id], Y = out[y.roster_id]; if (!X || !Y) continue;
         X.pf += a; X.pa += c; X.pts = a; X.opp = c; Y.pf += c; Y.pa += a; Y.pts = c; Y.opp = a;
         if (a > c) { X.w++; Y.l++; X.res = 'W'; Y.res = 'L'; } else if (c > a) { Y.w++; X.l++; X.res = 'L'; Y.res = 'W'; } else { X.t++; Y.t++; X.res = Y.res = 'T'; }
     }
@@ -1067,9 +1130,17 @@ function teamLink(R, label) {
     if (!R) return h('span', null, label || '—');
     return h('span', { class: 'tlink', title: `Open ${teamName(R)}`, onclick: (e) => { e.stopPropagation(); goTeam(R.roster_id); } }, label || teamName(R));
 }
+// Home and League carry no week control, so neither shows a week that was
+// picked on another page: arriving on one returns to the week in progress.
+function leavePick(page) {
+    if (page === 'home' || page === 'league') S.ui.weekPicked = false;
+    if (S.ui.weekPicked || S.seasonType !== 'regular') return;
+    const w = defaultWeek(page);
+    if (w !== S.week) { S.week = w; syncLineups(); }
+}
 function go(page, opts) {
     S.page = page; S.ui.vault = null;
-    if (!S.ui.weekPicked && S.seasonType === 'regular') S.week = defaultWeek(page);
+    leavePick(page);
     try { sessionStorage.setItem('badgerLeaguePage-' + S.leagueId, page); } catch (e) {}
     if (opts && opts.playersTab) S.ui.playersTab = opts.playersTab;
     if (opts && opts.teamPop) S.ui.teamPop = opts.teamPop;
@@ -1121,14 +1192,48 @@ function showOriginal(reason, chosen) {
     document.documentElement.classList.remove('badger-league-on');
     if (reason) (chosen ? console.info : console.warn)(TAG, reason);
 }
+// On Sleeper's own layout one thing of ours stays on the page: a button in the
+// corner that brings Fantasy Badger back in one click, with the menu's other
+// rows behind the arrow beside it. It sits on Sleeper's page, outside our
+// shadow root, so it is plain DOM with its styles inline.
 function injectOriginalPill() {
     if (document.getElementById('badger-league-pill')) return;
-    // The same toggle as the Badger top bar, in the same corner, Sleeper lit.
-    const t = layoutToggle('sleeper');
-    t.id = 'badger-league-pill';
-    t.style.position = 'fixed'; t.style.top = '10px'; t.style.right = '18px'; t.style.zIndex = '2147483000';
-    t.style.boxShadow = '0 4px 16px rgba(0,0,0,.35)';
-    document.body.appendChild(t);
+    const el = (tag, css, kids) => { const e = document.createElement(tag); e.style.cssText = css; for (const k of kids || []) e.append(k); return e; };
+    const FACE = 'Nunito,system-ui,-apple-system,"Segoe UI",sans-serif';
+    const ring = (b) => { b.addEventListener('focus', () => { b.style.outline = '2px solid #e6ebf2'; b.style.outlineOffset = '2px'; }); b.addEventListener('blur', () => { b.style.outline = 'none'; }); };
+    const wrap = el('div', `position:fixed;top:10px;right:18px;z-index:2147483000;font:800 13px ${FACE};`);
+    wrap.id = 'badger-league-pill';
+    const mark = el('img', 'width:20px;height:20px;display:block;'); mark.src = BADGER_MARK; mark.alt = '';
+    const back = el('button', 'all:unset;box-sizing:border-box;display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px 0 8px;border-radius:8px 0 0 8px;background:#20ceb8;color:#0d1117;cursor:pointer;white-space:nowrap;', [mark, 'Back to Fantasy Badger']);
+    back.type = 'button'; back.dataset.act = 'badger-back'; back.title = 'Switch these pages back to Fantasy Badger’s layout'; ring(back);
+    back.addEventListener('click', () => { try { localStorage.setItem('badgerLeagueUI', 'on'); } catch (e) {} location.reload(); });
+    const tip = el('span', 'display:block;width:12px;height:7px;background:#e6ebf2;clip-path:polygon(0 0,100% 0,50% 100%);');
+    const more = el('button', 'all:unset;box-sizing:border-box;display:inline-grid;place-items:center;width:34px;height:32px;border:1px solid #20ceb8;border-left:0;border-radius:0 8px 8px 0;background:#1a2030;cursor:pointer;', [tip]);
+    more.type = 'button'; more.dataset.act = 'badger-menu'; more.title = 'Fantasy Badger: what’s new, feedback'; more.setAttribute('aria-label', more.title); more.setAttribute('aria-haspopup', 'true'); more.setAttribute('aria-expanded', 'false'); ring(more);
+    const row = (href, title, under) => {
+        const a = el('a', 'display:block;padding:8px 10px;border-radius:7px;color:#e6ebf2;text-decoration:none;cursor:pointer;', [
+            el('span', `display:block;font:700 13px ${FACE};`, [title]), el('span', `display:block;font:600 12px ${FACE};color:#8591a7;`, [under])]);
+        a.href = href; a.setAttribute('role', 'menuitem');
+        a.addEventListener('mouseenter', () => { a.style.background = '#202737'; }); a.addEventListener('mouseleave', () => { a.style.background = 'none'; });
+        return a;
+    };
+    // What's new is drawn by the league pages, so the row goes back to them with the notes open.
+    const notes = row('#', 'What’s new', 'Opens in Fantasy Badger’s layout');
+    notes.dataset.act = 'notes-open';
+    notes.addEventListener('click', (e) => { e.preventDefault(); try { sessionStorage.setItem('badgerOpenNotes', '1'); localStorage.setItem('badgerLeagueUI', 'on'); } catch (err) {} location.reload(); });
+    const say = row(feedbackHref('Sleeper’s own layout'), 'Send feedback', 'Opens an issue on GitHub'); say.target = '_blank'; say.rel = 'noopener';
+    const menu = el('div', `display:none;position:absolute;top:40px;right:0;width:300px;box-sizing:border-box;background:#1a2030;border:1px solid #354060;border-radius:10px;box-shadow:0 16px 36px rgba(0,0,0,.5);padding:6px;text-align:left;`, [
+        el('div', `display:flex;align-items:center;gap:9px;padding:8px 10px 9px;font:800 14px ${FACE};color:#e6ebf2;`, ['Fantasy Badger', el('span', 'margin-left:auto;font:600 11.5px ui-monospace,Menlo,monospace;color:#8591a7;', [fullVersion().split('.').slice(0, 3).join('.')])]),
+        el('div', 'border-top:1px solid #2a3345;margin:0 0 4px;'), notes, say, el('div', 'border-top:1px solid #2a3345;margin:4px 0 0;'),
+        el('div', `font:600 12px/1.4 ${FACE};color:#8591a7;padding:8px 10px;`, ['To take this button off Sleeper as well, switch Fantasy Badger off from its icon in Chrome’s toolbar.'])]);
+    menu.setAttribute('role', 'menu'); menu.setAttribute('aria-label', 'Fantasy Badger');
+    const set = (open) => { menu.style.display = open ? 'block' : 'none'; more.setAttribute('aria-expanded', open ? 'true' : 'false'); };
+    more.addEventListener('click', (e) => { e.stopPropagation(); set(menu.style.display === 'none'); });
+    menu.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', () => set(false));
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') set(false); });
+    wrap.append(el('div', 'display:inline-flex;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.35);', [back, more]), menu);
+    document.body.appendChild(wrap);
 }
 // The page's two faces ship in the package (fonts/, SIL Open Font License, the
 // licences beside them), so drawing the page asks nothing of any host. They are
@@ -1182,6 +1287,7 @@ async function boot() {
         if (!settleWeek() && S.seasonType === 'regular') S.week = defaultWeek(S.page);
         await ensureData();
         render();
+        try { if (sessionStorage.getItem('badgerOpenNotes')) { sessionStorage.removeItem('badgerOpenNotes'); openNotes(); } } catch (e) { /* no storage: the notes stay a click away */ }
         console.log(TAG, `up: ${S.league.name}, week ${S.week} (${S.seasonType}), me=${S.myRoster ? 'roster ' + S.myRoster.roster_id : 'no roster'}`);
         loadMessages().then(() => { if (S.ui.chat) render(); });
         loadSeasonChain();
@@ -1206,6 +1312,7 @@ async function boot() {
         let lastPoll = Date.now();
         setInterval(() => {
             if (document.hidden || S.killed) return;
+            if (standingsDue()) refreshStandings().then((moved) => { if (moved && !S.killed) render(); });
             const carried = wsHealthy() && wsLastPush && Date.now() - wsLastPush < 120000;
             if (Date.now() - lastPoll < (carried ? 300000 : 60000)) return;
             lastPoll = Date.now(); refreshShared();
@@ -1241,12 +1348,12 @@ async function boot() {
         }
     }
     // the curve's panes borrow the score bug's box widths, which move with the window
-    let rsT = null; window.addEventListener('resize', () => { clearTimeout(rsT); rsT = setTimeout(syncPanes, 120); });
-    window.addEventListener('popstate', () => { const r2 = parseRoute(); if (r2 && r2.leagueId === S.leagueId) { S.page = r2.page; render(); ensureData().then(render).catch(fail); } });
+    let rsT = null; window.addEventListener('resize', () => { syncBar(); clearTimeout(rsT); rsT = setTimeout(syncPanes, 120); });
+    window.addEventListener('popstate', () => { const r2 = parseRoute(); if (r2 && r2.leagueId === S.leagueId) { S.page = r2.page; if (S.ui.weekPicked) leavePick(r2.page); render(); ensureData().then(render).catch(fail); } });
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && S.ui.report) { S.ui.report = null; render(); return; }
         if (e.key === 'Escape') { if (S.ui.sel) { S.ui.sel = null; S.ui.dropAsk = null; render(); return; }   // the player card sits over the drawer: it goes first
-            if (S.ui.tx || S.ui.notes || S.ui.chat || S.ui.menu || S.ui.muPick || S.ui.composer || S.ui.trade || S.ui.pdOpen || S.ui.wkOpen || S.ui.teamMenu || S.ui.moreOpen || S.ui.vault) { S.ui.tx = null; S.ui.notes = false; S.ui.moreOpen = false; S.ui.chat = false; S.ui.vault = null; S.ui.menu = false; S.ui.muPick = false; S.ui.composer = null; S.ui.sel = null; S.ui.dropAsk = null; S.ui.trade = null; S.ui.pdOpen = false; S.ui.wkOpen = false; S.ui.teamMenu = false; S.ui.dropOpen = false; render(); } }
+            if (S.ui.tx || S.ui.notes || S.ui.chat || S.ui.menu || S.ui.muPick || S.ui.composer || S.ui.trade || S.ui.pdOpen || S.ui.wkOpen || S.ui.teamMenu || S.ui.moreOpen || S.ui.vault || S.ui.bmenu) { S.ui.bmenu = false; S.ui.tx = null; S.ui.notes = false; S.ui.moreOpen = false; S.ui.chat = false; S.ui.vault = null; S.ui.menu = false; S.ui.muPick = false; S.ui.composer = null; S.ui.sel = null; S.ui.dropAsk = null; S.ui.trade = null; S.ui.pdOpen = false; S.ui.wkOpen = false; S.ui.teamMenu = false; S.ui.dropOpen = false; render(); } }
         if (e.key === '/' && S.page === 'players' && !/input|textarea/i.test((e.composedPath()[0] || {}).tagName)) { e.preventDefault(); const i = $('.search input'); if (i) i.focus(); }
     });
 }
@@ -1278,7 +1385,7 @@ function render() {
     // the header it was pointing at is about to be rebuilt; on a live Sunday that
     // is every few seconds, so the tooltip comes back on the rebuilt header if
     // the pointer is still on it
-    const tipWas = tipFor ? { tip: tipFor.dataset.tip, pos: tipFor.dataset.pos } : null;
+    const tipWas = tipFor ? { tip: tipFor.dataset.tip, pos: tipFor.dataset.pos, cell: tipFor.dataset.say != null } : null;
     tipHide();
     // Inner scroll containers are rebuilt on every render; remember where they were.
     // Both axes. Only scrollTop was kept, so sorting the Players table — a
@@ -1291,7 +1398,7 @@ function render() {
     const caret = focusKey && typeof act.selectionStart === 'number' ? [act.selectionStart, act.selectionEnd] : null;
     app.innerHTML = '';
     app.append(topbar());
-    app.addEventListener('click', () => { if (S.ui.pdOpen || S.ui.wkOpen || S.ui.teamMenu || S.ui.dropOpen || S.ui.moreOpen) { S.ui.pdOpen = false; S.ui.wkOpen = false; S.ui.teamMenu = false; S.ui.dropOpen = false; S.ui.moreOpen = false; render(); } }, { once: true });
+    app.addEventListener('click', () => { if (S.ui.pdOpen || S.ui.wkOpen || S.ui.teamMenu || S.ui.dropOpen || S.ui.moreOpen || S.ui.bmenu) { S.ui.bmenu = false; S.ui.pdOpen = false; S.ui.wkOpen = false; S.ui.teamMenu = false; S.ui.dropOpen = false; S.ui.moreOpen = false; render(); } }, { once: true });
     const err = S.errors.length ? h('div', { class: 'card', style: 'margin:14px 18px 0;border-color:#ef5a5a;color:#ef5a5a;font-weight:700;' }, `Something did not load: ${S.errors[S.errors.length - 1]}`, ' ', h('button', { class: 'btn sm', style: 'margin-left:8px', onclick: () => { S.errors = []; render(); } }, 'Dismiss')) : null;
     if (err) app.append(err);
     const pageEl = S.ui.vault ? vaultPage : ({ home: pageHome, team: pageTeam, players: pagePlayers, matchup: pageMatchup, league: pageLeague }[S.page] || pageHome);
@@ -1304,49 +1411,44 @@ function render() {
     root.scrollTop = scrollY;
     for (const el of $$('[data-keep]')) { const k = kept[el.dataset.keep]; if (k) { el.scrollTop = k.top; el.scrollLeft = k.left; } }
     if (focusKey && (caret || kbdNav)) { const el = $(`[data-focus="${focusKey}"]`); if (el) { el.focus({ preventScroll: true }); if (caret && typeof el.setSelectionRange === 'function') try { el.setSelectionRange(caret[0], caret[1]); } catch (e) { /* not a text field */ } } }
-    if (tipWas && tipX >= 0) { const under = shadow.elementFromPoint(tipX, tipY), again = under && under.closest ? under.closest('[data-tip]') : null; if (again && again.dataset.tip === tipWas.tip) tipShow(again); }
+    if (tipWas && tipX >= 0) { const under = shadow.elementFromPoint(tipX, tipY), again = under && under.closest ? under.closest('[data-tip], [data-say]') : null; if (again && (tipWas.cell ? again.dataset.say != null : again.dataset.tip === tipWas.tip)) tipShow(again); }
+    syncBar();
     syncPanes();
 }
 function topbar() {
     const L = S.league, my = S.myRoster;
     const needs = my ? lineupIssues(my).length : 0;
     const pendingMine = S.pending.filter(t => t.type === 'trade' && (t.roster_ids || []).includes(my && my.roster_id) && String(t.creator) !== String(S.myUserId)).length;
-    const brand = h('div', { class: 'brand', onclick: (e) => { e.stopPropagation(); S.ui.menu = !S.ui.menu; render(); } },
+    // The week is picked on the pages that are about one, so the league's line
+    // names its shape, and the part of the year only when that is not the season.
+    const sub = `${L.settings.num_teams}-team · ${scoringLabel()}${S.seasonType === 'regular' ? '' : ' · ' + (S.seasonType === 'pre' ? 'Preseason' : S.seasonType)}`;
+    const brand = h('div', { class: 'brand', onclick: (e) => { e.stopPropagation(); S.ui.bmenu = false; S.ui.menu = !S.ui.menu; render(); } },
         h('div', { class: 'lg' }, L.avatar ? h('img', { src: avatarUrl(L.avatar), alt: '' }) : '🏈'),
-        h('div', null, L.name, h('small', null, `${L.settings.num_teams}-team · ${scoringLabel()} · ${S.seasonType === 'regular' ? 'Week ' + S.curWeek : S.seasonType === 'pre' ? 'Preseason' : S.seasonType}`)),
+        h('div', { class: 'bn' }, h('span', { class: 'bname', title: L.name }, L.name), h('small', null, sub)),
         caret('caret'),
-        notesUnread() ? h('span', { class: 'bdot', title: 'Fantasy Badger was updated: What’s new is in this menu' }) : null,
         S.ui.menu ? leagueMenu() : null);
-    const txTab = () => {
+    // The pages: five words. Scoreboard says LIVE while NFL games are being played,
+    // the same mark a matchup under way carries.
+    const liveN = S.seasonType === 'regular' ? gamesLiveNow() : 0;
+    const nav = h('nav', { class: 'nav' }, ...[['home', 'Home'], ['team', 'Team'], ['players', 'Players'], ['matchup', 'Scoreboard'], ['league', 'League']].map(([k, t]) =>
+        h('a', { class: k === S.page ? 'on' : '', onclick: () => go(k) }, t, k === 'team' && (needs + pendingMine) ? h('span', { class: 'cnt' }, needs + pendingMine) : null,
+            k === 'matchup' && liveN ? h('span', { class: 'navlive', title: `${liveN} game${liveN === 1 ? '' : 's'} in progress` }, h('i', { 'aria-hidden': 'true' }), 'LIVE') : null)));
+    // What opens a drawer sits together on the right, each with its word: a
+    // drawer is not a page, and nothing in the bar is a symbol on its own.
+    const txBtn = () => {
         if (!my) return null;
         const n = inFlightCount(), runs = waiverRuns(), fresh = !!runs.length && runs[0].at > txSeenAt();
         const t = `Transactions · ${n ? `${n} in flight for your team` : 'claims, trades and waiver results'}${fresh ? ' · a waiver run was processed' : ''}`;
-        const toggle = () => { if (S.ui.tx) closeTx(); else openTx(); };
-        return h('a', { class: `txtab ${n ? 'hot' : ''} ${S.ui.tx ? 'open' : ''}`.trim(), title: t, 'aria-label': t, role: 'button', tabindex: '0', 'data-act': 'tx-open',
-            onclick: toggle, onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } } },
-            h('span', { class: 'txmark', 'aria-hidden': 'true' }, '⇄'), n ? h('span', { class: 'cnt' }, String(n)) : fresh ? h('span', { class: 'txrundot', 'aria-hidden': 'true' }) : null);
+        return h('button', { class: `tool tx${n ? ' hot' : ''}${S.ui.tx ? ' open' : ''}`, title: t, 'aria-label': t, 'data-act': 'tx-open', onclick: () => { if (S.ui.tx) closeTx(); else openTx(); } },
+            svgIcon('moves'), h('span', { class: 'lbl' }, 'Transactions'), n ? h('span', { class: 'cnt' }, String(n)) : fresh ? h('span', { class: 'txrundot', 'aria-hidden': 'true' }) : null);
     };
-    const nav = h('nav', { class: 'nav' }, ...[['home', 'Home'], ['team', 'Team'], ['players', 'Players'], ['matchup', 'Scoreboard'], ['league', 'League']].flatMap(([k, t]) => [
-        h('a', { class: k === S.page ? 'on' : '', onclick: () => go(k) }, t, k === 'team' && (needs + pendingMine) ? h('span', { class: 'cnt' }, needs + pendingMine) : null),
-        k === 'players' ? txTab() : null]).filter(Boolean));
-    // In the vault the arrows walk that season's weeks; stepping the live season
-    // while reading a dead one is what they used to do.
-    const vc = vaultCtx();
-    const vw = vc ? Object.keys(vc.V.matchups).map(Number).sort((a, b) => a - b) : null;
-    const vi = vw ? vw.indexOf(vc.V.ui.week) : -1;
-    const step = (d) => { if (!vc) return setWeek(S.week + d);
-        const nx = vw[vi + d]; if (nx == null) return;
-        vc.V.ui.week = nx; vc.V.ui.matchupRoster = null; vc.V.ui.tab = 'matchups'; render(); };
-    const week = h('div', { class: 'week' },
-        h('button', { onclick: () => step(-1), disabled: vc ? vi <= 0 : S.week <= 1, title: 'Previous week', 'aria-label': 'Previous week' }, '\u2039'),
-        weekDropdown(),
-        h('button', { onclick: () => step(1), disabled: vc ? (vi < 0 || vi >= vw.length - 1) : S.week >= 18, title: 'Next week', 'aria-label': 'Next week' }, '\u203a'));
     const nLeague = leagueUnread(), nDm = unreadDms(), unread = nLeague + nDm;
     const chatTitle = unread ? `Chat · ${[nLeague ? `${nLeague} new in the league` : null, nDm ? `${nDm} unread direct message${nDm === 1 ? '' : 's'}` : null].filter(Boolean).join(' · ')}` : 'League chat and messages';
-    const icons = h('div', { class: 'icons' },
-        h('div', { class: 'ic', title: chatTitle, 'aria-label': chatTitle, onclick: () => { S.ui.chat = !S.ui.chat; if (S.ui.chat) { S.ui.tx = null; S.ui.notes = false; S.ui.composer = null; S.ui.trade = null; } render(); if (S.ui.chat) loadConvo(convoId()).then(render); } }, '💬', unread && !S.ui.chat ? h('span', { class: 'cnt chatcnt' }, unread > 9 ? '9+' : String(unread)) : null),
-        layoutToggle('badger'));
-    return h('div', { class: 'topbar', onclick: () => { if (S.ui.menu) { S.ui.menu = false; render(); } } }, brand, nav, week, icons);
+    const chatBtn = h('button', { class: `tool chat${S.ui.chat ? ' open' : ''}`, title: chatTitle, 'aria-label': chatTitle, 'data-act': 'chat-open',
+        onclick: () => { S.ui.chat = !S.ui.chat; if (S.ui.chat) { S.ui.tx = null; S.ui.notes = false; S.ui.composer = null; S.ui.trade = null; } render(); if (S.ui.chat) loadConvo(convoId()).then(render); } },
+        svgIcon('chat'), h('span', { class: 'lbl' }, 'Chat'), unread && !S.ui.chat ? h('span', { class: 'cnt chatcnt' }, unread > 9 ? '9+' : String(unread)) : null);
+    return h('div', { class: 'topbar', onclick: () => { if (S.ui.menu || S.ui.bmenu) { S.ui.menu = false; S.ui.bmenu = false; render(); } } },
+        brand, nav, h('div', { class: 'icons' }, txBtn(), chatBtn, badgerOpener()));
 }
 // The brand menu is a league switcher: every league this account is in this
 // season, the current one marked, one click to jump.
@@ -1397,16 +1499,12 @@ function leagueMenu() {
                 h('span', { class: 'yr' }, String(c.season)), h('span', { 'aria-hidden': 'true' }, '\u{1F3C6}'),
                 h('span', { class: 'ch' }, c.champ ? `${c.champ}, champion` : 'season'), h('span', { class: 'chev' }, '›'))));
     }
-    const unread = notesUnread();
-    m.append(h('div', { class: 'sep' }),
-        h('a', { class: 'lmrow lmnotes', 'data-act': 'notes-open', onclick: (e) => { e.preventDefault(); openNotes(); } },
-            unread ? h('span', { class: 'ndot', 'aria-hidden': 'true' }) : null, h('span', null, 'What’s new'), h('span', { class: 'v' }, notesVersion())));
     return m;
 }
 // ── what's new ───────────────────────────────────────────────────────────────
 // The notes ship in the package (changelog.js). An update to a new minor sets a
-// flag (background.js); it shows as a dot on the league menu until the notes
-// are opened.
+// flag (background.js); it shows as a dot on the Badger button, and as NEW in
+// its menu, until the notes are opened.
 // The version is the date and the time of day (scripts/stamp-version.sh); the
 // notes are keyed by the date, its first three numbers.
 const notesVersion = () => chrome.runtime.getManifest().version.split('.').slice(0, 3).join('.');
@@ -1418,7 +1516,7 @@ function notesUnread() {
     return S.notesUnread;
 }
 function openNotes() {
-    S.ui.menu = false; S.ui.tx = null; S.ui.chat = false; S.ui.composer = null; S.ui.trade = null;
+    S.ui.menu = false; S.ui.bmenu = false; S.ui.tx = null; S.ui.chat = false; S.ui.composer = null; S.ui.trade = null;
     S.ui.notes = true; S.ui.notesOpen = S.ui.notesOpen || {};
     if (S.notesUnread) { S.notesUnread = false; try { chrome.storage.local.remove('badgerNotesUnread'); } catch (e) { /* the dot comes back next load */ } }
     render();
@@ -1442,101 +1540,110 @@ function notesDrawer() {
         h('div', { class: 'db' }, ...(list.length ? list.map(entry) : [h('div', { class: 'dim' }, 'No notes for this version yet.')]),
             list.length > 1 ? h('div', { class: 'wnfoot' }, 'Earlier versions open with a click.') : null));
 }
-// ── the layout toggle ────────────────────────────────────────────────────────
-// Badger | Sleeper, the same control in the same corner on both layouts, with
-// the one you're on lit. Plain DOM with its styles inline, because on Sleeper's
-// own layout it sits on Sleeper's page, outside our shadow root.
-function layoutToggle(on) {
-    const wrap = document.createElement('div');
-    wrap.setAttribute('role', 'group'); wrap.setAttribute('aria-label', 'Page layout');
-    wrap.className = 'ltog';
-    wrap.style.cssText = 'display:inline-flex;align-items:center;height:32px;box-sizing:border-box;border:1px solid #354060;border-radius:8px;background:#1a2030;padding:2px;gap:2px;font:800 11px Nunito,system-ui,-apple-system,sans-serif;letter-spacing:.04em;';
-    const half = (key, label, mark) => {
-        const b = document.createElement('button');
-        const lit = key === on;
-        b.type = 'button'; b.setAttribute('aria-pressed', lit ? 'true' : 'false');
-        b.title = lit ? `You are on ${key === 'badger' ? 'Fantasy Badger’s' : 'Sleeper’s own'} layout` : `Switch to ${key === 'badger' ? 'Fantasy Badger’s' : 'Sleeper’s own'} layout`;
-        b.style.cssText = `all:unset;box-sizing:border-box;height:26px;display:inline-flex;align-items:center;gap:6px;padding:0 10px;border-radius:6px;cursor:${lit ? 'default' : 'pointer'};white-space:nowrap;`
-            + (lit ? (key === 'badger' ? 'background:#20ceb8;color:#0d1117;' : 'background:#e6ebf2;color:#0d1117;') : 'color:#98a4b8;');
-        b.addEventListener('focus', () => { b.style.outline = '2px solid #20ceb8'; b.style.outlineOffset = '1px'; });
-        b.addEventListener('blur', () => { b.style.outline = 'none'; });
-        b.append(mark, label);
-        if (!lit) b.addEventListener('click', () => {
-            if (key === 'sleeper') { showOriginal('user chose Sleeper’s layout', true); location.reload(); }
-            else { try { localStorage.setItem('badgerLeagueUI', 'on'); } catch (e) {} location.reload(); }
-        });
-        return b;
-    };
-    const badger = document.createElement('img'); badger.src = chrome.runtime.getURL('icons/badger-mascot-128.png'); badger.alt = ''; badger.style.cssText = 'width:16px;height:16px;';
+// ── the Badger menu ──────────────────────────────────────────────────────────
+// Everything about Fantasy Badger itself sits behind one button in the corner:
+// which layout the league pages wear, what the last update brought, and where
+// to say something about it. The league field beside the pages stays what it
+// was, the leagues.
+//
+// Where the menu's links lead. Each opens in a new tab on a click; none is fetched.
+const LINKS = { privacy: 'https://fantasybadger.com/privacy/extension', store: 'https://chromewebstore.google.com/detail/', source: 'https://github.com/FantasyBadger/fantasy-badger-sleeper-extension' };
+const BADGER_MARK = (() => { try { return chrome.runtime.getURL('icons/badger-mascot-128.png'); } catch (e) { return ''; } })();
+const fullVersion = () => { try { const m = chrome.runtime.getManifest(); return m.version_name || m.version; } catch (e) { return ''; } };
+// Feedback is an issue on the repository. The form opens with the version and the
+// page already written in, and nothing about the league: what else goes in is the
+// writer's to add.
+const feedbackHref = (where) => `${LINKS.source}/issues/new?body=${encodeURIComponent(`Version: ${fullVersion()}\nPage: ${where}\n\nWhat happened, or what you would like:\n`)}`;
+// The listing exists only for a copy that came from the store.
+const storeListing = () => { try { return 'update_url' in chrome.runtime.getManifest() ? LINKS.store + chrome.runtime.id : null; } catch (e) { return null; } };
+// The notes the installed version carries, newest first, as What's new lists them.
+const notesShown = () => { const cur = notesVersion().split('.').map(Number); return (globalThis.BADGER_NOTES || []).filter(n => { const v = String(n.v).split('.').map(Number); return (v[0] - cur[0] || v[1] - cur[1] || (v[2] || 0) - (cur[2] || 0)) <= 0; }); };
+// The badger keeps its own colours on a teal ground: on the dark bar it is too dark to read alone.
+const badgerChip = (px) => h('span', { class: 'bchip', style: `width:${px}px;height:${px}px`, 'aria-hidden': 'true' }, h('img', { src: BADGER_MARK, alt: '', style: `width:${px - 6}px;height:${px - 6}px` }));
+function badgerOpener() {
+    const unread = notesUnread();
+    const t = unread ? 'Fantasy Badger was updated: What’s new is in this menu' : 'Fantasy Badger: layout, what’s new, feedback';
+    return h('div', { class: 'bwrap', onclick: (e) => e.stopPropagation() },
+        h('button', { class: `opener${S.ui.bmenu ? ' open' : ''}`, 'aria-haspopup': 'true', 'aria-expanded': S.ui.bmenu ? 'true' : 'false', title: t, 'aria-label': t, 'data-act': 'badger-menu',
+            onclick: () => { S.ui.menu = false; S.ui.bmenu = !S.ui.bmenu; render(); } },
+            badgerChip(22), h('span', { class: 'lbl' }, 'Badger'), caret(), unread ? h('span', { class: 'udot', 'aria-hidden': 'true' }) : null),
+        S.ui.bmenu ? badgerMenu() : null);
+}
+function badgerMenu() {
+    const unread = notesUnread(), top = notesShown()[0], shop = storeListing();
+    const shut = () => setTimeout(() => { S.ui.bmenu = false; render(); }, 0);   // after the click has done its own work
+    const out = (href) => ({ href, target: '_blank', rel: 'noopener', onclick: shut });
+    const row = (attrs, title, under, right) => h('a', Object.assign({ role: 'menuitem' }, attrs), h('span', { class: 'bmt' }, h('b', null, title), under ? h('small', null, under) : null), right || null);
+    return h('div', { class: 'menu bmenu', role: 'menu', 'aria-label': 'Fantasy Badger' },
+        h('div', { class: 'bmhead' }, badgerChip(28), h('b', null, 'Fantasy Badger'), h('span', { class: 'bmver' }, notesVersion())),
+        h('div', { class: 'sep' }),
+        h('div', { class: 'bmhd' }, 'LAYOUT'),
+        layoutSwitch(),
+        h('p', { class: 'bmnote' }, 'On Sleeper’s own pages a Badger button stays in this corner, so coming back is one click.'),
+        h('div', { class: 'sep' }),
+        row({ class: `bmrow${unread ? ' hi' : ''}`, href: '#', 'data-act': 'notes-open', onclick: (e) => { e.preventDefault(); openNotes(); } },
+            ['What’s new', top ? h('span', { class: 'bmstamp' }, ` · ${String(top.when).replace(/,\s*\d{4}$/, '')}`) : null], top ? top.title : null,
+            unread ? h('span', { class: 'bmnew' }, 'NEW') : null),
+        row(Object.assign({ class: 'bmrow' }, out(feedbackHref({ home: 'Home', team: 'Team', players: 'Players', matchup: 'Scoreboard', league: 'League' }[S.page] || S.page))), 'Send feedback', 'Opens an issue on GitHub', svgIcon('out', 'bmout')),
+        h('div', { class: 'sep' }),
+        h('div', { class: 'bmfoot' }, h('a', out(LINKS.privacy), 'Privacy policy'), h('a', out(LINKS.source), 'Source code'), shop ? h('a', out(shop), 'Rate it on the store') : null));
+}
+// ── the layout switch ────────────────────────────────────────────────────────
+// Badger | Sleeper, with the one you are on lit. It is drawn in the Badger
+// menu, so Badger's half is always the lit one; Sleeper's half reloads the page
+// as Sleeper drew it.
+function layoutSwitch() {
     // Sleeper's mark: the left of its own nav logo, which carries the wordmark beside it
-    const sleeper = document.createElement('span'); sleeper.setAttribute('aria-hidden', 'true');
-    sleeper.style.cssText = 'width:14px;height:17px;display:inline-block;background:url(https://sleepercdn.com/images/v2/logos/logo_with_text_2.png) left center / auto 17px no-repeat;';
-    wrap.append(half('badger', 'BADGER', badger), half('sleeper', 'SLEEPER', sleeper));
-    return wrap;
+    const sleeper = h('span', { class: 'smark', 'aria-hidden': 'true' });
+    return h('div', { class: 'ltog', role: 'group', 'aria-label': 'Page layout' },
+        h('button', { type: 'button', class: 'lit', 'aria-pressed': 'true', title: 'You are on Fantasy Badger’s layout' }, h('img', { src: BADGER_MARK, alt: '' }), 'BADGER'),
+        h('button', { type: 'button', 'aria-pressed': 'false', title: 'Switch to Sleeper’s own layout', 'data-act': 'layout-sleeper',
+            onclick: () => { showOriginal('user chose Sleeper’s layout', true); location.reload(); } }, sleeper, 'SLEEPER'));
 }
 function showOriginalNav(path) { try { localStorage.setItem('badgerLeagueUI', 'off'); } catch (e) {} location.href = path; }
 function scoringLabel() { const sc = (S.league.scoring_settings || {}); const r = sc.rec || 0; return r === 1 ? 'PPR' : r === 0.5 ? 'Half PPR' : r === 0 ? 'Standard' : `${r} PPR`; }
 function setWeek(w) { S.ui.weekPicked = true; S.week = Math.max(1, Math.min(18, w)); syncLineups(); render(); ensureData().then(render).catch(fail); }
-// The period picker: the one control that answers "when". Weeks of the live
-// season, and — since a past season is also a when — the archive at the foot
-// of the same list. Inside the vault it becomes that season's week navigation
-// instead, because a control that scrubbed the LIVE season while you read a
-// dead one was the quiet bug this replaced.
+// The week picker: the control that answers "when" on a page that is about one
+// week. Weeks of the live season, and — since a past season is also a when —
+// the archive at the foot of the same list. A past season, once open, walks
+// its own weeks on its own page.
 // A week list that opens on the week you are looking at. scrollTop rather than
 // scrollIntoView: the latter would scroll the page behind the menu too.
 function pdScroll(rows) {
     const el = h('div', { class: 'pdscroll' }, ...rows);
-    setTimeout(() => { const on = el.querySelector('.mi.on'); if (on && on.offsetTop > el.clientHeight) el.scrollTop = on.offsetTop - el.clientHeight / 2 + on.offsetHeight / 2; }, 0);
+    setTimeout(() => { const on = el.querySelector('.mi.on'), top = on ? on.offsetTop - el.offsetTop : 0;   // its place in this list, not in the whole menu
+        if (on && top + on.offsetHeight > el.clientHeight) el.scrollTop = top - el.clientHeight / 2 + on.offsetHeight / 2; }, 0);
     return el;
-}
-function vaultCtx() {
-    const id = S.ui.vault && S.ui.vault.id;
-    if (!id) return null;
-    const V = VAULTS[id];
-    if (!V || V.status !== 'ready') return null;
-    return { id, V, meta: (S.chain || []).find(c => c.id === id) || {} };
 }
 function weekDropdown() {
     const ui = S.ui;
-    const vc = vaultCtx();
     const mi = (txt, sub, on, disabled, fn) => h('div', { class: `mi ${on ? 'on' : ''} ${disabled ? 'off' : ''}`, onclick: disabled ? null : fn }, txt, h('span', { class: 'mono' }, sub || ''));
-    // Past seasons, wherever the menu ends. Opening one is a mode change, not a
+    // Past seasons, at the foot of the menu. Opening one is a mode change, not a
     // scrub, so they are separated and carry the champion rather than a week.
-    const seasonRows = (skipId) => (S.chain || []).filter(c => c.id !== skipId).map(c =>
+    const seasonRows = (S.chain || []).map(c =>
         h('div', { class: 'mi sea', onclick: () => { ui.wkOpen = false; vaultOpen(c.id); } },
             h('span', null, h('span', { class: 'tro' }, '\u{1F3C6}'), `${c.season} season`),
-            h('span', { class: 'mono' }, c.champ ? String(c.champ).slice(0, 11) : '\u2192')));
-
-    if (vc) {
-        const { id, V, meta } = vc;
-        const weeks = Object.keys(V.matchups).map(Number).sort((a, b) => a - b);
-        const cur = V.ui.week;
-        const goWeek = (w) => { ui.wkOpen = false; V.ui.week = w; V.ui.matchupRoster = null; V.ui.tab = 'matchups'; render(); };
-        const menu = ui.wkOpen ? h('div', { class: 'pdmenu', onclick: (e) => e.stopPropagation() },
-            h('div', { class: 'pdpin' }, h('div', { class: 'mi back', onclick: () => { ui.wkOpen = false; S.ui.vault = null; render(); } },
-                h('span', null, `\u2190 Back to ${S.season}`), h('span', { class: 'mono' }, 'live'))),
-            h('div', { class: 'pdhd' }, meta.champ ? `${meta.season} \u2014 ${String(meta.champ).toUpperCase()} WON IT` : `${meta.season} SEASON`),
-            pdScroll(weeks.map(w => mi(`Week ${w}`, '', w === cur, false, () => goWeek(w)))),
-            (S.chain || []).length > 1 ? h('div', { class: 'pdhd tp' }, 'OTHER SEASONS') : null,
-            ...seasonRows(id)) : null;
-        return h('div', { class: 'pdd right', onclick: (e) => e.stopPropagation() },
-            h('button', { class: 'ddbtn vault', title: `Season Vault \u2014 ${meta.season}, read-only`, onclick: () => { ui.wkOpen = !ui.wkOpen; render(); } },
-                cur ? [h('span', { class: 'yr' }, `${meta.season} \u00b7 `), `Week ${cur}`] : String(meta.season), caret()), menu);
-    }
-
+            h('span', { class: 'mono' }, c.champ ? String(c.champ).slice(0, 11) : '→')));
     const pick = (w) => { ui.wkOpen = false; setWeek(w); };
     const inSeason = S.seasonType === 'regular';
     const menu = ui.wkOpen ? h('div', { class: 'pdmenu', onclick: (e) => e.stopPropagation() },
         h('div', { class: 'pdpin' },
-            mi('Last week', S.curWeek > 1 && inSeason ? `wk ${S.curWeek - 1}` : '\u2014', S.week === S.curWeek - 1, !(S.curWeek > 1 && inSeason), () => pick(S.curWeek - 1)),
+            mi('Last week', S.curWeek > 1 && inSeason ? `wk ${S.curWeek - 1}` : '—', S.week === S.curWeek - 1, !(S.curWeek > 1 && inSeason), () => pick(S.curWeek - 1)),
             mi('Current week', `wk ${S.curWeek}`, S.week === S.curWeek, false, () => pick(S.curWeek)),
-            mi('Next week', S.curWeek < LAST_WEEK ? `wk ${S.curWeek + 1}` : '\u2014', S.week === S.curWeek + 1, !(S.curWeek < LAST_WEEK), () => pick(S.curWeek + 1))),
+            mi('Next week', S.curWeek < LAST_WEEK ? `wk ${S.curWeek + 1}` : '—', S.week === S.curWeek + 1, !(S.curWeek < LAST_WEEK), () => pick(S.curWeek + 1))),
         h('div', { class: 'pdhd' }, 'ALL WEEKS'),
         pdScroll(Array.from({ length: LAST_WEEK }, (_, i) => i + 1).map(w => mi(`Week ${w}`, w === S.curWeek ? 'current' : '', S.week === w, false, () => pick(w)))),
-        (S.chain || []).length ? h('div', { class: 'pdhd tp' }, 'PAST SEASONS') : null,
-        ...seasonRows(null)) : null;
-    return h('div', { class: 'pdd right', onclick: (e) => e.stopPropagation() },
-        h('button', { class: 'ddbtn', style: S.week !== S.curWeek ? 'color:var(--amber)' : '', title: S.week === S.curWeek ? 'Current week' : `Viewing week ${S.week} \u2014 current is ${S.curWeek}`, onclick: () => { ui.wkOpen = !ui.wkOpen; render(); } }, `Week ${S.week}`, caret()), menu);
+        seasonRows.length ? h('div', { class: 'pdhd tp' }, 'PAST SEASONS') : null,
+        ...seasonRows) : null;
+    return h('div', { class: 'pdd', onclick: (e) => e.stopPropagation() },
+        h('button', { class: 'ddbtn', style: S.week !== S.curWeek ? 'color:var(--amber)' : '', title: S.week === S.curWeek ? 'Current week' : `Viewing week ${S.week} — current is ${S.curWeek}`, onclick: () => { ui.wkOpen = !ui.wkOpen; render(); } },
+            `Week ${S.week}${S.week === S.curWeek ? ' · current' : ''}`, caret()), menu);
+}
+// The picker with ‹ › either side, as the Team and Players rows carry theirs:
+// stepping one week is the commonest move.
+function weekControl() {
+    const arrow = (d, glyph, title) => h('button', { class: 'pstep', disabled: S.week + d < 1 || S.week + d > LAST_WEEK, title, 'aria-label': title, onclick: (e) => { e.stopPropagation(); setWeek(S.week + d); } }, glyph);
+    return h('div', { class: 'wkc' }, arrow(-1, '‹', 'Previous week'), weekDropdown(), arrow(1, '›', 'Next week'));
 }
 
 // ── roster insights ──────────────────────────────────────────────────────────
@@ -3410,7 +3517,7 @@ function buildLedger(A, a, B, b) {
         const md = p.metadata || {}, poss = md.possession, g = p.game_id;
         curT = p.time;
         if (md.team && md.opponent) { gameOfTeam[md.team] = g; gameOfTeam[md.opponent] = g; }
-        const qn = Number(String(md.quarter_name || '').replace(/[^0-9]/g, ''));
+        const qn = quarterNum(md.quarter_name);
         if (qn) {
             const mins = Number(md.time_remaining_minutes), secs = Number(md.time_remaining_seconds) || 0;
             const rem = qn > 4 ? 0 : (4 - qn) * 15 + (isFinite(mins) ? mins + secs / 60 : 15);
@@ -3545,6 +3652,12 @@ function playPhrase(desc) {
     if ((m = d.match(/for (-?\d+) yards?/i))) return `${yd(m[1])}`;
     return d.slice(0, 46) || '\u2014';
 }
+// Sleeper numbers a play's quarter "1" to "4" and calls overtime "OT". Read as a
+// bare number, overtime was no quarter at all: its plays lost their clock in the
+// log, the game's clock stopped where the fourth quarter left it, and the game
+// view labelled them "QOT".
+const quarterNum = (name) => { const q = String(name == null ? '' : name); return /ot/i.test(q) ? 5 : Number(q.replace(/[^0-9]/g, '')) || 0; };
+const playQuarter = (name) => { const n = quarterNum(name); return !n ? '' : n > 4 ? 'OT' : `Q${n}`; };
 const SLOT_FMT = (() => { try { return new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short', hour: 'numeric', hour12: false }); } catch (e) { return null; } })();
 function gameSlot(ms) {
     let day, hour;
@@ -3596,19 +3709,24 @@ function playLog(A, a, B, b) {
             h('span', { class: `tog${ui.logBig ? ' on' : ''}`, title: `Only plays worth at least ${Math.round(BIG_WP * 100)} points of win probability or ${BIG_PTS} fantasy points`, onclick: () => { ui.logBig = !ui.logBig; render(); } }, '\u2605 Big swings')));
     if (!L) return h('div', { class: 'card plcard' }, head, h('div', { class: 'empty', style: 'flex:1;display:flex;align-items:center;justify-content:center' }, rec ? 'Nothing has been played yet this week.' : `Reading every play of week ${S.week} from Sleeper \u2014 a few seconds the first time, instant after`));
     const all = L.events;
-    const slotOf = (e) => gameSlot((L.gameStart && e.g != null && L.gameStart[e.g]) || e.t);
-    const shown = all.filter(e => (ui.logSide === 'all' || e.side === ui.logSide) && (!ui.logBig || Math.abs(e.dw) >= BIG_WP || Math.abs(e.dp) >= BIG_PTS))
-        .map(e => ({ e, slot: slotOf(e) }))
-        .sort((x, y) => (y.slot.r - x.slot.r) || (y.e.t - x.e.t));   // newest window first, newest play first within it
-    // A table per broadcast window with a sticky div label above each —
-    // Chrome pins a sticky td to the whole table, not its tbody, so real
-    // push-out group headers need to live outside the tables. Identical fixed
-    // colgroups keep every window's columns aligned.
+    // Newest first, in the order things happened, and nothing else. The log
+    // used to be filed under its game's broadcast window, newest window first:
+    // an early game that ran into overtime then sat under plays from the late
+    // window that had happened before it. Only the day is marked, where it
+    // changes, because a time of day does not say which day.
+    const dayOf = (t) => { const d = new Date(t); return { k: `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`, n: d.toLocaleDateString('en-US', { weekday: 'long' }).toUpperCase() }; };
+    const shown = all.map((e, i) => ({ e, i })).filter(({ e }) => (ui.logSide === 'all' || e.side === ui.logSide) && (!ui.logBig || Math.abs(e.dw) >= BIG_WP || Math.abs(e.dp) >= BIG_PTS))
+        .sort((x, y) => (y.e.t - x.e.t) || (y.i - x.i))
+        .map(({ e }) => ({ e, slot: dayOf(e.t) }));
+    // A table per day with a sticky div label above each — Chrome pins a sticky
+    // td to the whole table, not its tbody, so real push-out group headers need
+    // to live outside the tables. Identical fixed colgroups keep every day's
+    // columns aligned.
     // The side columns hold "152.72 · 99.9%" and the swing under it: at 96px the
     // last digit of the percentage was cut off.
     const mkcols = () => h('colgroup', null, h('col', { style: 'width:60px' }), h('col'), h('col', { style: 'width:108px' }), h('col', { style: 'width:116px' }));
     // The column header rides a sticky DIV, not a sticky th — a th can only
-    // stick within its own table, and this pane holds one table per window.
+    // stick within its own table, and this pane holds one table per day.
     const wrap = h('div', { class: 'plscroll', 'data-keep': 'plog' },
         h('div', { class: 'lhw' }, h('table', { class: 'plog' }, mkcols(), h('tr', { class: 'lth' }, h('th', null, 'When'), h('th', null, 'Play'),
             h('th', { class: 'r', title: `${nmA} \u2013 ${nmB}, after the play` }, 'Score now'), h('th', { class: 'r', title: 'Win % after the play, and how far it moved' }, 'Win')))));
@@ -3631,15 +3749,15 @@ function playLog(A, a, B, b) {
     };
     // What the scorer has done so far this game, as of this play.
     const cumLine = (w2) => { const a2 = w2 && w2.st ? gameStatAtoms(w2.pid, w2.st) : null; if (!a2) return null; const kids = []; a2.forEach((t, i) => { if (i) kids.push(' · '); kids.push(h('span', { class: 'cat' }, t)); }); return h('div', { class: 'cum mono' }, ...kids); };
-    const clockTxt = (e) => { const qn = Number(String(e.q || '').replace(/[^0-9]/g, '')); if (!qn) return ''; return `${qn > 4 ? 'OT' : 'Q' + qn} ${e.clk || ''}`.trim(); };
+    const clockTxt = (e) => { const q = playQuarter(e.q); return q ? `${q} ${e.clk || ''}`.trim() : ''; };
     let lastSlot = null;
     for (const { e, slot } of shown.slice(0, 120)) {
-        if (slot.n !== lastSlot) {
+        if (slot.k !== lastSlot) {
             body = h('tbody');
             wrap.append(h('div', { class: 'slotgrp' },
                 h('div', { class: 'sloth' }, h('div', { class: 'slotin' }, h('span', { class: 'ln' }), h('span', { class: 'lbl' }, slot.n), h('span', { class: 'ln' }))),
                 h('table', { class: 'plog' }, mkcols(), body)));
-            lastSlot = slot.n;
+            lastSlot = slot.k;
         }
         const d = new Date(e.t), hr = d.getHours() % 12 || 12, at = `${hr}:${String(d.getMinutes()).padStart(2, '0')}${d.getHours() < 12 ? 'a' : 'p'}`;
         // the clock's row: every game over, and the jump to the result belongs to no play
@@ -3986,7 +4104,7 @@ function wpReadout(card, box, e, lens, final) {
         }
     });
     const d = new Date(e.t), hr = d.getHours() % 12 || 12, at = `${hr}:${String(d.getMinutes()).padStart(2, '0')}${d.getHours() < 12 ? 'a' : 'p'}`;
-    const qn = Number(String(e.q || '').replace(/[^0-9]/g, '')), clock = e.kind === 'clock' ? 'FINAL' : qn ? `${qn > 4 ? 'OT' : 'Q' + qn} ${e.clk || ''}`.trim() : '';
+    const pq = playQuarter(e.q), clock = e.kind === 'clock' ? 'FINAL' : pq ? `${pq} ${e.clk || ''}`.trim() : '';
     const wd = wpWords(e), strip = box.querySelector('.wpplay');
     // what the play did to its own side's chance (the clock's jump goes to whoever it helped)
     const own = e.kind === 'clock' ? Math.abs(e.dw) : (e.side === 'b' ? -e.dw : e.dw);
@@ -4065,6 +4183,11 @@ function fitGauges(page) {
         }
     }
 }
+// A drawer starts under the top bar and leaves it whole: the bar's buttons stay
+// in reach while one is open, and the one that opened it closes it. The bar is
+// shorter in a narrow window, so its height is measured, not assumed, and kept
+// on the root, where the drawer's own rule reads it.
+function syncBar() { const b = $('.topbar'); if (b && root) root.style.setProperty('--bar-h', `${b.offsetHeight}px`); }
 // After a render, read the score bug's box widths and hand them to the
 // curve's panes. A change re-renders once, synchronously — before paint, so
 // nothing flickers — and the second pass measures the same and stops.
@@ -4150,13 +4273,14 @@ function allPlayMap(live) {
     const div = {}; for (const R of S.rosters) { out[R.roster_id] = { w: 0, l: 0, dw: 0, dl: 0, dt: 0 }; div[R.roster_id] = (R.settings || {}).division || 0; }
     for (let w = 1; w <= end && (w < S.curWeek || (live && w === S.curWeek)); w++) {
         const rows = (S.matchups[w] || []).filter(m => m.matchup_id != null && out[m.roster_id]);
-        for (const m of rows) for (const o of rows) { if (o === m) continue; const a = m.points || 0, b = o.points || 0; if (a > b) out[m.roster_id].w++; else if (a < b) out[m.roster_id].l++; else { out[m.roster_id].w += 0.5; out[m.roster_id].l += 0.5; } }
+        const ptsOf = new Map(rows.map((m) => [m, live && w === S.curWeek ? countedPoints(m) : m.points || 0]));   // the week in progress at its projected final
+        for (const m of rows) for (const o of rows) { if (o === m) continue; const a = ptsOf.get(m), b = ptsOf.get(o); if (a > b) out[m.roster_id].w++; else if (a < b) out[m.roster_id].l++; else { out[m.roster_id].w += 0.5; out[m.roster_id].l += 0.5; } }
         // division record: the ACTUAL pairings, when both sides share a division
         const by = {}; for (const m of rows) (by[m.matchup_id] = by[m.matchup_id] || []).push(m);
         for (const pair of Object.values(by)) if (pair.length === 2) {
             const [x, y] = pair;
             if (!div[x.roster_id] || div[x.roster_id] !== div[y.roster_id]) continue;
-            const a = x.points || 0, b = y.points || 0;
+            const a = ptsOf.get(x), b = ptsOf.get(y);
             if (a > b) { out[x.roster_id].dw++; out[y.roster_id].dl++; }
             else if (b > a) { out[y.roster_id].dw++; out[x.roster_id].dl++; }
             else { out[x.roster_id].dt++; out[y.roster_id].dt++; }
@@ -4187,10 +4311,10 @@ function currentSeeds(live) {
     for (let w = 1; w <= last && w <= regSeasonEnd(); w++) {
         const by = {}; for (const m of (S.matchups[w] || [])) if (m.matchup_id != null) (by[m.matchup_id] = by[m.matchup_id] || []).push(m);
         for (const p of Object.values(by)) if (p.length === 2) {
-            const [x, y] = p, a = x.points || 0, b = y.points || 0;
+            const [x, y] = p, now = live && w === S.curWeek, a = now ? countedPoints(x) : x.points || 0, b = now ? countedPoints(y) : y.points || 0;
             if (a > b) H[key(x.roster_id, y.roster_id)] = (H[key(x.roster_id, y.roster_id)] || 0) + 1;
             else if (b > a) H[key(y.roster_id, x.roster_id)] = (H[key(y.roster_id, x.roster_id)] || 0) + 1;
-            // the week in progress also counts toward the record and points, as it stands
+            // the week in progress also counts toward the record and points, at its projected final
             if (live && w === S.curWeek) {
                 const tx = byRid[x.roster_id], ty = byRid[y.roster_id]; if (!tx || !ty) continue;
                 tx.pf += a; ty.pf += b;
@@ -4241,7 +4365,7 @@ function standingsRow(R, i, compact) {
     const lv = stCtx && stCtx.lv ? stCtx.lv[R.roster_id] : null;
     const at0 = lv ? stCtx.pos.was[R.roster_id] : null, at1 = lv ? stCtx.pos.now[R.roster_id] : null;
     const mover = lv && at0 && at1 && at0 !== at1
-        ? h('span', { class: `lvmv ${at0 > at1 ? 'up' : 'dn'}`, title: `${ordinal(at0)} on settled weeks, ${ordinal(at1)} as it stands` }, `${at0 > at1 ? '▲' : '▼'}${Math.abs(at0 - at1)}`) : null;
+        ? h('span', { class: `lvmv ${at0 > at1 ? 'up' : 'dn'}`, title: `${ordinal(at0)} on settled weeks, ${ordinal(at1)} ${liveWord()}` }, `${at0 > at1 ? '▲' : '▼'}${Math.abs(at0 - at1)}`) : null;
     // as it stands, the seed and its mover share a row, the mover's slot held whether or not it is filled
     const seedCell = (inner) => lv ? h('span', { class: 'sdrow' }, inner, mover || h('span', { class: 'lvmv', 'aria-hidden': 'true' })) : inner;
     return h('tr', { class: mine ? 'hl' : '' },
@@ -4251,10 +4375,10 @@ function standingsRow(R, i, compact) {
         h('td', { style: `font-weight:800;${mine ? 'color:var(--teal)' : ''}` }, h('div', { class: 'tcell' }, avatarEl(R, 'sm'),
             vault ? h('span', null, teamName(R)) : teamLink(R),
             vault && vault.pts && vault.pts.has(R.roster_id) ? h('span', { class: 'chip amber', style: 'font-size:9px;margin-left:6px' }, 'points seat') : null)),
-        h('td', { class: 'r mono' }, lv ? `${lv.w}\u2013${lv.l}${lv.t ? '\u2013' + lv.t : ''}` : record(R), lv && lv.res ? h('span', { class: 'lvres', title: `Week ${S.curWeek} as it stands: ${fmtS(lv.pts)}\u2013${fmtS(lv.opp)}` }, h('i'), lv.res) : null),
+        h('td', { class: 'r mono' }, lv ? `${lv.w}\u2013${lv.l}${lv.t ? '\u2013' + lv.t : ''}` : record(R), lv && lv.res ? h('span', { class: 'lvres', title: `Week ${S.curWeek} ${liveWord()}: ${fmtS(lv.pts)}\u2013${fmtS(lv.opp)}` }, h('i'), lv.res) : null),
         (((S.league.settings || {}).divisions || 0) >= 2) ? h('td', { class: 'r mono dim c-div' }, ap && (ap.dw + ap.dl + ap.dt > 0) ? `${ap.dw}\u2013${ap.dl}${ap.dt ? '\u2013' + ap.dt : ''}` : '\u2014') : null,
         h('td', { class: 'r mono c-ap', title: apPlayed ? `${Math.round(100 * ap.w / (ap.w + ap.l))}% of every possible matchup won` : 'Fills in once games are played' }, apPlayed ? `${Math.round(ap.w)}\u2013${Math.round(ap.l)}` : '\u2014'),
-        h('td', { class: 'r mono', title: lv ? `${fmt1(pf(R))} settled + ${fmt1(lv.pts)} this week` : null }, fmt1(lv ? lv.pf : pf(R))), h('td', { class: 'r mono dim c-pa', title: lv ? `${fmt1(pa(R))} settled + ${fmt1(lv.opp)} this week` : null }, fmt1(lv ? lv.pa : pa(R))),
+        h('td', { class: 'r mono', title: lv ? `${fmt1(pf(R))} settled + ${fmt1(lv.pts)} ${liveWeekProjects() ? 'projected ' : ''}this week` : null }, fmt1(lv ? lv.pf : pf(R))), h('td', { class: 'r mono dim c-pa', title: lv ? `${fmt1(pa(R))} settled + ${fmt1(lv.opp)} ${liveWeekProjects() ? 'projected ' : ''}this week` : null }, fmt1(lv ? lv.pa : pa(R))),
         compact ? null : h('td', null, sp ? [h('span', { class: `pos ${sp.pos}` }, posLabel(sp.pos)), ` \u00d7${sp.n}`] : h('span', { class: 'dim' }, '\u2014')),
         vault ? null : h('td', { class: 'r mono c-faab' }, waiverInfo().faab ? `$${faabLeft(R)}` : R.settings.waiver_position),
         vault ? null : live ? h('td', { class: 'c' }, inp == null ? h('span', { class: 'dim' }, '\u2014')
@@ -4415,39 +4539,8 @@ function pageTeam() {
                 mine ? h('button', { class: 'btn sm s', onclick: () => go('players') }, 'Add player')
                     : h('button', { class: 'btn sm s', onclick: () => goTeam(S.myRoster.roster_id) }, '← My team')))));
     if (mine && S.seasonType === 'regular') { const wa = weeksAheadFold(my); if (wa) page.append(wa); }
-    if (isUsage(S.ui.basis)) { const sc = snapShareCard(my); if (sc) page.append(sc); }
     page.append(rosterCard(my, !mine));
     return page;
-}
-// Snap share, last four games against the season, for every starter who has
-// played more than four games — before that the two dots are the same dot.
-// Sorted by how far it moved. The line under each carries the position's own
-// share: carries for a back, targets for everyone else. All Sleeper.
-function snapShareCard(my) {
-    const l4 = l4Pool(), sea = S.seasonStats; if (!l4 || !sea) return null;
-    const rows = [];
-    for (const pid of (my.starters || []).filter(p => p && p !== '0')) {
-        const pos = ppos(pid); if (!['QB', 'RB', 'WR', 'TE'].includes(pos)) continue;
-        const a = l4[pid], b = sea[pid]; if (!a || !b || !(b.gp > a.gp)) continue;
-        const sa = usageVal(a, 'snp'), sb = usageVal(b, 'snp'); if (sa == null || sb == null) continue;
-        const sub = pos === 'QB' ? null : pos === 'RB' ? ['carries', usageVal(b, 'csh', sea), usageVal(a, 'csh')] : ['targets', usageVal(b, 'tsh', sea), usageVal(a, 'tsh')];
-        rows.push({ pid, sa, sb, sub, gp: a.gp });
-    }
-    if (!rows.length) return null;
-    rows.sort((x, y) => Math.abs(y.sa - y.sb) - Math.abs(x.sa - x.sb));
-    const pct = (v) => v == null ? '—' : `${Math.round(v * 100)}%`;
-    return h('div', { class: 'card snapcard' },
-        h('div', { class: 'card-h' }, h('h3', null, 'Snap share, last 4 games vs season'), h('span', { class: 'dim', style: 'font-size:11px' }, 'starters · Sleeper')),
-        ...rows.map(({ pid, sa, sb, sub, gp }) => {
-            const d = sa - sb, moved = Math.abs(d) >= 0.05, tone = !moved ? 'flat' : d > 0 ? 'up' : 'down';
-            const lo = Math.min(sa, sb) * 100, hi = Math.max(sa, sb) * 100;
-            return h('div', { class: `dbl ${tone}` },
-                h('div', { class: 'dbw', onclick: () => { S.ui.sel = pid; render(); } }, h('div', { class: 'avatar sm' }, h('img', { src: headshot(pid), alt: '', onerror: (e) => e.target.remove() })), h('span', null, pname(pid))),
-                h('div', { class: 'dbt', title: `season ${pct(sb)} · last ${gp} games ${pct(sa)}` }, h('span', { class: 'ln', style: `left:${lo}%;width:${hi - lo}%` }), h('span', { class: 'dt s', style: `left:${sb * 100}%` }), h('span', { class: 'dt a', style: `left:${sa * 100}%` })),
-                h('div', { class: 'dbv mono' }, `${pct(sb)} → ${pct(sa)}`, h('small', null, sub && sub[1] != null && sub[2] != null ? `${sub[0]} ${pct(sub[1])} → ${pct(sub[2])}` : `${gp} games`)));
-        }),
-        h('div', { class: 'dbaxis mono' }, h('span'), h('div', null, h('span', null, '0%'), h('span', null, '50%'), h('span', null, '100%')), h('span')),
-        h('div', { class: 'dblegend' }, h('span', null, h('i', { class: 's' }), 'season'), h('span', null, h('i', { class: 'up' }), 'last 4, up'), h('span', null, h('i', { class: 'down' }), 'last 4, down'), h('span', null, h('i', { class: 'flat' }), 'within 5 points')));
 }
 function teamSwitcher(R) {
     const open = S.ui.teamMenu;
@@ -4524,22 +4617,25 @@ function statusChip(pid, week) {
 }
 // Four stat groups; the strips above the stat columns are the only labels.
 const GROUPS = { QB: 'QB', RB: 'SKILL', WR: 'SKILL', TE: 'SKILL', K: 'K', DEF: 'DEF' };
-// Five columns, and the same kind of number in the same column for every group:
-// the fourth is always yards, the fifth always scoring. A back's carries were
-// missing entirely before — the skill strip was a receiver's four.
+// The box score is one set, drawn the same on the roster and on Players and the
+// same under Proj and Actual: a position's own band, then rushing in the last
+// three columns for a quarterback and every skill position alike. Nothing in it
+// is a number Sleeper does not project — red-zone work, air yards and snaps are
+// usage, and live there.
+const BOX_REC = [['rec_tgt', 'TGT'], ['rec', 'REC'], ['rec_yd', 'RE YD'], ['rec_td', 'RE TD']];
+const BOX_RUSH = [['rush_att', 'CAR'], ['rush_yd', 'RU YD'], ['rush_td', 'RU TD']];
 const GROUP_STATS = {
-    QB: [['pass_yd', 'PA YD'], ['pass_td', 'PA TD'], ['pass_int', 'INT'], ['rush_yd', 'RU YD'], ['rush_td', 'RU TD']],
-    SKILL: [['rush_att', 'CAR'], ['rec_tgt', 'TGT'], ['rec', 'REC'], ['yds', 'YDS'], ['tds', 'TD']],
-    K: [['fgm', 'FGM'], ['fga', 'FGA'], ['xpm', 'XPM'], ['fgm_50p', '50+']],
-    DEF: [['sack', 'SCK'], ['int', 'INT'], ['fum_rec', 'FR'], ['yds_allow', 'YDS A'], ['pts_allow', 'PTS A']],
+    QB: [['pass_att', 'ATT'], ['pass_yd', 'PA YD'], ['pass_td', 'PA TD'], ['pass_int', 'INT'], ...BOX_RUSH],
+    SKILL: [...BOX_REC, ...BOX_RUSH],
+    K: [['fgm', 'FGM'], ['fga', 'FGA'], ['fgm_40_49', '40-49'], ['fgm_50p', '50+'], ['xpm', 'XPM'], ['xpa', 'XPA']],
+    DEF: [['sack', 'SACK'], ['int', 'INT'], ['fum_rec', 'FR'], ['td', 'TD'], ['yds_allow', 'YDS A'], ['pts_allow', 'PTS A'], ['safe', 'SFTY']],
 };
-const STAT_N = 5;
+const STAT_N = 7;
 // Usage on the Team page is the deep view: for each position, Sleeper's whole
-// usage set — the Players tab's — led by the rest-of-season projection, every
-// number with a bar for where he ranks at his position and the column to scan
-// first lit, so a cut can be judged from the roster.
+// usage set — the Players tab's — led by the rest-of-season projection, with
+// the column to scan first leading the numbers, so a cut can be judged from the roster.
 const ROS_COL = () => ['ros', 'ROS', `Rest of season: weeks ${Math.max(1, S.curWeek)}–${LAST_WEEK}, Sleeper's projection in this league's scoring, with his rank at the position`];
-const USAGE_N = 10;   // ROS and the longest set, a receiver's or a back's nine
+const USAGE_N = 11;   // ROS and the skill grid's ten
 // His rank at the position by Sleeper's rest-of-season projection.
 const rosRanks = new WeakMap();
 function rosRank(pid) {
@@ -4550,19 +4646,23 @@ function rosRank(pid) {
     return r[pid] || null;
 }
 const deepView = () => isUsage(S.ui.basis);
+// Insight is advice about the lineup to come, so it rides with the projection. Every other view is a record of
+// what happened, and its numbers get the room: on a laptop the column was the part cut off at the right.
+const insightShown = () => !(['wkActual', 'seasActual', 'l4Actual'].includes(S.ui.basis) || deepView());
 const statN = () => isUsage(S.ui.basis) ? USAGE_N : STAT_N;
-// The strip is per POSITION under Usage, not per group — a back and a receiver
-// are used differently — and it is the Players set, so the Team page can never
-// carry a usage column Players does not. A kicker or defence keeps its box score.
+// Under Usage the roster is one grid. Every back, receiver and tight end reads
+// under the same labels in the fixed order, so a number is in the same column
+// all the way down and the labels are drawn once for the run. A quarterback's
+// numbers take the slots that answer the same question: attempts where snaps
+// are, his own carries where a back's are. A kicker or defence keeps its box score.
+const slotCols = (set) => set.map(k => k == null ? [null, '', ''] : [k, USAGE[k][0], USAGE[k][1]]);
 function teamStatSet(group, pos) {
-    const k = usageKeyOf(pos) || 'WR';
 
     if (!isUsage(S.ui.basis) || group === 'K' || group === 'DEF') return GROUP_STATS[group];
-    return [ROS_COL(), ...USAGE_SETS[k].map(key => [key, USAGE[key][0], USAGE[key][1]])];
+    return [ROS_COL(), ...slotCols(group === 'QB' ? QB_SLOTS : USAGE_SETS.SKILL)];
 }
-// A usage strip changes with the position, not just the group.
 const l4Basis = () => S.ui.basis === 'usageL4' || S.ui.basis === 'l4Actual';
-const stripKeyOf = (group, pos) => deepView() && group === 'SKILL' ? `SKILL:${usageKeyOf(pos) || 'WR'}` : group;
+const stripKeyOf = (group) => group;
 function groupOf(pid) { return GROUPS[ppos(pid)] || 'SKILL'; }
 function groupStatVal(line, key) {
     if (!line || !line.stats) return null;
@@ -4574,28 +4674,138 @@ function groupStatRaw(line, key) {
     if (key === 'yds') return st.rush_rec_yd ?? (((st.rush_yd || 0) + (st.rec_yd || 0)) || null);
     if (key === 'tds') return st.anytime_tds ?? (((st.rush_td || 0) + (st.rec_td || 0)) || null);
     if (key === 'pts_allow') return st.pts_allow ?? st.fan_pts_allow ?? null;
-    if (key === 'rush_att' || key === 'rush_td' || key === 'yds_allow') return st[key] ?? null;
+    if (key === 'td') return st.td ?? st.def_td ?? null;   // Sleeper projects a defence's touchdowns as def_td
     return st[key] ?? null;
 }
-// The deep view's cells: ROS with his rank, then each number with a bar under it
-// for where he ranks among the players at his position over the same games.
+// Which way a usage number is better. One that is not listed is a style and not
+// a grade — how deep a man catches the ball — and is never ranked.
+const GRADE = { opp: 1, snp: 1, rz: 1, tsh: 1, ypt: 1, ryac: 1, csh: 1, ypc: 1, yco: 1, att: 1, cmp: 1, ypa: 1, sck: -1 };
+// His rank at the position in one number, among the players with a real role
+// over the same games, and the level that puts the number at. Four levels, read
+// off this league: inside the top twelve (one a team), among the rest of the
+// players the league starts at the position, within a team's worth past them,
+// and beyond. The number is drawn at its level, so the eye finds the strong
+// ones before it has read any. The rank itself is said when the number is
+// pointed at: printed under every number it was a second table on top of the first.
+const levelOf = (rk, n, started) => { const st = Math.max(n, started >= 4 ? started : 2 * n); return rk <= n ? 1 : rk <= st ? 2 : rk <= st + n ? 3 : 4; };
+const startedAt = (pos) => S.rosters.flatMap((r) => r.starters || []).filter((p) => p && p !== '0' && ppos(p) === pos).length;
+function statRank(d, v, way) {
+    if (!d || v == null || !way) return null;
+    const rk = d.pop.filter((p) => way * p[0] > way * v).length + 1;
+    return { rk, of: d.pop.length, step: levelOf(rk, d.g.n, d.g.started) };
+}
+const rankSays = (pos, r, work) => `${ordinal(r.rk)} of the ${r.of} ${posLabel(pos)}s on the field for a quarter of their team’s snaps${work ? `, with ${work.per} ${work.word[1]} a game` : ''}`;
+const levelWord = (step) => { const n = S.rosters.length || 12; return ['', `top ${n}`, 'starter', `next ${n}`, 'beyond'][step] || ''; };
+// What a number says when it is pointed at: his rank, then what is behind the figure, a line each.
+const say = (pos, rk, step, lines) => ({ 'data-say': lines.filter(Boolean).join('\n'), 'data-rank': `${posLabel(pos)}${rk}`, 'data-step': String(step) });
+// What the levels are, in a line under the table.
+const levelKey = () => { const n = S.rosters.length || 12;
+    return h('span', { class: 'lvkey' }, 'A number is drawn by where it ranks at his position:', h('b', { class: 'lv1' }, `top ${n}`), h('b', { class: 'lv2' }, 'a starter in this league'), h('b', { class: 'lv3' }, `the next ${n}`), h('b', { class: 'lv4' }, 'beyond'), 'Point at one for his rank.'); };
+// A rate needs work behind it before it is ranked. One catch on one target is 32
+// yards a target, and set against men with forty targets it led the position.
+// So a rate is ranked only for a man with enough of what it is "per", a game,
+// over his games in view, and only against the others who have it. Passing
+// follows the NFL's own qualifier, 14 attempts a game, and rushing sits a shade
+// under its 6.25 carries. Sacks are a count, but fewer is better, so a
+// quarterback who hardly dropped back would lead those too. A style, such as
+// how deep his catches come, is never ranked, but it is a rate as well: on too
+// little it is drawn dim like the rest, where one deep catch had it shining.
+const RATE_UNIT = { ypt: 'tgt', ypc: 'car', cmp: 'att', ypa: 'att', sck: 'att', adoc: 'rec', aircmp: 'att' };
+const rateUnit = (k) => RATE_UNIT[k];
+const RATE_MIN = { tgt: { WR: 3, TE: 3, RB: 2 }, rec: { WR: 2, TE: 2, RB: 1.5 }, car: { RB: 6, QB: 2 }, att: { QB: 14 } };
+const RATE_STAT = { tgt: 'rec_tgt', rec: 'rec', car: 'rush_att', att: 'pass_att' }, RATE_WORD = { tgt: ['target', 'targets'], rec: ['catch', 'catches'], car: ['carry', 'carries'], att: ['pass attempt', 'pass attempts'] };
+function workFor(line, pos, unit) {
+    const st = (line && line.stats) || {}, games = line && line.gp > 1 ? line.gp : 1, have = st[RATE_STAT[unit]] || 0, per = (RATE_MIN[unit] || {})[pos] || 1;
+    return { have, per, games, ok: have >= per * games, word: RATE_WORD[unit] };
+}
+const workSays = (w, style) => `${w.have} ${w.word[w.have === 1 ? 0 : 1]} over ${w.games} game${w.games === 1 ? '' : 's'}. It takes ${w.per} a game to ${style ? 'go by' : 'be ranked'}.`;
+const unranked = (w, style) => ({ 'data-say': workSays(w, style), 'data-rank': style ? 'Too little to go by' : 'Not ranked', 'data-step': '0' });
+// Which way a number is going: his last four games against his season, for a man
+// with more games than the four. A share has moved at five points, as the
+// roster's own marks say; anything else when it has gone a quarter of the way
+// from the middle of his position to its top scorers. Less than that is steady,
+// and steady carries no mark.
+function moveOf(pid, pos, k) {
+    if (!GRADE[k]) return null;
+    const l4 = l4Pool(), sea = S.seasonStats, a = l4 && l4[pid], b = sea && sea[pid]; if (!a || !b || !(b.gp > a.gp)) return null;
+    const now = usageVal(a, k), was = usageVal(b, k, sea); if (now == null || was == null) return null;
+    const unit = rateUnit(k); if (unit && !(workFor(a, pos, unit).ok && workFor(b, pos, unit).ok)) return null;   // a rate that moved on a handful of plays has not moved
+    let step = 0.05;
+    if (USAGE[k][2] !== 'pct') { const d = usageDist(sea, pos, k, (e) => { const x = usageVal(e, k, sea); return x == null && USAGE_ZERO.has(k) ? 0 : x; }); if (!d || d.top == null) return null;
+        const n = d.pop.length, mid = (d.pop[(n - 1) >> 1][0] + d.pop[n >> 1][0]) / 2; step = Math.abs(d.top - mid) / 4; if (!step) return null; }
+    return { tone: Math.abs(now - was) < step ? 'flat' : (now - was) * GRADE[k] > 0 ? 'up' : 'down', now, was, games: a.gp };
+}
+const moveMark = (m) => m && m.tone !== 'flat' ? h('span', { class: `trend ${m.tone}` }, m.tone === 'up' ? '\u25b2' : '\u25bc') : null;
+// His season, week by week, each week read against its own team totals: this
+// week and the last four from the weeks in hand, older ones from his own game
+// log and the totals saved for that week. Each week is a line to read, a reason
+// there is none, or null while it loads. The player card draws it.
+function seasonWeeks(pid) {
+    const G = (S.gameLog || {})[pid]; if (!G && S.seasonType === 'regular') loadGameLog(pid).then(render).catch(() => {});
+    const team = (P(pid) || {}).team, upto = S.seasonType === 'regular' ? Math.min(LAST_WEEK, S.curWeek) : 0;
+    const weekOf = (w) => {
+        const pl = S.stats[w]; let ln = null;
+        if (pl) ln = pl[pid] || null;
+        else { if (!G || G.loading) return null; const e = G.st && G.st[String(w)]; if (e && e.stats) { const tm = weekTeamTotals(w, e.team || team); if (tm === undefined) return null; ln = { pid, stats: e.stats, tm }; } }
+        if (ln && ln.stats && ((ln.stats.off_snp || 0) > 0 || (ln.stats.gp || 0) > 0)) return { ln, pl };
+        if (w === S.curWeek && !teamGameOver(pid, w)) return { why: null };   // still to play: nothing to mark yet
+        const sched = S.schedule && S.schedule[w];
+        return { why: sched && Object.keys(sched).length && team && !sched[team] ? 'bye' : 'did not play' };
+    };
+    const season = []; for (let w = 1; w <= upto; w++) season.push([w, weekOf(w)]);
+    return season;
+}
+const seriesFrom = (season, get) => season.map(([w, x]) => { if (!x) return [w, undefined]; if (!x.ln) return [w, null, x.why]; const v = get(x.ln, x.pl); return v != null && isFinite(v) ? [w, v] : [w, null, 'no number for this one']; });
+// Where a share stands against the season, beside the last four games' figure:
+// up or down when it moved five points, and nothing when it held: a dash there
+// read as a minus sign. It marks the snap
+// share and the position's own share, carries for a back and targets for a
+// receiver. Only a player with more games than the four gets one: before that
+// the two figures are the same figure. It used to be a card of its own above
+// the roster, a full-width chart for seven pairs of numbers.
+const TREND_KEYS = { RB: ['snp', 'csh'], WR: ['snp', 'tsh'], TE: ['snp', 'tsh'] };
+function shareTrend(pid, k) {
+    if (!(TREND_KEYS[ppos(pid)] || []).includes(k)) return null;
+    const l4 = l4Pool(), sea = S.seasonStats, a = l4 && l4[pid], b = sea && sea[pid];
+    if (!a || !b || !(b.gp > a.gp)) return null;
+    const now = usageVal(a, k), was = usageVal(b, k, sea); if (now == null || was == null) return null;
+    const d = now - was, pc = (v) => `${Math.round(v * 100)}%`; if (Math.abs(d) < 0.05) return null;
+    return h('span', { class: `trend ${d > 0 ? 'up' : 'down'}`, title: `season ${pc(was)} \u2192 last ${a.gp} games ${pc(now)}` }, d > 0 ? '\u25b2' : '\u25bc');
+}
+// The deep view's cells: ROS, then each number, every one drawn at its level at
+// the position and saying his rank when pointed at; over the season an arrow
+// leads a number whose last four games moved against it. It used to be a bar
+// under every number, then his rank under every number.
+// What is behind an opportunity figure, in counts: the carries and targets it was built from.
+const oppWork = (line) => { const st = line && line.stats; if (!st) return null; const g = line.gp > 1 ? line.gp : 1, c = (st.rush_att || 0) / g, t = (st.rec_tgt || 0) / g;
+    return [c >= 0.5 ? `${fmt1(c)} carries` : null, `${fmt1(t)} targets`].filter(Boolean).join(' + ') + (line.gp > 1 ? ' a game' : ''); };
 function deepCells(pid, group) {
     const pos = ppos(pid), line = statLine(pid, S.ui.basis), pool = basisPool(S.ui.basis);
     const key = keyColFor(pos);
 
+    const quiet = (pos === 'WR' || pos === 'TE') && (usageVal(line, 'csh', pool) || 0) < 0.05;
     const cells = teamStatSet(group, pos).map(([fk]) => {
-        if (fk === 'ros') { const r = (S.ros || {})[pid], rk = rosRank(pid);
-            return h('td', { class: 'r mono' }, r ? fmt0(r.pts) : h('span', { class: 'dim' }, S.rosLoading ? '…' : '—'), r && rk ? h('span', { class: 'rk' }, `${posLabel(pos)}${rk}`) : null); }
+        if (fk == null || (quiet && U_RUSH.includes(fk))) return h('td');
+        if (fk === 'ros') { const r = (S.ros || {})[pid], rk = r ? rosRank(pid) : null, lv = rk ? levelOf(rk, S.rosters.length || 12, startedAt(pos)) : 0;
+            return h('td', Object.assign({ class: `r mono${lv ? ' lv' + lv : ''}` }, lv ? say(pos, rk, lv, [`${ordinal(rk)} at his position in Sleeper’s rest-of-season projection`]) : null), r ? fmt0(r.pts) : h('span', { class: 'dim' }, S.rosLoading ? '…' : '—')); }
         const k = fk;
         const get = (e) => { const x = usageVal(e, k, pool); return x == null && USAGE_ZERO.has(k) ? 0 : x; };
         const show = (x) => usageFmt(k, x);
         const v = line ? get(line) : null;
         const cls = `r mono${fk === key ? ' keycol' : ''}`;
         if (v == null) return h('td', { class: cls }, h('span', { class: 'dim' }, '—'));
-        const d = pool && usageDist(pool, pos, fk, get), p = d ? usagePct(d, v) : null;
+        const d = pool && usageDist(pool, pos, fk, get), way = GRADE[k];
+        const unit = rateUnit(fk), work = unit ? workFor(line || (pool && pool[pid]), pos, unit) : null, short = !!work && !work.ok;   // too little behind a rate: not ranked, and drawn dim
+        const r = short ? null : statRank(d, v, way);
 
-        return h('td', { class: cls, title: p ? `${ordinal(p)} percentile of the ${d.pop.length} ${posLabel(pos)}s on the field for a quarter of their team’s snaps` : null },
-            show(v), p ? h('span', { class: 'pc' }, h('i', { style: `width:${p}%` })) : null);
+        const mv = S.ui.basis === 'usageS' ? moveOf(pid, pos, fk) : null;   // over the season, which way his last four games went
+        const why = [r ? rankSays(pos, r, work) : null, fk === 'opp' ? oppWork(line) : null, mv ? `last ${mv.games} games ${usageFmt(fk, mv.now)}, season ${usageFmt(fk, mv.was)}` : null].filter(Boolean);
+        // a style has no rank to say, but its season is still worth a look
+        const style = !way && !short && USAGE[fk] ? { 'data-say': 'A style, not a grade: it carries no rank.', 'data-rank': USAGE[fk][0], 'data-step': '0' } : null;
+        const td = h('td', Object.assign({ class: cls + (r ? ` lv${r.step}` : short ? ' lv0' : '') }, r ? say(pos, r.rk, r.step, why) : short ? unranked(work, !way) : style || { title: why.join(' \u00b7 ') || null }),
+            l4Basis() ? shareTrend(pid, fk) : moveMark(mv), show(v));
+        if (d && USAGE[fk] && (r || short || style)) { td.sayMore = () => seasonTip(pid, pos, fk, d, show); td.sayPid = pid; }   // held there, the tooltip draws his season
+        return td;
     });
     while (cells.length < statN()) cells.push(h('td'));
     return cells;
@@ -4604,7 +4814,10 @@ function groupStatCells(pid, group) {
 
     if (deepView() && group !== 'K' && group !== 'DEF') return deepCells(pid, group);
     const line = statLine(pid, S.ui.basis), set = teamStatSet(group, ppos(pid));
+    // a receiver's rushing columns stay empty until he has carried the ball
+    const runs = group !== 'SKILL' || ppos(pid) === 'RB' || (groupStatVal(line, 'rush_att') || 0) >= 0.5;
     const cells = set.map(([k]) => {
+        if (!runs && k.startsWith('rush')) return h('td');
         const v = groupStatVal(line, k);
         return h('td', { class: 'r mono' }, v == null ? h('span', { class: 'dim' }, '—') : Number.isInteger(v) ? fmt0(v) : fmt1(v));
     });
@@ -4615,10 +4828,9 @@ function stripRow(group, pos) {
     // sticky 4-col lead (the frozen zone) · the points col · the stat labels · insight
     const set = teamStatSet(group, pos);
     const tipped = deepView() && group !== 'K' && group !== 'DEF';
-    const key = tipped ? keyColFor(pos) : null;
-    const cells = set.map(([k, lbl, tip]) => h('td', { class: `lbl${k === key ? ' keycol' : ''}` }, h('span', tipped && k !== 'ros' ? tipAttrs(k, pos) : { title: tip || null }, lbl)));
+    const cells = set.map(([k, lbl, tip]) => k == null ? h('td') : h('td', { class: 'lbl' }, h('span', tipped && k !== 'ros' ? tipAttrs(k, group === 'SKILL' ? 'WR' : pos) : { title: tip || null }, lbl)));
     while (cells.length < statN()) cells.push(h('td'));
-    return h('tr', { class: 'typerow' }, h('td', { colspan: 4, class: 'fxsec' }), h('td'), ...cells, h('td'));
+    return h('tr', { class: 'typerow' }, h('td', { colspan: 4, class: 'fxsec' }), h('td'), ...cells, insightShown() ? h('td') : null);
 }
 // On another manager's roster the swap control has nothing to swap — it
 // becomes the way to ask for that player instead.
@@ -4743,27 +4955,35 @@ function rosterCard(my, ro) {
     const openBench = Math.max(0, benchSlots - ((my.players || []).filter(p => !startersSet.has(p) && !reserve.includes(p) && !taxi.includes(p)).length));
     const bench = (my.players || []).filter(p => !startersSet.has(p) && !reserve.includes(p) && !taxi.includes(p))
         .sort((a, b) => (byGroupOrder.indexOf(groupOf(a)) - byGroupOrder.indexOf(groupOf(b))) || ((projOf(b, S.week) || 0) - (projOf(a, S.week) || 0)));
-    const NCOLS = 6 + statN();   // slot · swap · player · opp · pts · five stats (fourteen under Advanced) · insight (Drop, Own% and St% live on the player card)
+    const showIns = insightShown();
+    const NCOLS = 5 + statN() + (showIns ? 1 : 0);   // slot · swap · player · opp · pts · the stats · insight, under Proj (Drop, Own% and St% live on the player card)
+    // A signed figure to two places (+0.05) is the widest thing a number column holds, so those keep their width.
+    const signedCol = (i) => {  return false; };
+    // Insight is one line of words: where it shows, it gets the width a line needs and the numbers get the rest.
+    // The table stops growing once a number column would pass 104px beside an Insight column, where a wider screen
+    // only adds air. Where Insight is not shown the numbers take its room, so the table is as wide either way.
+    const PTS_W = 96, deepT = statN() > STAT_N, wideT = statN() > USAGE_N, insRoom = !deepT ? 320 : wideT ? 174 : 180, insW = showIns ? insRoom : 0, statMin = !deepT ? 64 : wideT ? 54 : 56, LEAD_W = 452 + PTS_W;
     const INS = insightsIndex(my);
-    const insightTd = (ref) => insightCell(INS, ref);
+    const insightTd = (ref) => showIns ? insightCell(INS, ref) : null;
     const posMark = (pid) => { const p = ppos(pid); return h('span', { class: `pos txt ${p}`, style: 'margin-right:5px' }, posLabel(p)); };
     const colgroup = h('colgroup', null,
-        h('col', { style: 'width:56px' }), h('col', { style: 'width:30px' }), h('col', { style: 'width:280px' }), h('col', { style: 'width:86px' }), h('col', { style: 'width:66px' }),
-        ...Array.from({ length: statN() }, () => h('col', { style: `width:${statN() > STAT_N ? 64 : 92}px` })),
-        h('col'));   /* insight column absorbs the slack */
+        h('col', { style: 'width:56px' }), h('col', { style: 'width:30px' }), h('col', { style: 'width:280px' }), h('col', { style: 'width:86px' }), h('col', { style: `width:${PTS_W}px` }),
+        ...Array.from({ length: statN() }, (_, i) => h('col', { style: signedCol(i) ? 'width:62px' : null })),   /* the numbers share what is left */
+        showIns ? h('col', { style: `width:${insW}px` }) : null);
     const fx = (el, cls) => { el.classList.add('fxc', cls); return el; };
     // the deep views are as wide as their columns, so ten fit a laptop without scrolling sideways
-    const tbl = h('table', { class: 'fixedcols', style: statN() > STAT_N ? `min-width:${518 + statN() * 64 + 200}px` : null }, colgroup, h('tr', null, fx(h('th', null, 'Slot'), 'fx1'), fx(h('th', { class: 'swcol' }, ''), 'fx2'), fx(h('th', null, 'Player'), 'fx3'), fx(h('th', null, 'Opp'), 'fx4'),
-        h('th', { class: 'r', title: (S.ui.basis === 'wkActual' || S.ui.basis === 'usage') ? `Week ${S.week} points` : S.ui.basis === 'wkProj' ? `Week ${S.week} projection` : l4Basis() ? 'Points per game, last four games played' : (S.ui.basis === 'seasActual' || S.ui.basis === 'usageS') ? 'Season points to date' : 'Rest of season, projected' }, (S.ui.basis === 'wkActual' || S.ui.basis === 'usage') ? 'Act' : S.ui.basis === 'wkProj' ? 'Proj' : l4Basis() ? 'Pts/G' : (S.ui.basis === 'seasActual' || S.ui.basis === 'usageS') ? 'Pts' : 'RoS'),
-        h('th', { class: 'r', colspan: statN() }, isUsage(S.ui.basis) ? `Usage · ${S.ui.basis === 'usage' ? 'wk ' + S.week : S.ui.basis === 'usageL4' ? 'last 4 games' : 'season'}` : 'Stats · ' + (S.ui.basis === 'l4Actual' ? 'last 4 games' : S.ui.basis === 'wkActual' ? 'wk actual' : S.ui.basis === 'wkProj' ? 'wk proj' : S.ui.basis === 'seasActual' ? 'season' : 'RoS')),
-        h('th', null, '\u{1F9A1} Insight')));
+    const tbl = h('table', { class: 'fixedcols', style: `min-width:${LEAD_W + statN() * statMin + insW}px;max-width:${LEAD_W + statN() * 104 + insRoom}px` }, colgroup, h('tr', null, fx(h('th', null, 'Slot'), 'fx1'), fx(h('th', { class: 'swcol' }, ''), 'fx2'), fx(h('th', null, 'Player'), 'fx3'), fx(h('th', null, 'Opp'), 'fx4'),
+        h('th', { class: 'r', title: (S.ui.basis === 'wkActual' || S.ui.basis === 'usage') ? `Week ${S.week} points` : S.ui.basis === 'wkProj' ? `Week ${S.week} projection` : l4Basis() ? 'Points per game, last four games played' : (S.ui.basis === 'seasActual' || S.ui.basis === 'usageS') ? 'Season points to date' : 'Rest of season, projected' }, (S.ui.basis === 'wkActual' || S.ui.basis === 'usage') ? 'Pts' : S.ui.basis === 'wkProj' ? 'Proj' : l4Basis() ? 'Pts/G' : (S.ui.basis === 'seasActual' || S.ui.basis === 'usageS') ? 'Pts' : 'ROS'),
+        h('th', { class: 'r', colspan: statN() }, isUsage(S.ui.basis) ? `Usage · ${S.ui.basis === 'usage' ? 'wk ' + S.week : S.ui.basis === 'usageL4' ? 'last 4 games' : 'season'}` : 'Stats · ' + (S.ui.basis === 'l4Actual' ? 'last 4 games' : S.ui.basis === 'wkActual' ? 'wk actual' : S.ui.basis === 'wkProj' ? 'wk proj' : S.ui.basis === 'seasActual' ? 'season' : 'ROS')),
+        showIns ? h('th', null, '\u{1F9A1} Insight') : null));
     const commonCells = (pid) => {
         const line = statLine(pid, S.ui.basis); const l4 = l4Basis(); const seas = !l4 && (S.ui.basis === 'seasActual' || S.ui.basis === 'ros' || S.ui.basis === 'usageS');
         // over the last four, points per game — with the game count when he has fewer than four
         const ptsCell = !line || line.pts == null ? h('span', { class: 'dim' }, '—') : l4 ? [fmt1(line.pts / (line.gp || 1)), l4Short(line) ? h('span', { class: 'was' }, `${line.gp} g`) : null] : seas ? fmt0(line.pts) : (S.ui.basis === 'wkActual' || S.ui.basis === 'usage') ? fmtS(line.pts) : fmt1(line.pts);
+        const rk = line && line.pts != null ? ranksFor(S.ui.basis).pos[pid] : null;
         return [
             fx(oppCell(pid, S.week), 'fx4'),
-            h('td', { class: 'r mono', style: 'font-weight:600' }, ptsCell),
+            h('td', { class: 'r mono', style: 'font-weight:600' }, rk ? h('span', { class: 'rki', title: `${ordinal(rk)} ${posLabel(ppos(pid))} by this column` }, `${posLabel(ppos(pid))}${rk}`) : null, ptsCell),
         ];
     };
     // ── starters, strip when the group changes ──
@@ -4801,7 +5021,7 @@ function rosterCard(my, ro) {
             fx(h('td', null, empty ? h('div', { class: 'rsempty' }, h('span', { class: 'chip red' }, 'Empty slot'), (() => { const ins = INS['slot:' + i]; return ins ? h('span', { class: 'rsetxt', title: ins.text }, ins.text.replace(/^no [\w/ ]+ \u2014 /, '')) : null; })()) : playerCell(pid, S.week)), 'fx3'),
             ...(empty ? [fx(h('td', null), 'fx4'), h('td', { class: 'r mono red' }, '—')] : commonCells(pid)),
             ...(empty ? [h('td', { colspan: statN() })] : groupStatCells(pid, slotGroup)),
-            empty ? h('td', { class: 'inscol' }) : insightTd(pid)));
+            empty ? (showIns ? h('td', { class: 'inscol' }) : null) : insightTd(pid)));
     });
     // ── bench ──
     {
@@ -4863,7 +5083,9 @@ function rosterCard(my, ro) {
     }
     for (const pid of taxi) tbl.append(h('tr', null, fx(h('td', null, h('span', { class: 'pos TAXI' }, 'TAXI')), 'fx1'), fx(h('td', { class: 'swcol' }), 'fx2'), fx(h('td', null, benchPlayerCell(pid, null)), 'fx3'), ...commonCells(pid), ...groupStatCells(pid, groupOf(pid)), insightTd(pid)));
     const foot = deepView() ? h('div', { class: 'gloss' },
-        h('span', null, 'The bar under each number is where he ranks at his position, among the players on the field for a quarter of their team’s snaps over the same games: full is the best in the league. ROS is Sleeper’s rest-of-season projection, with his rank. Hover any column header for what it is and a 2025 yardstick.')) : null;
+        levelKey(), h('span', null, 'He is ranked among the players at his position on the field for a quarter of their team’s snaps, over the same games. A rate is ranked only with enough work behind it; with too little it is drawn dim.'),
+        S.ui.basis === 'usageS' ? h('span', null, h('span', { class: 'trend up' }, '\u25b2'), h('span', { class: 'trend down' }, '\u25bc'), ' his last four games against his season; no mark is steady.') : null,
+        h('span', null, `${isUsage(S.ui.basis) ? 'ROS is Sleeper’s rest-of-season projection, drawn the same way. ' : ''}Hover a column header for what it is and how this season’s players at the position compare.`)) : null;
     return h('div', { class: 'card' }, h('div', { class: 'card-h' }, h('h3', null, ro ? `${teamName(my)} — roster` : 'Roster'), periodCluster({ team: true })), h('div', { class: 'scroll-x' }, tbl), foot);
 }
 // Every row leads with the position now, so this only adds the bench note.
@@ -4923,13 +5145,9 @@ function confirmDrop(pid) {
 // ── Players ──────────────────────────────────────────────────────────────────
 // Which stat lines matter, per position, for the table's numeric block.
 const STAT_COLS = {
-    ALL: [['pass_yd', 'Pa Yd'], ['pass_td', 'Pa TD'], ['rush_yd', 'Ru Yd'], ['rush_td', 'Ru TD'], ['rec', 'Rec'], ['rec_yd', 'Re Yd'], ['rec_td', 'Re TD']],
-    QB: [['pass_cmp', 'Cmp'], ['pass_att', 'Att'], ['pass_yd', 'Pa Yd'], ['pass_td', 'Pa TD'], ['pass_int', 'INT'], ['pass_sack', 'Sck'], ['rush_yd', 'Ru Yd'], ['rush_td', 'Ru TD']],
-    RB: [['rush_att', 'Att'], ['rush_yd', 'Ru Yd'], ['rush_td', 'Ru TD'], ['rush_rz_att', 'RZ'], ['rec_tgt', 'Tgt'], ['rec', 'Rec'], ['rec_yd', 'Re Yd'], ['rec_td', 'Re TD'], ['snap', 'Snap%']],
-    WR: [['rec_tgt', 'Tgt'], ['rec', 'Rec'], ['rec_yd', 'Re Yd'], ['rec_td', 'Re TD'], ['rec_rz_tgt', 'RZ'], ['rec_air_yd', 'Air'], ['rush_yd', 'Ru Yd'], ['snap', 'Snap%']],
-    TE: [['rec_tgt', 'Tgt'], ['rec', 'Rec'], ['rec_yd', 'Re Yd'], ['rec_td', 'Re TD'], ['rec_rz_tgt', 'RZ'], ['snap', 'Snap%']],
-    K: [['fgm', 'FGM'], ['fga', 'FGA'], ['fgm_40_49', '40-49'], ['fgm_50p', '50+'], ['xpm', 'XPM'], ['xpa', 'XPA']],
-    DEF: [['sack', 'Sck'], ['int', 'INT'], ['fum_rec', 'FR'], ['td', 'TD'], ['safe', 'Sfty'], ['yds_allow', 'Yd Alw'], ['pts_allow', 'Pts Alw']],
+    ALL: [['pass_yd', 'PA YD'], ['pass_td', 'PA TD'], ['rec', 'REC'], ['rec_yd', 'RE YD'], ['rec_td', 'RE TD'], ['rush_yd', 'RU YD'], ['rush_td', 'RU TD']],
+    QB: GROUP_STATS.QB, RB: [...BOX_RUSH, ...BOX_REC],   // a back's own tab leads with the ground game
+    WR: BOX_REC, TE: BOX_REC, FLEX: GROUP_STATS.SKILL, K: GROUP_STATS.K, DEF: GROUP_STATS.DEF,
 };
 // Periods. Weekly: the week in the top bar, actual if it has been played,
 // projected if it has not, both when it is the current week. Season: to date,
@@ -5144,71 +5362,85 @@ const l4Short = (line) => { const pool = l4Pool(); return !!(line && pool && lin
 // already make. The shares need the TEAM's totals, and every player at every
 // position is in the pull, so a pool is summed once and remembered. Sleeper's
 // air yards are counted on completions, not targets — so this is "air yards
-// per catch" and never called aDOT.
+// per catch", not depth of target.
 const USAGE = {
     snp:    ['SNAP%', 'share of his team’s offensive snaps', 'pct'],
     tsh:    ['TGT%', 'target share: his targets over his team’s', 'pct'],
     csh:    ['CAR%', 'carry share: his carries over his team’s', 'pct'],
-    ash:    ['AIR%', 'share of his team’s air yards (Sleeper counts them on completions)', 'pct'],
-    wopr:   ['OPP RATING', 'weighted opportunity: 1.5 × target share + 0.7 × air-yard share, on completed air yards', 'f2'],
     adoc:   ['AIR/REC', 'air yards per catch — how far downfield his catches come', 'f1'],
     ryac:   ['YAC', 'yards after the catch', 'f0'],
-    cyac:   ['YAC', 'yards after contact, rushing', 'f0'],
+    yco:    ['YCO', 'yards after contact, rushing', 'f0'],
     ypc:    ['YPC', 'yards per carry', 'f1'],
-    ypt:    ['YDS/TGT', 'yards per target', 'f1'],
+    ypt:    ['Y/TGT', 'yards per target', 'f1'],
     touch:  ['TOUCH', 'carries + targets', 'f0'],
-    rz:     ['RZ', 'red-zone carries + targets', 'f0'],
-    fd:     ['FD', 'first downs, rushing + receiving', 'f0'],
+    rz:     ['RZ', 'red-zone plays that went through him: carries + targets, or a quarterback’s passes + carries', 'f0'],
     rtg:    ['RTG', 'passer rating', 'f1'],
     cmp:    ['CMP%', 'completion percentage', 'f1'],
     ypa:    ['YPA', 'yards per attempt', 'f1'],
-    sck:    ['SACK', 'times sacked', 'f0'],
-    rzatt:  ['RZ', 'red-zone pass attempts', 'f0'],
+    sck:    ['SACKED', 'times sacked', 'f0'],
+    att:    ['ATT', 'pass attempts', 'f1'],
     aircmp: ['AIR/CMP', 'air yards per completion', 'f1'],
-    xopp:   ['OPP PTS', 'what his carries and targets are usually worth, in this league’s scoring', 'f1'],
+    opp:    ['OPP PTS', 'what his share of the offence is usually worth, in this league’s scoring', 'f1'],
 };
-// Opportunity points for backs. Each unit of workload is priced by the stats
-// backs averaged from one in 2023–25 (Sleeper's box scores): a carry outside
-// the red zone, one inside it, a
-// target outside, one inside. Rushing stats are fit on carries and receiving
-// stats on targets. The league's own scoring then prices that expected stat line
-// through scoreStats, so the column is right in PPR, half, standard or
-// first-down leagues without a special case. In half PPR a carry is worth 0.50,
-// a red-zone carry 1.27, a target 1.03, a red-zone target 2.01.
-// Tested out of sample: early in the season, among backs scoring the same, the
-// one with more of it scored more the rest of the way — and plain touches did
-// as well. It earns its place by being in points: set beside PTS/G, the gap
-// between a back's work and his scoring reads in one look.
+// The price list for a back: the stat line backs got from one carry and from one
+// target, outside the red zone and inside it, in 2023–25 (Sleeper's box scores).
+// Rushing stats are fit on carries and receiving stats on targets.
 const OPP_RB = { carry: { rush_yd: 4.4778, rush_td: 0.0098, rush_fd: 0.1967, fum_lost: 0.0037 }, rz_carry: { rush_yd: 3.9352, rush_td: 0.1471, rush_fd: 0.194, fum_lost: 0.0007 },
     target: { rec: 0.784, rec_yd: 5.8469, rec_td: 0.0107, rec_fd: 0.2331, fum_lost: 0.0072 }, rz_target: { rec: 0.7772, rec_yd: 5.2029, rec_td: 0.1823, rec_fd: 0.1904, fum_lost: -0.0028 } };
-function oppPoints(st) {
-    const ca = st.rush_att || 0, ta = st.rec_tgt || 0; if (!ca && !ta) return null;
-    const crz = Math.min(ca, st.rush_rz_att || 0), trz = Math.min(ta, st.rec_rz_tgt || 0);
-    const n = { carry: ca - crz, rz_carry: crz, target: ta - trz, rz_target: trz }, x = { rush_att: ca, rec_tgt: ta };
-    for (const [c, per] of Object.entries(OPP_RB)) for (const [k, v] of Object.entries(per)) x[k] = (x[k] || 0) + n[c] * v;
-    x.bonus_rec_rb = x.rec;   // leagues that pay backs extra per catch
+// Opportunity points, for backs, receivers and tight ends alike. His share of
+// his team's targets — and of its carries, for a back — times what a normal
+// offence throws and runs in a game, priced by the stat line players at his
+// position got from one target or one carry in 2023–25 (Sleeper's box scores,
+// red zone and all). The league's own scoring prices that line through
+// scoreStats, so the column is right in any format. Shares, not counts: over a
+// few games a count follows the score of the games, a share follows the role.
+// Tested out of sample on 2023–25, in standard, half and full PPR: early in the
+// season, among players scoring the same, the one with more of it scored more
+// the rest of the way. It did as well as plain touches for a back and better
+// than pricing each carry and target one by one at every position, far better
+// for a tight end; for a wide receiver, a rating that adds his share of the air
+// yards explained a little more. By midseason points carry it, tight ends apart.
+const OPP_GAME = { tgt: 31.29, rzt: 3.83, car: 26.88, rzc: 4.50 };
+const OPP_REC = {
+    WR: { target: { rec: 0.6369, rec_yd: 8.31, rec_td: 0.0245, rec_fd: 0.3515 }, rz_target: { rec: 0.6238, rec_yd: 5.5476, rec_td: 0.2258, rec_fd: 0.1917 } },
+    TE: { target: { rec: 0.7279, rec_yd: 7.5246, rec_td: 0.0078, rec_fd: 0.3437 }, rz_target: { rec: 0.6973, rec_yd: 6.271, rec_td: 0.2963, rec_fd: 0.2183 } },
+};
+const OPP_LINE = (() => {
+    const mix = (a, b, r) => { const o = {}; for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) o[k] = (a[k] || 0) * (1 - r) + (b[k] || 0) * r; return o; };
+    const rt = OPP_GAME.rzt / OPP_GAME.tgt, rc = OPP_GAME.rzc / OPP_GAME.car, o = {};
+    for (const [pos, L] of Object.entries({ RB: OPP_RB, ...OPP_REC })) o[pos] = { target: mix(L.target, L.rz_target, rt), carry: L.carry ? mix(L.carry, L.rz_carry, rc) : null };
+    return o;
+})();
+function oppShare(pos, tsh, csh) {
+    const L = OPP_LINE[pos]; if (!L || tsh == null) return null;
+    const x = { rec_tgt: tsh * OPP_GAME.tgt };
+    for (const [k, v] of Object.entries(L.target)) x[k] = (x[k] || 0) + x.rec_tgt * v;
+    if (L.carry && csh != null) { x.rush_att = csh * OPP_GAME.car; for (const [k, v] of Object.entries(L.carry)) x[k] = (x[k] || 0) + x.rush_att * v; }
+    x[`bonus_rec_${pos.toLowerCase()}`] = x.rec;   // leagues that pay a position extra per catch
     return scoreStats(x);
 }
-// The column to scan first, per position, where the evidence says one exists.
-// Tested on 2023–25: early in the season, among players who have scored the
-// same, the one with more opportunity scored more the rest of the way.
-// Receivers: the opportunity rating (target share runs level with it, and edges
-// it for TEs). Backs: opportunity points (touches run level). By midseason a
-// player's points already carry this, which the tooltip says too.
-const keyColFor = (pos) => pos === 'WR' || pos === 'TE' ? ('wopr') : pos === 'RB' ? 'xopp' : null;
-// The Players supersets; the Team page shows the first five of each, chosen so
-// a back's strip and a receiver's read in parallel: share · efficiency · after
-// the catch or contact · red zone.
+// The column to scan first: opportunity points, wherever a back, a receiver or
+// a tight end is on the row. A quarterback has none.
+const keyColFor = (pos) => pos === 'QB' || pos === 'K' || pos === 'DEF' ? null : 'opp';
+// One usage grid. The lead: what his role is worth, how much he plays, his
+// red-zone work. Then his end of the passing game, then the ground game. The
+// roster, Flex and All read in that order; a back's own tab leads with the
+// ground game, and a receiver's has none.
+const U_LEAD = ['opp', 'snp', 'rz'], U_REC = ['tsh', 'ypt', 'ryac', 'adoc'], U_RUSH = ['csh', 'ypc', 'yco'];
 const USAGE_SETS = {
-    WR: ['snp', 'tsh', 'adoc', 'ryac', 'rz', 'ash', 'wopr', 'ypt', 'fd'],
-    RB: ['snp', 'csh', 'ypc', 'cyac', 'rz', 'tsh', 'touch', 'xopp', 'fd'],
-    QB: ['rtg', 'cmp', 'ypa', 'sck', 'rzatt', 'aircmp'],
-    ALL: ['snp', 'tsh', 'csh', 'touch', 'ryac', 'rz', 'fd'],
+    SKILL: [...U_LEAD, ...U_REC, ...U_RUSH],
+    RB: [...U_LEAD, ...U_RUSH, ...U_REC],
+    WR: [...U_LEAD, ...U_REC],
+    QB: ['att', 'rz', 'cmp', 'ypa', 'aircmp', 'sck', 'csh', 'ypc'],
 };
-USAGE_SETS.TE = USAGE_SETS.WR; USAGE_SETS.FLEX = USAGE_SETS.ALL;
+USAGE_SETS.TE = USAGE_SETS.WR; USAGE_SETS.FLEX = USAGE_SETS.ALL = USAGE_SETS.SKILL;
+// The player card adds the ones the tables have no room for.
+const CARD_MORE = { QB: ['rtg'], RB: ['touch'] };
+// A quarterback in the skill grid's slots, for the roster, where the columns are shared.
+const QB_SLOTS = [null, 'att', 'rz', 'cmp', 'ypa', 'aircmp', 'sck', 'csh', 'ypc', null];
 // Over more than one game the counts read per game, so a player who missed one
 // is not marked down and the tooltip yardsticks mean the same thing in any window.
-const PER_GAME = new Set(['ryac', 'cyac', 'touch', 'xopp', 'rz', 'fd', 'sck', 'rzatt']);
+const PER_GAME = new Set(['ryac', 'yco', 'touch', 'rz', 'sck', 'att']);
 const isUsage = (b) => b === 'usage' || b === 'usageS' || b === 'usageL4';
 const usageFmt = (key, v) => v == null ? null : USAGE[key][2] === 'pct' ? `${Math.round(v * 100)}%` : USAGE[key][2] === 'f2' ? v.toFixed(2) : USAGE[key][2] === 'f1' ? fmt1(v) : Number.isInteger(v) ? fmt0(v) : fmt1(v);
 const usageKeyOf = (pos) => pos === 'TE' ? 'WR' : (USAGE_SETS[pos] ? pos : null);
@@ -5219,8 +5451,8 @@ function teamTotals(pool) {
     const t = {};
     for (const [pid, line] of Object.entries(pool)) {
         const st = line && line.stats; const tm = (P(pid) || {}).team; if (!st || !tm) continue;
-        const e = t[tm] = t[tm] || { tgt: 0, car: 0, air: 0 };
-        e.tgt += st.rec_tgt || 0; e.car += st.rush_att || 0; e.air += st.pass_air_yd || 0;
+        const e = t[tm] = t[tm] || { tgt: 0, car: 0, air: 0, snp: 0 };
+        e.tgt += st.rec_tgt || 0; e.car += st.rush_att || 0; e.air += st.pass_air_yd || 0; e.snp = Math.max(e.snp, st.tm_off_snp || 0);
     }
     teamTotalsCache.set(pool, t);
     return t;
@@ -5239,7 +5471,11 @@ function usageVal(line, key, pool) {
 }
 function usageRaw(line, key, pool) {
     const st = line.stats, pos = ppos(line.pid), tm = (P(line.pid) || {}).team;
-    const tt = line.tm || ((pool && tm) ? (teamTotals(pool)[tm] || null) : null);
+    let tt = line.tm || ((pool && tm) ? (teamTotals(pool)[tm] || null) : null);
+    // A season's team totals cover every game the team has played. A man who missed some is measured
+    // against the games he was there for: Sleeper counts the team's snaps over his games only, so
+    // their share of the team's season cuts its targets, carries and air yards down to his.
+    if (tt && !line.tm && tt.snp && st.tm_off_snp && st.tm_off_snp < tt.snp) { const f = st.tm_off_snp / tt.snp; tt = { tgt: tt.tgt * f, car: tt.car * f, air: tt.air * f }; }
     if (pos === 'K' || pos === 'DEF') return null;
     const share = (n, d) => (d && n != null ? n / d : null);
     // Sleeper leaves a stat out of the box score when it is zero. For a man who
@@ -5249,28 +5485,24 @@ function usageRaw(line, key, pool) {
     // account for — five catches for 69 with 69 after the catch is no air yards.
     // Only catches with neither figure stay unknown.
     const on = (st.off_snp || 0) > 0 || (st.gp || 0) > 0, zero = (v) => v ?? (on ? 0 : null);
-    const air = st.rec_air_yd ?? (st.rec_yar != null ? (st.rec_yd || 0) - st.rec_yar : !st.rec && on ? 0 : null);
     const yac = st.rec_yar ?? (st.rec_air_yd != null ? (st.rec_yd || 0) - st.rec_air_yd : !st.rec && on ? 0 : null);
     switch (key) {
         case 'snp': return st.tm_off_snp ? (st.off_snp || 0) / st.tm_off_snp : null;
         case 'tsh': return tt ? share(zero(st.rec_tgt), tt.tgt) : null;
         case 'csh': return tt ? share(zero(st.rush_att), tt.car) : null;
-        case 'ash': return tt ? share(air, tt.air) : null;
-        case 'wopr': { const a = usageRaw(line, 'tsh', pool), b = usageRaw(line, 'ash', pool); return a == null || b == null ? null : 1.5 * a + 0.7 * b; }
         case 'adoc': return st.rec ? (st.rec_air_yd || 0) / st.rec : null;
         case 'ryac': return yac;
-        case 'cyac': return st.rush_yac ?? null;
+        case 'yco': return st.rush_yac ?? null;
         case 'ypc': return st.rush_ypa ?? (st.rush_att ? (st.rush_yd || 0) / st.rush_att : null);
         case 'ypt': return st.rec_ypt ?? (st.rec_tgt ? (st.rec_yd || 0) / st.rec_tgt : null);
         case 'touch': return ((st.rush_att || 0) + (st.rec_tgt || 0)) || null;
-        case 'xopp': return pos === 'RB' ? oppPoints(st) : null;
-        case 'rz': return ((st.rec_rz_tgt || 0) + (st.rush_rz_att || 0)) || null;
-        case 'fd': return ((st.rec_fd || 0) + (st.rush_fd || 0)) || null;
+        case 'opp': return oppShare(pos, usageRaw(line, 'tsh', pool), usageRaw(line, 'csh', pool));
+        case 'att': return st.pass_att ?? null;
+        case 'rz': return ((pos === 'QB' ? st.pass_rz_att || 0 : st.rec_rz_tgt || 0) + (st.rush_rz_att || 0)) || null;
         case 'rtg': return st.pass_rtg ?? passerRating(st);
         case 'cmp': return st.cmp_pct ?? (st.pass_att ? (st.pass_cmp || 0) / st.pass_att * 100 : null);
         case 'ypa': return st.pass_ypa ?? (st.pass_att ? (st.pass_yd || 0) / st.pass_att : null);
         case 'sck': return st.pass_sack ?? null;
-        case 'rzatt': return st.pass_rz_att ?? null;
         case 'aircmp': return st.pass_cmp ? (st.pass_air_yd || 0) / st.pass_cmp : null;
         default: return null;
     }
@@ -5281,185 +5513,180 @@ function statVal(line, key) {
     const st = line.stats, pg = (v) => v != null && line.tm && line.gp > 1 ? v / line.gp : v;   // the last four: per game
     if (key === 'snap') { const a = st.off_snp, b = st.tm_off_snp; return (a != null && b) ? a / b * 100 : null; }
     if (key === 'pts_allow') return pg(st.pts_allow ?? st.fan_pts_allow ?? null);
+    if (key === 'td') return pg(st.td ?? st.def_td ?? null);
     return pg(st[key] ?? null);
 }
 // ── header tooltips: what it is, how to use it, and a yardstick ─────────────
-// Every usage header carries one. The yardstick is the position in
-// view: the 2025 median and the cutoffs to rank top-24 and top-12 (top-12 and
-// top-6 for TEs, top-12 and top-5 for QBs). Usage
-// figures are Sleeper's, 50+ targets / 100+ carries / 250+ attempts. Counts are
-// per game, which is how the tables show them over more than one game.
+// Every usage header carries one. The yardstick is not stored: it is
+// this season's players at the position in view, over the games the column
+// covers, worked out when the tooltip opens (peerLine). Last year's league is
+// never the measure of this year's.
 const TIPS = {
     'u:snp': { name: 'Snap share', what: 'The share of his team’s offensive plays he was on the field for.',
-        use: 'The floor under everything else, since he can’t earn looks from the sideline. Snaps usually rise a week or two before targets do, so a jump here is the earliest sign of a bigger role. A receiver under 60% is a part-timer whose weeks will swing.',
-        bench: { WR: ['median 72%', 'top-24 83%', 'top-12 88%'], TE: ['median 71%', 'top-12 81%', 'top-6 86%'], RB: ['median 54%', 'top-24 54%', 'top-12 63%'] } },
+        use: 'The floor under everything else, since he can’t earn looks from the sideline. Snaps usually rise a week or two before targets do, so a jump here is the earliest sign of a bigger role. A receiver under 60% is a part-timer whose weeks will swing.' },
     'u:tsh': { name: 'Target share', what: 'His targets as a share of all his team’s targets.',
-        use: 'The best single predictor of a receiver’s fantasy points. Trust it over yards in a small sample: 25% with a quiet box score is still a start, because the looks are what carry into next week.',
-        bench: { WR: ['median 18%', 'top-24 23%', 'top-12 28%'], TE: ['median 16%', 'top-12 19%', 'top-6 20%'], RB: ['median 9%', 'top-24 9%', 'top-12 11%'] } },
+        use: 'The best single predictor of a receiver’s fantasy points. Trust it over yards in a small sample: 25% with a quiet box score is still a start, because the looks are what carry into next week.' },
     'u:csh': { name: 'Carry share', what: 'His carries as a share of all his team’s carries.',
-        use: 'Who owns the backfield. At 60% or more he’s a workhorse you start regardless of matchup. Under 40% he’s in a committee and needs a touchdown or a receiving role to pay off.',
-        bench: { RB: ['median 43%', 'top-24 47%', 'top-12 60%'] } },
+        use: 'Who owns the backfield. At 60% or more he’s a workhorse you start regardless of matchup. Under 40% he’s in a committee and needs a touchdown or a receiving role to pay off.' },
     'u:adoc': { name: 'Air yards per catch', what: 'How far past the line of scrimmage his catches were made. Sleeper counts air yards on completions only.',
-        use: 'Tells you his role. High means a deep threat whose weeks boom or bust. Low means short-area work that needs volume or yards after the catch. For true depth on every target, see aDOT.',
-        bench: { WR: ['median 8.8', 'top-24 10.2', 'top-12 11.2'], TE: ['median 5.3', 'top-12 5.9', 'top-6 6.8'] } },
+        use: 'Tells you his role. High means a deep threat whose weeks boom or bust. Low means short-area work that needs volume or yards after the catch. A back’s is often below zero: his catches come behind the line.' },
     'u:ryac': { name: 'Yards after the catch', what: 'Receiving yards gained after the ball was caught.',
-        use: 'What he creates on his own. Strong after-catch yardage makes a short-target role worth starting, and it holds up better from year to year than touchdowns do.',
-        bench: { WR: ['median 14/g', 'top-24 18', 'top-12 26'], TE: ['median 18/g', 'top-12 20', 'top-6 23'], RB: ['median 20/g', 'top-24 19', 'top-12 26'] } },
-    'u:cyac': { name: 'Yards after contact', what: 'Rushing yards gained after the first defender touched him.',
-        use: 'A back’s own contribution beyond his blocking. Strong after-contact numbers hold up when the line struggles. Weak ones mean his yards per carry depend on the line in front of him.',
-        bench: { RB: ['median 23/g', 'top-24 23', 'top-12 29'] } },
+        use: 'What he creates on his own. Strong after-catch yardage makes a short-target role worth starting, and it holds up better from year to year than touchdowns do.' },
+    'u:yco': { name: 'Yards after contact', what: 'Rushing yards gained after the first defender touched him.',
+        use: 'A back’s own contribution beyond his blocking. Strong after-contact numbers hold up when the line struggles. Weak ones mean his yards per carry depend on the line in front of him.' },
     'u:ypc': { name: 'Yards per carry', what: 'Rushing yards divided by carries.',
-        use: 'Noisy: one long run can swing a month. Use it as a tiebreaker behind carry share and red-zone work, and check RYOE before believing a big number.',
-        bench: { RB: ['median 4.4', 'top-24 4.4', 'top-12 4.8'] } },
-    'u:rz': { name: 'Red-zone looks', what: 'Targets plus carries inside the opponent’s 20.',
-        use: 'Where touchdowns come from. Red-zone work without touchdowns yet means they’re due. Touchdowns without red-zone work means he’s running hot, and that usually doesn’t last.',
-        bench: { WR: ['median 0.75/g', 'top-24 0.9', 'top-12 1.1'], TE: ['median 0.75/g', 'top-12 0.9', 'top-6 1.3'], RB: ['median 2.2/g', 'top-24 2.2', 'top-12 2.8'] } },
-    'u:ash': { name: 'Air-yard share', what: 'His share of his team’s air yards, counted on completions only.',
-        use: 'How much of the downfield passing goes his way. Read it next to target share: a high air share on a modest target share is a deep threat, and both high is a true number one.',
-        bench: {} },
-    'u:wopr': { name: 'Opportunity rating', what: '1.5 × target share + 0.7 × air-yard share. Sleeper’s air yards count completions only, so this runs a little off the standard figure.',
-        use: 'Scan this first early in the season. In 2023–25, among receivers who had scored the same over the first three weeks, the one with the higher rating scored more the rest of the way. By midseason his points already carry it. When the Advanced columns are in, the standard version replaces this one.',
-        bench: {} },
+        use: 'Noisy: one long run can swing a month. Use it as a tiebreaker behind carry share and red-zone work' + '.' },
+    'u:rz': { name: 'Red-zone looks', what: 'Plays inside the opponent’s 20 that went through him: carries plus targets, and for a quarterback his passes plus his carries.',
+        use: 'Where touchdowns come from. Red-zone work without touchdowns yet means they’re due. Touchdowns without red-zone work means he’s running hot, and that usually doesn’t last.' },
     'u:ypt': { name: 'Yards per target', what: 'Receiving yards divided by targets.',
-        use: 'Efficiency on the looks he gets. Above 9 is excellent and often falls back. Below 7 on heavy volume means the offense is feeding him inefficiently, and he’s still a start for the volume.',
-        bench: { WR: ['median 7.6', 'top-24 8.5', 'top-12 9.7'], TE: ['median 7.3', 'top-12 7.3', 'top-6 8.7'] } },
-    'u:fd': { name: 'First downs', what: 'Receiving plus rushing first downs.',
-        use: 'A steady sign of role that moves less than touchdowns do. It’s also points in leagues that score first downs.',
-        bench: { WR: ['median 2.0/g', 'top-24 2.6', 'top-12 2.8'], TE: ['median 1.6/g', 'top-12 1.7', 'top-6 2.4'], RB: ['median 3.1/g', 'top-24 3.1', 'top-12 3.8'] } },
-    'u:xopp': { name: 'Opportunity points', what: 'What his carries and targets are usually worth, in this league’s scoring, per game. Each is priced by what backs got from one in 2023–25; red-zone carries and targets are priced on their own, since that is where touchdowns come from.',
-        use: 'Scan this first early in the season, against Pts/G: well below it means buy, well above it means sell. In 2023–25, among backs who had scored the same over the first three weeks, the one with more of it scored more the rest of the way. Touches ran level with it; this one is in points, so the gap reads directly. By midseason his points already carry it.',
-        bench: {} },
+        use: 'Efficiency on the looks he gets. Above 9 is excellent and often falls back. Below 7 on heavy volume means the offense is feeding him inefficiently, and he’s still a start for the volume.' },
+    'u:opp': { name: 'Opportunity points', what: 'What his share of the offence is usually worth, per game, in this league’s scoring: his share of his team’s targets, and of its carries for a back, times what a normal offence throws and runs, priced by what players at his position got from each in 2023–25.',
+        use: 'Scan this first early in the season, against his points per game: well below it means buy, well above it means sell. In 2023–25, among players who had scored the same over the first three weeks, the one with more of it scored more the rest of the way, in standard, half and full PPR. By midseason his points already carry most of it, except for tight ends, where it keeps helping.' },
+    'u:att': { name: 'Pass attempts', what: 'Passes thrown, per game.',
+        use: 'A quarterback’s volume. More attempts mean more yards and touchdowns available to him and to everyone he throws to.' },
     'u:touch': { name: 'Touches', what: 'Carries plus targets.',
-        use: 'Raw volume. Around 19 a game is RB1 work for a back, and in PPR a target is worth more than a carry.',
-        bench: { RB: ['median 15.5/g', 'top-24 16', 'top-12 18.8'], WR: ['median 6.1/g', 'top-24 7.2', 'top-12 8.1'] } },
+        use: 'Raw volume. Around 19 a game is RB1 work for a back, and in PPR a target is worth more than a carry.' },
     'u:rtg': { name: 'Passer rating', what: 'The NFL’s passer rating formula.',
-        use: 'A blunt summary that overweights touchdowns and interceptions. Use it as a sanity check, not as a start/sit input. YPA and EPA/DB are better guides.',
-        bench: { QB: ['median 94', 'top-12 98', 'top-5 102'] } },
+        use: 'A blunt summary that overweights touchdowns and interceptions. Use it as a sanity check, not as a start/sit input. ' + ('YPA is a better guide.') },
     'u:cmp': { name: 'Completion %', what: 'Completions divided by attempts.',
-        use: 'Depends heavily on how far downfield he throws, so read it next to CPOE, which adjusts for how hard the throws were.',
-        bench: { QB: ['median 65.7%', 'top-12 67.3%', 'top-5 68.0%'] } },
+        use: 'Depends heavily on how far downfield he throws, so read it next to ' + ('AIR/CMP.') },
     'u:ypa': { name: 'Yards per attempt', what: 'Passing yards divided by attempts.',
-        use: 'The best box-score efficiency number for a quarterback. 7.5 or more supports a high ceiling for him and his receivers. Under 6.7 caps his weekly upside.',
-        bench: { QB: ['median 7.2', 'top-12 7.3', 'top-5 8.0'] } },
+        use: 'The best box-score efficiency number for a quarterback. 7.5 or more supports a high ceiling for him and his receivers. Under 6.7 caps his weekly upside.' },
     'u:sck': { name: 'Sacks taken', what: 'Times he was sacked.',
-        use: 'Sacks kill drives and cost points. A quarterback taking three a game is behind a line that will cap his volume, and he’s a good matchup for the defense you stream against him.',
-        bench: { QB: ['median 2.0/g', 'fewest quarter 1.5', 'most tenth 3.1'] } },
-    'u:rzatt': { name: 'Red-zone attempts', what: 'Pass attempts inside the opponent’s 20.',
-        use: 'His touchdown opportunity. A quarterback throwing often near the goal line has a higher floor than his yardage suggests.',
-        bench: { QB: ['median 4.0/g', 'top-12 4.3', 'top-5 5.4'] } },
+        use: 'Sacks kill drives and cost points. A quarterback taking three a game is behind a line that will cap his volume, and he’s a good matchup for the defense you stream against him.' },
     'u:aircmp': { name: 'Air yards per completion', what: 'How far downfield his completions travel, on average.',
-        use: 'Big-play upside. A high number is good news for his deep receivers, and his weeks will swing more.',
-        bench: { QB: ['median 5.9', 'top-12 6.3', 'top-5 7.0'] } },
+        use: 'Big-play upside. A high number is good news for his deep receivers, and his weeks will swing more.' },
 
 };
 
 const tipId = (k) => 'u:' + k;
 // data-tip on a header; the position picks the yardstick. Flex/All show a receiver's.
-const tipAttrs = (k, pos, extra) => { const id = k.includes(':') ? k : tipId(k); return TIPS[id] ? { 'data-tip': id, 'data-pos': pos || 'WR', 'data-extra': extra || null, tabindex: '0' } : {}; };
-let tipEl = null, tipTimer = null, tipFor = null, tipX = -1, tipY = -1;
-function tipHide() { clearTimeout(tipTimer); tipTimer = null; tipFor = null; if (tipEl) tipEl.hidden = true; }
+const tipAttrs = (k, pos, extra, pool) => { const id = k.includes(':') ? k : tipId(k); return TIPS[id] ? { 'data-tip': id, 'data-pos': pos || 'WR', 'data-extra': extra || null, 'data-pool': pool || null, tabindex: '0' } : {}; };
+// The yardstick under a tooltip: this season's players at the position, over the
+// same games as the column it explains. Three marks, the ones the player card
+// draws on its strips and from the same arithmetic: the middle of those with a
+// real role, the typical starter in this league, and the top scorers. A
+// ground-game column on a receiver's or a mixed table is read against backs,
+// who are the ones it is about. Fewer than ten with a role and there is none.
+function peerLine(id, pos, where) {
+    const k = id.slice(2);
+    const at = U_RUSH.includes(k) && (pos === 'WR' || pos === 'TE') ? 'RB' : pos;
+    if (!['QB', 'RB', 'WR', 'TE'].includes(at)) return null;
+    const b = S.ui.basis, win = where === 'l4' || b === 'usageL4' ? 'last4' : b === 'usage' ? 'week' : 'season';
+    const pool = win === 'last4' ? l4Pool() : win === 'week' ? S.stats[S.week] : S.seasonStats; if (!pool) return null;
+    const get = (e) => { const x = usageVal(e, k, pool); return x == null && USAGE_ZERO.has(k) ? 0 : x; };
+    const show = (x) => usageFmt(k, x);
+    const d = usageDist(pool, at, k, get); if (!d) return null;
+    const n = d.pop.length, mid = (d.pop[(n - 1) >> 1][0] + d.pop[n >> 1][0]) / 2;
+    return { who: `${S.season} ${posLabel(at)}s \u00b7 ${win === 'last4' ? 'last 4 games' : win === 'week' ? `wk ${S.week}` : 'season'}`,
+        marks: [`middle ${show(mid)}`, d.st != null ? `starter ${show(d.st)}` : null, d.top != null ? `top-${d.g.n} ${show(d.top)}` : null].filter(Boolean) };
+}
+let tipEl = null, tipTimer = null, tipMore = null, tipFor = null, tipX = -1, tipY = -1;
+function tipHide() { clearTimeout(tipTimer); clearTimeout(tipMore); tipTimer = tipMore = null; tipFor = null; if (tipEl) tipEl.hidden = true; }
+// A header's tooltip explains the column. A number's says his rank at the position, which the cell no longer prints.
 function tipShow(el) {
+    if (el.dataset.say != null) {
+        tipDraw(el, [h('div', { class: 'bt-h' }, h('b', null, el.dataset.rank), h('span', null, levelWord(Number(el.dataset.step)))), ...el.dataset.say.split('\n').map((x) => h('p', null, x))], true);
+        // his season follows. The first time it has to be fetched, so it waits for the pointer to settle;
+        // once it is in hand it is drawn with the rest, and a page that redraws under the pointer does not flicker.
+        if (el.sayMore) { const draw = () => { if (tipFor !== el) return; const more = el.sayMore(); if (more) { tipEl.append(more); tipEl.classList.add('more'); tipPlace(el); } };
+            const G = (S.gameLog || {})[el.sayPid]; if (G && !G.loading) draw(); else tipMore = setTimeout(draw, 250); }
+        return;
+    }
     const t = TIPS[el.dataset.tip]; if (!t) return;
-    const want = el.dataset.pos === 'TE' ? 'TE' : el.dataset.pos;
-    const bpos = t.bench[want] ? want : Object.keys(t.bench)[0];
-    const b = bpos ? t.bench[bpos] : null;
-    if (!tipEl) { tipEl = h('div', { class: 'btip', role: 'tooltip' }); layer.appendChild(tipEl); }
-    tipEl.innerHTML = '';
-    // append() writes a null as the text "null" — only real nodes go in
-    tipEl.append(...[
-        h('div', { class: 'bt-h' }, h('b', null, t.name), h('span', null, el.dataset.tip.startsWith('f:') ? 'Advanced' : 'Usage')),
+    const b = peerLine(el.dataset.tip, el.dataset.pos, el.dataset.pool);
+    tipDraw(el, [
+        h('div', { class: 'bt-h' }, h('b', null, t.name), h('span', null, 'Usage')),
         h('p', { class: 'bt-what' }, t.what), h('p', null, t.use),
-        b ? h('div', { class: 'bt-b' }, h('span', { class: 'bt-bl' }, `2025 ${bpos}s`), ...b.map((x, i) => h('span', { class: i ? '' : 'mid' }, x))) : null,
-        el.dataset.extra ? h('div', { class: 'bt-x' }, el.dataset.extra) : null].filter(Boolean));
+        b ? h('div', { class: 'bt-b' }, h('span', { class: 'bt-bl' }, b.who), ...b.marks.map((x, i) => h('span', { class: i ? '' : 'mid' }, x))) : null,
+        el.dataset.extra ? h('div', { class: 'bt-x' }, el.dataset.extra) : null]);
+}
+function tipDraw(el, kids, cell) {
+    if (!tipEl) { tipEl = h('div', { role: 'tooltip' }); layer.appendChild(tipEl); }
+    tipEl.className = cell ? 'btip cell' : 'btip';
+    tipEl.innerHTML = '';
+    tipEl.append(...kids.filter(Boolean));   // append() writes a null as the text "null": only real nodes go in
     tipEl.hidden = false;
+    tipFor = el;
+    tipPlace(el);
+}
+function tipPlace(el) {
     const r = el.getBoundingClientRect(), w = tipEl.offsetWidth, ht = tipEl.offsetHeight;
     const x = Math.max(8, Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - 8));
     const y = r.bottom + 8 + ht > innerHeight - 8 ? Math.max(8, r.top - ht - 8) : r.bottom + 8;
     tipEl.style.left = `${x}px`; tipEl.style.top = `${y}px`;
-    tipFor = el;
 }
 function wireTips() {
-    const target = (e) => { const n = e.composedPath ? e.composedPath()[0] : e.target; return n && n.closest ? n.closest('[data-tip]') : null; };
+    const target = (e) => { const n = e.composedPath ? e.composedPath()[0] : e.target; return n && n.closest ? n.closest('[data-tip], [data-say]') : null; };
     shadow.addEventListener('mousemove', (e) => { tipX = e.clientX; tipY = e.clientY; }, { passive: true });
-    shadow.addEventListener('mouseover', (e) => { const el = target(e); if (!el || el === tipFor) return; clearTimeout(tipTimer); tipTimer = setTimeout(() => tipShow(el), 220); });
+    shadow.addEventListener('mouseover', (e) => { const el = target(e); if (!el || el === tipFor) return; clearTimeout(tipTimer); tipTimer = setTimeout(() => tipShow(el), el.dataset.say != null ? 90 : 220); });   // a number answers at once; a header waits, so sweeping the strip does not flicker
     shadow.addEventListener('mouseout', (e) => { const el = target(e); if (el && !el.contains(e.relatedTarget)) tipHide(); });
     shadow.addEventListener('focusin', (e) => { const el = target(e); if (el) tipShow(el); });
     shadow.addEventListener('focusout', tipHide);
     shadow.addEventListener('keydown', (e) => { if (e.key === 'Escape' && tipFor) { e.stopPropagation(); tipHide(); } }, true);
     root.addEventListener('scroll', tipHide, { passive: true });
 }
-// ── quick views: Starter role · Points, few looks ─────────
-// Starter role is a breakout finder, and its thresholds are not guesses: they
-// come from what every WR/RB drafted outside the top 30 at the position did in
-// 2019–25. Receivers at snaps 50%+ and target share 18%+ finished top-24 about
-// a quarter of the time (a tenth for everyone drafted that late); backs at snaps
-// 50%+, carries 40%+ and 12+ touches a game about 4 in 10. The strong tier works
-// after a single game; the regular bar only from a third. Season to date through
-// week 4, then the last four games — a rising share by itself predicted nothing
-// for receivers, so there is no separate "growing" view; for backs a jump in
-// carries is real, and the row says so. A player covering for an injured,
-// higher-drafted teammate held the role about half as often, so he stays on the
-// list with the reason attached. Receivers scoring top-24 points without the
-// usage went 0 for 14 — that is the FLASH tag. Inputs are Sleeper's live
-// fields and its ADP.
+// ── quick views: Underperforming · Overperforming ────────────────────────────
+// One yardstick, read both ways: what a man scores a game against what his
+// share of his offence is usually worth (OPP PTS), over the same games.
+// Underperforming is a starter's opportunity scoring 2.5 or more a game below
+// it. Points tend to follow opportunity, so these are the buy-lows and holds.
+// Overperforming is the mirror, with one guard. The best players beat an
+// average price for their work every year, and that is skill: run on the whole
+// league the list is led by its stars. So it is kept to players drafted late
+// who are scoring like starters. In 2019–25 receivers doing that without the
+// usage went 0 for 14 at keeping it up, and backs 1 in 4. Both read the season
+// through week 4, then the last four games, and both ask for three games once
+// there are three to ask for: one game can put any gap on anyone. (A third
+// view, Starter role, listed late picks used like starters. It went when these
+// two took one yardstick.) Inputs are Sleeper's live fields and its ADP.
 const QUICK = [
-    ['starter', 'Starter role', 'Drafted outside the top 30 at his position (top 12 for TEs) or undrafted, and used like a starter. Receivers: snaps 50%+ and target share 18%+. Backs: snaps 50%+, carries 40%+, 12+ touches a game. STRONG: WR snaps 70%+ and targets 25%+, TE 70%+ and 18%+, RB 60%+, carries 50%+ and 15+ touches. Weeks 1–2 show STRONG only. In 2019–25 about 1 in 4 such receivers and 4 in 10 such backs finished top-24.'],
-
-    ['flash', 'Points, few looks', 'Drafted late and scoring like a top-24 starter without a starter’s usage. In 2019–25, receivers doing this in the first three weeks went 0 for 14 at keeping it up; backs 1 in 4.'],
+    ['under', 'Underperforming', 'Getting a starter’s opportunity and scoring 2.5 or more points a game below what it is usually worth (OPP PTS). Points tend to follow opportunity, so these are players to buy low, or to hold.'],
+    ['over', 'Overperforming', 'Drafted outside the top 30 at his position (top 12 for TEs) or undrafted, scoring like a starter, and 2.5 or more points a game above what his opportunity is usually worth (OPP PTS). In 2019–25, receivers scoring like this without the usage went 0 for 14 at keeping it up; backs 1 in 4.'],
 ];
-const qHurt = (pid) => /^(out|ir|doubtful|pup|sus)/i.test(statusOf(pid) || '');
+const QUICK_GAP = 2.5;
 function quickRead() {
 
-    const key = [statsGen, l4End(), S.curWeek, !!S.sleeperAdp, !!S.seasonStats, Object.keys(S.l4 || {}).length, S.playersAt].join('|');
+    const key = [statsGen, l4End(), S.curWeek, !!S.sleeperAdp, !!S.seasonStats, Object.keys(S.l4 || {}).length, S.playersAt, S.rosters.map((r) => (r.starters || []).join(',')).join('|')].join('|');
     if (S.quick && S.quick.key === key) return S.quick;
-    const q = { key, starter: new Map(), flash: new Map(), ready: { starter: false } };
+    const q = { key, under: new Map(), over: new Map(), ready: false };
     S.quick = q;
     if (S.seasonType !== 'regular' || !S.sleeperAdp || !S.seasonStats) return q;
     const end = l4End(), useL4 = end >= 5, pool = useL4 ? l4Pool(end) : S.seasonStats;
     if (!pool) return q;
-    const adp = S.sleeperAdp;
+    const adp = S.sleeperAdp, ref = useL4 ? null : pool, n = S.rosters.length || 12;
     const rows = [];
     for (const [pid, line] of Object.entries(pool)) {
         const pos = ppos(pid); if (!['WR', 'RB', 'TE'].includes(pos) || !line || !line.gp || !line.stats) continue;
-        const st = line.stats, ref = useL4 ? null : pool;
-        rows.push({ pid, pos, gp: line.gp, snap: st.tm_off_snp ? (st.off_snp || 0) / st.tm_off_snp : 0,
-            tsh: usageRaw(line, 'tsh', ref) || 0, csh: usageRaw(line, 'csh', ref) || 0, tch: ((st.rush_att || 0) + (st.rec_tgt || 0)) / line.gp, ppg: (line.pts || 0) / line.gp });
+        const opp = usageVal(line, 'opp', ref); if (opp == null) continue;   // the column's own figure, already a game's
+        rows.push({ pid, pos, gp: line.gp, opp, ppg: (line.pts || 0) / line.gp });
     }
-    const byPos = {}; for (const r of rows) (byPos[r.pos] = byPos[r.pos] || []).push(r);
-    // a points rank only means something once most of the position has played — mid-week-one "top 24" is a 3-point game
-    for (const [pos, arr] of Object.entries(byPos)) { const minG = Math.min(2, Math.max(...arr.map(r => r.gp))), ranked = arr.filter(r => r.gp >= minG); if (ranked.length < (pos === 'TE' ? 12 : 24) * 3) continue; ranked.sort((a, b) => b.ppg - a.ppg).forEach((r, i) => { r.prk = i + 1; }); }
+    // three games once there are three to ask for; before that, as many as have been played
+    const minG = Math.min(3, Math.max(1, ...rows.map((r) => r.gp)));
+    const byPos = {}; for (const r of rows) if (r.gp >= minG) (byPos[r.pos] = byPos[r.pos] || []).push(r);
     const late = (r) => { const a = adp[r.pid]; return a == null || a > (r.pos === 'TE' ? 12 : 30); };
-    const strong = (r) => r.pos === 'RB' ? r.snap >= 0.6 && r.csh >= 0.5 && r.tch >= 15 : r.pos === 'TE' ? r.snap >= 0.7 && r.tsh >= 0.18 : r.snap >= 0.7 && r.tsh >= 0.25;
-    const regular = (r) => r.pos === 'RB' ? r.snap >= 0.5 && r.csh >= 0.4 && r.tch >= 12 : r.pos === 'WR' && r.snap >= 0.5 && r.tsh >= 0.18;
-    const room = {};
-    for (const [pid, pl] of Object.entries(S.players || {})) if (pl && pl.team && ['WR', 'RB', 'TE'].includes(pl.position)) (room[`${pl.team}:${pl.position}`] = room[`${pl.team}:${pl.position}`] || []).push(pid);
-    for (const r of rows) {
-        if (!late(r)) continue;
-        const s1 = strong(r), rg = regular(r);
-        if (s1 || (rg && r.gp >= 3)) {
-            const mine = adp[r.pid] ?? Infinity;
-            const covering = (room[`${(P(r.pid) || {}).team}:${r.pos}`] || []).filter(o => o !== r.pid && (adp[o] ?? Infinity) < mine && qHurt(o));
-            let grew = null;
-            if (useL4 && r.pos === 'RB') { const sl = S.seasonStats[r.pid]; const sc = sl && sl.gp > r.gp ? usageRaw(sl, 'csh', S.seasonStats) : null; if (sc != null && r.csh - sc >= 0.10) grew = [sc, r.csh]; }
-            q.starter.set(r.pid, { strong: s1, covering, grew, r });
-        } else if (!rg && r.prk && r.prk <= (r.pos === 'TE' ? 12 : 24)) q.flash.set(r.pid, { r });
+    for (const [pos, arr] of Object.entries(byPos)) {
+        // a points rank only means something once most of the position has played: mid-week-one "top 24" is a 3-point game
+        if (arr.length < (pos === 'TE' ? 12 : 24) * 3) continue;
+        arr.slice().sort((a, b) => b.ppg - a.ppg).forEach((r, i) => { r.prk = i + 1; });
+        const d = usageDist(pool, pos, 'opp', (e) => usageVal(e, 'opp', ref)), started = startedAt(pos);
+        for (const r of arr) {
+            const gap = r.ppg - r.opp, e = { pid: r.pid, r, x: r.opp, y: r.ppg, res: gap, g: r.gp };
+            const work = d ? statRank(d, r.opp, 1) : null;   // where his opportunity ranks: the first two levels are a starter's
+            if (work && work.step <= 2 && gap <= -QUICK_GAP) q.under.set(r.pid, e);
+            else if (late(r) && levelOf(r.prk, n, started) <= 2 && gap >= QUICK_GAP) q.over.set(r.pid, e);
+        }
     }
-    q.ready.starter = true;
+    q.ready = true;
 
     return q;
 }
+// Why he is on the list, under his name: the two figures and the gap between them.
 function quickTags(pid, qk, qr) {
-    const pct = (v) => `${Math.round(v * 100)}%`;
-    if (qk === 'starter') { const e = qr.starter.get(pid); if (!e) return null;
-        return h('div', { class: 'qtags' }, e.strong ? h('span', { class: 'qtag strong' }, 'STRONG') : null,
-            e.covering.length ? h('span', { class: 'qtag cover', title: `${e.covering.map(pname).join(' and ')} ${e.covering.length > 1 ? 'are' : 'is'} ${e.covering.map(statusOf).join(' / ')} — roles like this held about half as often` }, 'COVERING') : null,
-            h('span', null, [e.covering.length ? `while ${e.covering.map(o => (P(o) || {}).last_name || pname(o)).join(' and ')} ${e.covering.length > 1 ? 'are' : 'is'} out` : null,
-                e.grew ? `carries ${pct(e.grew[0])} → ${pct(e.grew[1])}` : null, e.r.gp < 4 ? `${e.r.gp} game${e.r.gp === 1 ? '' : 's'}` : null,
-                e.r.pos === 'RB' ? `snaps ${pct(e.r.snap)} · carries ${pct(e.r.csh)} · ${Math.round(e.r.tch)} tch/g` : `snaps ${pct(e.r.snap)} · targets ${pct(e.r.tsh)}`].filter(Boolean).join(' · '))); }
-
-    if (qk === 'flash') { const e = qr.flash.get(pid); if (!e) return null;
-        return h('div', { class: 'qtags' }, h('span', { class: 'qtag flash' }, 'FLASH'), h('span', null, e.r.pos === 'RB' ? `${fmt1(e.r.ppg)} pts/g · snaps ${pct(e.r.snap)} · carries ${pct(e.r.csh)}` : `${fmt1(e.r.ppg)} pts/g · snaps ${pct(e.r.snap)} · targets ${pct(e.r.tsh)}`)); }
-    return null;
+    const e = qr[qk] && qr[qk].get(pid); if (!e) return null;
+    return h('div', { class: 'qtags' }, h('span', null, qk === 'under'
+        ? `work worth ${fmt1(e.x)} · scoring ${fmt1(e.y)} pts/g · ${fmt1(-e.res)} under it`
+        : `scoring ${fmt1(e.y)} pts/g · work worth ${fmt1(e.x)} · ${fmt1(e.res)} over it`));
 }
 
 function pagePlayers() {
@@ -5468,12 +5695,12 @@ function pagePlayers() {
     const rostered = rosteredSet();
     const isHurt = (pid) => !!statusOf(pid);
     settleBasis(periodsFor());
-    const basis = ui.basis; const isSeason = ui.scope === 'season', isL4 = ui.scope === 'last4'; const usage = isUsage(basis); const isActual = basis === 'wkActual' || basis === 'seasActual' || basis === 'l4Actual' || usage;
+    const basis = ui.basis; const isSeason = ui.scope === 'season', isL4 = ui.scope === 'last4'; const usage = isUsage(basis), adv = false, deep = usage || adv; const isActual = basis === 'wkActual' || basis === 'seasActual' || basis === 'l4Actual' || deep;
     // the quick views' counts need Sleeper's draft positions on every lens — loading them up front keeps the chips from growing later
     loadSleeperAdp().then(() => { if (S.sleeperAdpFresh) { S.sleeperAdpFresh = false; render(); } }).catch(() => {});
 
     // the last four for the table
-    const l4Wait = (isL4 || ui.playersQuick) && S.seasonType === 'regular' && !l4Pool();
+    const l4Wait = (isL4 || ui.playersQuick || basis === 'usageS') && S.seasonType === 'regular' && !l4Pool();   // the season's arrows read the last four too
 
     if ((l4Wait) && !S.l4Loading) { S.l4Loading = true; Promise.all([l4Wait ? loadL4(l4End()) : null]).then(() => { S.l4Loading = false; render(); }).catch(() => { S.l4Loading = false; }); }
     if (basis === 'ros' && !(S.ros && S.rosFrom === Math.max(1, S.curWeek))) { if (!S.rosLoading) { S.rosLoading = true; loadRos().then(() => { S.rosLoading = false; render(); }).catch(() => { S.rosLoading = false; }); } }
@@ -5501,7 +5728,7 @@ function pagePlayers() {
     if (ui.playersTrending) list = list.filter(pid => (((S.trending || {})[pid] || {}).add || 0) > 0);
     if (ui.playersHideBye) list = list.filter(pid => !isBye(pid, S.week));
     if (ui.playersQ) { const q = ui.playersQ.toLowerCase(); list = list.filter(pid => pname(pid).toLowerCase().includes(q) || ((P(pid) || {}).team || '').toLowerCase() === q); }
-
+    if (ui.playersQuick && !QUICK.some(([k]) => k === ui.playersQuick)) ui.playersQuick = null;   // a view from an earlier build
     const qr = quickRead();
     const qCount = Object.fromEntries(QUICK.map(([k]) => [k, list.filter(pid => qr[k].has(pid)).length]));
     if (ui.playersQuick) list = list.filter(pid => qr[ui.playersQuick].has(pid));
@@ -5509,13 +5736,10 @@ function pagePlayers() {
     // depth, a back's carries and yards after contact — and All/Flex show the
     // set the skill positions share. K and DST keep their box score: usage is
     // not a kicking concept.
-
-    const sleeperUsageCols = (USAGE_SETS[usageKeyOf(ui.playersPos) || 'ALL'] || []);
-    const keyCol = usage ? keyColFor(ui.playersPos) : null;
-    const cols = usage
-        ? ((usageKeyOf(ui.playersPos) || ui.playersPos === 'ALL' || ui.playersPos === 'FLEX') ? sleeperUsageCols.map(k => [k, USAGE[k][0], USAGE[k][1]]) : STAT_COLS[ui.playersPos] || STAT_COLS.ALL)
-
-        : (STAT_COLS[ui.playersPos] || STAT_COLS.ALL).filter(([k]) => !(k === 'snap' && !isActual));
+    const tabKey = usageKeyOf(ui.playersPos) || (['K', 'DEF'].includes(ui.playersPos) ? null : 'ALL');
+    const keyCol = deep && tabKey ? keyColFor(ui.playersPos) : null;
+    const cols = usage && tabKey ? slotCols(USAGE_SETS[tabKey])
+        : STAT_COLS[ui.playersPos] || STAT_COLS.ALL;
     const ranks = ranksFor(basis);
     const netFor = (pid) => { const d = suggestDrop(pid); return (projOf(pid, S.week) || 0) - (d && d.pid ? (projOf(d.pid, S.week) || 0) : 0); };
     const val = (pid, f) => { const l = statLine(pid, basis); return f === 'pts' ? (l && l.pts != null ? (isL4 ? l.pts / (l.gp || 1) : l.pts) : -Infinity) : f === 'avg' ? (l && l.gp ? l.pts / l.gp : -Infinity)
@@ -5529,7 +5753,7 @@ function pagePlayers() {
     // a quick view arrives in its own order — strongest match first — until a header is clicked
     if (ui.playersQuick && ui.quickOrder) {
         const qm = qr[ui.playersQuick];
-        const score = ui.playersQuick === 'starter' ? (pid) => { const e = qm.get(pid); return (e.strong ? 1000 : 0) + e.r.ppg - (e.covering.length ? 500 : 0); } : (pid) => qm.get(pid).r.ppg;
+        const score = ui.playersQuick === 'under' ? (pid) => -qm.get(pid).res : (pid) => qm.get(pid).res;   // the widest gap first
         list.sort((a, b) => score(b) - score(a));
     }
     const shown = list.slice(0, 200);
@@ -5566,10 +5790,11 @@ function pagePlayers() {
         h('div', { class: 'filters fbrow' },
             group(lab('Position'), ...['ALL', ...POS_ORDER, ...(flexSet.size ? ['FLEX'] : [])].map(p => h('span', { class: `sel posf ${p} ${ui.playersPos === p ? 'on' : ''}`, title: p === 'FLEX' ? `This league's flex positions: ${[...flexSet].join('/')}` : null, onclick: () => { ui.playersPos = p; render(); } }, p === 'ALL' ? 'All' : p === 'DEF' ? 'DST' : p === 'FLEX' ? 'Flex' : p))),
             group(lab('Quick'), ...QUICK.map(([k, t, tip]) => {
-                const ready = qr.ready.starter, on = ui.playersQuick === k;
-                // a view with nobody in it can't be picked; one that empties while picked stays, and the table says why
-                const ok = ready && (qCount[k] > 0 || on);
-                const why = !ready ? (S.seasonType !== 'regular' ? 'Starts once the regular season has games.' : 'Loading\u2026')
+                const ready = qr.ready, on = ui.playersQuick === k;
+                // a view with nobody in it can't be picked; one that empties while picked stays, and the table says why.
+                // Before the last four games are added up there is no count to show: picking the view is what adds them up.
+                const ok = ready ? (qCount[k] > 0 || on) : S.seasonType === 'regular';
+                const why = !ready ? (S.seasonType !== 'regular' ? 'Starts once the regular season has games.' : tip)
                     : qCount[k] ? tip : `Nobody in this pool fits ${t} right now. ${tip}`;
                 return h('span', { class: `sel qchip ${on ? 'on' : ''} ${ok ? '' : 'off'}`, title: why, onclick: () => { if (!ok) return; ui.playersQuick = on ? null : k; ui.quickOrder = true; render(); ensureData().then(render).catch(fail); } }, t, ready ? h('i', { class: 'mono' }, qCount[k]) : null);
             })),
@@ -5579,13 +5804,13 @@ function pagePlayers() {
             ));
     const pool = basisPool(basis) || {};
     const empty = !Object.keys(pool).length;
-    const ptsLabel = isL4 ? 'Pts per game, last 4' : (basis === 'wkActual' || basis === 'usage') ? `Wk ${S.week} pts` : basis === 'wkProj' ? `Wk ${S.week} proj` : (basis === 'seasActual' || basis === 'usageS') ? 'Season pts' : 'RoS proj';
-    const ptsShort = isL4 ? 'Pts/G' : ['wkActual', 'seasActual', 'usage', 'usageS'].includes(basis) ? 'Pts' : basis === 'wkProj' ? 'Proj' : 'RoS';
+    const ptsLabel = isL4 ? 'Pts per game, last 4' : (basis === 'wkActual' || basis === 'usage' || (adv && !isSeason)) ? `Wk ${S.week} pts` : basis === 'wkProj' ? `Wk ${S.week} proj` : (basis === 'seasActual' || basis === 'usageS' || adv) ? 'Season pts' : 'ROS proj';
+    const ptsShort = isL4 ? 'Pts/G' : ['wkActual', 'seasActual', 'usage', 'usageS'].includes(basis) ? 'Pts' : basis === 'wkProj' ? 'Proj' : 'ROS';
     // Column families (variant C): a named group row + alternating tints so
     // fourteen numeric columns stop reading as one grey field. Families follow
     // the position filter; the first group's name follows the period picker.
-    const famOf = (k) => USAGE[k] ? 'Usage' : k.startsWith('pass') ? 'Passing' : k.startsWith('rush') ? 'Rushing' : k.startsWith('rec') ? 'Receiving' : /^(fg|xp)/.test(k) ? 'Kicking' : ['sack', 'int', 'fum_rec', 'td', 'safe', 'yds_allow', 'pts_allow'].includes(k) ? 'Defense' : null;
-    const scopeN = 3 + (isSeason ? 1 : 0) + (isSeason && basis === 'seasActual' ? 1 : 0);
+    const famOf = (k) => USAGE[k] ? (['tsh', 'ypt', 'ryac', 'adoc'].includes(k) ? 'Receiving' : ['csh', 'ypc', 'yco'].includes(k) ? 'Rushing' : ['cmp', 'ypa', 'aircmp', 'sck'].includes(k) ? 'Passing' : 'Role') : k.startsWith('pass') ? 'Passing' : k.startsWith('rush') ? 'Rushing' : k.startsWith('rec') ? 'Receiving' : /^(fg|xp)/.test(k) ? 'Kicking' : ['sack', 'int', 'fum_rec', 'td', 'safe', 'yds_allow', 'pts_allow'].includes(k) ? 'Defense' : null;
+    const scopeN = 2 + (isSeason ? 1 : 0) + (isSeason && basis === 'seasActual' ? 1 : 0);
     const groups = [{ label: isL4 ? 'Last 4' : ui.scope === 'season' ? 'Season' : `Week ${S.week}`, n: scopeN }];
     let lastFam = null;
     for (const [k] of cols) { const fam = famOf(k) || lastFam || 'Stats'; if (fam === lastFam) groups[groups.length - 1].n++; else { groups.push({ label: fam, n: 1 }); lastFam = fam; } }
@@ -5601,21 +5826,21 @@ function pagePlayers() {
     // stretched them all alike, and the Player column opened a gap after each name.
     // min-width holds the px plan, so a narrow screen gets exactly these widths
     // and scrolls rather than squeezing a stat until it clips.
-    const TEXT_W = [84, 300, 92];   // Action · Player (the watch star lives on the name line) · Opp
-    const NUM_W = [48, 56, 62,   // Ovr Rank Proj
+    const TEXT_W = [84, 280, 92];   // Action · Player (the watch star lives on the name line) · Opp
+    const NUM_W = [56, 62,   // Rank Proj
         ...(isSeason ? [44] : []), ...(isSeason && basis === 'seasActual' ? [52] : []),
-        ...cols.map(([k, lbl]) => k === keyCol ? 104 : usage ? (lbl.length > 6 ? 84 : 66) : 58),   // usage labels are words, not stat codes; the key column's name is never the one cut off
-        62, 62, 78];   // Market
+        ...cols.map(([k, lbl]) => deep ? (k === keyCol ? 70 : lbl.length > 6 ? 64 : 56) : 58),   // labels run to seven characters; the seven-character ones get the room to say it
+        52, 62, 70];   // Market
     const numSum = NUM_W.reduce((a, b) => a + b, 0), planW = numSum + TEXT_W.reduce((a, b) => a + b, 0);
     const colgroup = h('colgroup', null, ...TEXT_W.map(w => h('col', { style: `width:${w}px` })),
         ...NUM_W.map(w => h('col', { style: `width:${(100 * w / numSum).toFixed(4)}%` })));
     const grpRow = h('tr', { class: 'grp' }, h('th', { colspan: 2, class: 'fxsec' }), h('th', null, ''), ...groups.map((gr, gi) => h('th', { colspan: gr.n, class: `${gi % 2 === 0 ? 'band' : ''} ${gi === 0 ? 'qh' : ''}` }, gr.label)));
     const tbl = h('table', { class: 'dense fixedcols', style: `min-width:${planW}px` }, colgroup, grpRow, h('tr', null, h('th', { class: 'stk1' }, 'Action'), th('Player', 'name', false, null, 'stk2'), h('th', null, `Opp wk ${S.week}`),
         ...band([
-            th('Ovr', 'rk', true, `Overall rank by ${ptsLabel.toLowerCase()}`), th('Rank', 'prk', true, `Positional rank by ${ptsLabel.toLowerCase()}`),
+            th('Rank', 'prk', true, `Rank at his position by ${ptsLabel.toLowerCase()}; his overall rank is on each cell`),
             th(ptsShort, 'pts', true, isL4 ? 'Points per game over his last four games played' : isSeason ? (basis === 'seasActual' ? 'Season points to date' : basis === 'ros' ? 'Remaining weeks projected, summed' : "Sleeper's full-season projection") : (isActual ? `Week ${S.week} points` : `Week ${S.week} projection, this league's scoring`)),
             isSeason ? th('GP', 'gp', true, basis === 'ros' ? 'Weeks remaining with a game' : 'Games') : null, isSeason && basis === 'seasActual' ? th('Avg', 'avg', true, 'Per game played') : null,
-            ...cols.map(([k, lbl, tip]) => th(lbl, 'st:' + k, true, tip || null, k === keyCol ? 'keycol' : null, usage ? tipAttrs(k, ['ALL', 'FLEX'].includes(ui.playersPos) ? 'WR' : ui.playersPos) : null)),
+            ...cols.map(([k, lbl, tip]) => th(lbl, 'st:' + k, true, tip || null, null, deep ? tipAttrs(k, ['ALL', 'FLEX'].includes(ui.playersPos) ? 'WR' : ui.playersPos) : null)),
             th('Own%', 'own', true, '% of Sleeper leagues where rostered'), th('Start%', 'start', true, '% of Sleeper leagues where started'), th('Trend', 'trend', true, 'Adds minus drops across Sleeper, 24h'),
         ].filter(Boolean))));
     for (const pid of shown) {
@@ -5632,19 +5857,31 @@ function pagePlayers() {
             h('td', { class: 'stk2' }, h('div', { class: 'pl' }, h('span', { class: `pos txt ${pl.position}` }, posLabel(pl.position)), h('div', { style: 'min-width:0' }, h('div', { class: 'nm', onclick: () => { S.ui.sel = pid; render(); } }, pname(pid), teamMeta(pid), injuryChip(pid), newsIcon(pid), starEl(pid)),
                 h('div', { class: 'sub' }, bioText(pid),
                     isMine ? null : avail ? h('span', null, `${bioText(pid) ? ' · ' : ''}${waiv ? 'waivers' : 'FA'}`) : owner ? h('span', { class: 'ownr' }, `${bioText(pid) ? ' · ' : ''}${teamName(owner).slice(0, 14)}`) : null),
-                ui.playersQuick && usage ? quickTags(pid, ui.playersQuick, qr) : null))),   // the why is usage: under Proj or Actual it only made every row taller
+                ui.playersQuick && deep ? quickTags(pid, ui.playersQuick, qr) : null))),   // the why is usage: under Proj or Actual it only made every row taller
             oppCell(pid, S.week),
             ...band([
-            h('td', { class: 'r mono' }, ranks.overall[pid] || '—'),
-            h('td', { class: 'r mono' }, ranks.pos[pid] ? h('span', { class: `pos txt ${pl.position}` }, `${posLabel(pl.position)}${ranks.pos[pid]}`) : h('span', { class: 'dim' }, '—')),
+            h('td', { class: 'r mono', title: ranks.overall[pid] ? `${ordinal(ranks.overall[pid])} overall` : null }, ranks.pos[pid] ? h('span', { class: `pos txt ${pl.position}` }, `${posLabel(pl.position)}${ranks.pos[pid]}`) : h('span', { class: 'dim' }, '—')),
             h('td', { class: 'r mono', style: 'font-weight:700' }, line && line.pts != null ? (isL4 ? [fmt1(line.pts / (line.gp || 1)), l4Short(line) ? h('span', { class: 'was' }, `${line.gp} g`) : null] : isSeason ? fmt0(line.pts) : isActual ? fmtS(line.pts) : fmt1(line.pts)) : h('span', { class: 'dim' }, '—')),
             isSeason ? h('td', { class: 'r mono dim' }, line && line.gp != null ? fmt0(line.gp) : (line && line.stats && line.stats.gp != null ? fmt0(line.stats.gp) : '—')) : null,
             isSeason && basis === 'seasActual' ? h('td', { class: 'r mono' }, line && line.gp ? fmt1(line.pts / line.gp) : '—') : null,
             ...cols.map(([k]) => {
                 const kc = k === keyCol ? ' keycol' : '';
+                if (U_RUSH.includes(k) && (pl.position === 'WR' || pl.position === 'TE') && (statVal(line, 'csh') || 0) < 0.05) return h('td', { class: 'r mono' });
 
                 const v = statVal(line, k);
-                return h('td', { class: `r mono${kc}` }, v == null ? h('span', { class: 'dim' }, '—') : USAGE[k] ? usageFmt(k, v) : (k === 'snap' ? fmt0(v) + '%' : isL4 ? (Number.isInteger(v) ? fmt0(v) : fmt1(v)) : (isActual || isSeason) ? fmt0(v) : (Math.abs(v) < 10 ? fmt1(v) : fmt0(v))));
+                // a usage number is drawn at its level at the position and says his rank when pointed at; over the season an arrow says which way his last four games went
+                if (deep && GRADE[k] && v != null) { const unit = rateUnit(k), work = unit ? workFor(line, pl.position, unit) : null, short = !!work && !work.ok;   // too little behind a rate: not ranked
+                    const d = usageDist(pool, pl.position, k, (e) => { const x = usageVal(e, k, pool); return x == null && USAGE_ZERO.has(k) ? 0 : x; }), r = short ? null : statRank(d, v, GRADE[k]), mv = basis === 'usageS' ? moveOf(pid, pl.position, k) : null;
+                    const why = [r ? rankSays(pl.position, r, work) : null, k === 'opp' ? oppWork(line) : null, mv ? `last ${mv.games} games ${usageFmt(k, mv.now)}, season ${usageFmt(k, mv.was)}` : null].filter(Boolean);
+                    const td = h('td', Object.assign({ class: `r mono${kc}${r ? ' lv' + r.step : short ? ' lv0' : ''}` }, r ? say(pl.position, r.rk, r.step, why) : short ? unranked(work) : { title: why.join(' \u00b7 ') || null }), moveMark(mv), usageFmt(k, v));
+                    if (d && (r || short)) { td.sayMore = () => seasonTip(pid, pl.position, k, d, (x) => usageFmt(k, x)); td.sayPid = pid; }
+                    return td; }
+                // a style is never ranked: on too little work it is drawn dim, and either way its season is a hover away
+                if (deep && v != null && USAGE[k] && rateUnit(k)) { const work = workFor(line, pl.position, rateUnit(k)), d = usageDist(pool, pl.position, k, (e) => usageVal(e, k, pool));
+                    const td = h('td', Object.assign({ class: `r mono${work.ok ? '' : ' lv0'}${kc}` }, work.ok ? { 'data-say': 'A style, not a grade: it carries no rank.', 'data-rank': USAGE[k][0], 'data-step': '0' } : unranked(work, true)), usageFmt(k, v));
+                    if (d) { td.sayMore = () => seasonTip(pid, pl.position, k, d, (x) => usageFmt(k, x)); td.sayPid = pid; }
+                    return td; }
+                return h('td', { class: `r mono${kc}`, title: k === 'opp' && v != null ? oppWork(line) : null }, v == null ? h('span', { class: 'dim' }, '—') : USAGE[k] ? usageFmt(k, v) : (k === 'snap' ? fmt0(v) + '%' : isL4 ? (Number.isInteger(v) ? fmt0(v) : fmt1(v)) : (isActual || isSeason) ? fmt0(v) : (Math.abs(v) < 10 ? fmt1(v) : fmt0(v))));
             }),
             h('td', { class: 'r mono' }, S.research && S.research[pid] ? `${Math.round(S.research[pid].owned)}` : h('span', { class: 'dim' }, '—')),
             h('td', { class: 'r mono dim' }, S.research && S.research[pid] ? `${Math.round(S.research[pid].started)}` : '—'),
@@ -5652,16 +5889,22 @@ function pagePlayers() {
             ].filter(Boolean))));
     }
     const quickName = ui.playersQuick && (QUICK.find(([k]) => k === ui.playersQuick) || [])[1];
-    const quickWhy = ui.playersQuick === 'starter' ? (S.curWeek <= 2 ? ' In weeks 1\u20132 only the strong tier shows (WR snaps 70%+ and targets 25%+, RB snaps 60%+, carries 50%+, 15+ touches), and much of the league may not have played yet.' : ' Nobody drafted late is being used like a starter in this pool and position.')
-        : ui.playersQuick === 'flash' ? ' A points rank means something only once most of the position has played.' : ' Nobody in this pool is getting the work without the points right now.';
-    if (!shown.length) tbl.append(h('tr', null, h('td', { colspan: 24, class: 'empty' }, quickName && S.proj[S.week]
+    const quickWhy = ui.playersQuick === 'under' ? ' Nobody in this pool is getting a starter\u2019s work without the points right now.' : ' Nobody drafted late is scoring well above his workload in this pool and position.';
+    if (!shown.length) tbl.append(h('tr', null, h('td', { colspan: 24, class: 'empty' }, quickName && !qr.ready ? 'Loading\u2026' : quickName && S.proj[S.week]
         ? [h('b', null, `Nobody fits ${quickName} yet.`), quickWhy, ' ', h('span', { class: 'teal', style: 'cursor:pointer;font-weight:700', onclick: () => { ui.playersQuick = null; render(); } }, `Clear ${quickName}`)]
         : S.proj[S.week] ? 'No players match these filters.' : 'Loading…')));
-
-    const note = l4Wait ? h('div', { class: 'cap', style: 'margin:0 0 6px' }, h('span', { class: 'spin' }), 'Adding up everyone\u2019s last four games\u2026') : basis === 'ros' && S.rosLoading ? h('div', { class: 'cap', style: 'margin:0 0 6px' }, h('span', { class: 'spin' }), `Summing projections for weeks ${Math.max(1, S.curWeek)}–${LAST_WEEK}…`) : empty && isActual ? h('div', { class: 'cap', style: 'margin:0 0 6px' }, isSeason ? 'No games played yet this season — the season line fills in from week 1.' : `No stats for week ${S.week} yet.`) : null;
+    // The views open as soon as games are played. A small sample is said once,
+    // here, not on every row: a tag per row only repeated it and made rows taller.
+    const quickG = ui.playersQuick ? shown.map(pid => (qr[ui.playersQuick].get(pid) || {}).g).filter(Boolean) : [];
+    const quickFew = quickG.filter(g => g < 3), gLo = Math.min(...quickFew), gHi = Math.max(...quickFew);
+    const fewNote = quickFew.length ? h('div', { class: 'cap', style: 'margin:0 0 6px' }, h('b', null, 'Small sample. '),
+        quickFew.length === quickG.length ? `Every player here rests on ${gLo === gHi ? gLo : `${gLo}\u2013${gHi}`} game${gHi === 1 ? '' : 's'}.` : `${quickFew.length} of ${quickG.length} rest on fewer than 3 games.`,
+        ' A single game can swing a player\u2019s share of the work either way \u2014 leads to check, not verdicts.') : null;
+    const note = l4Wait ? h('div', { class: 'cap', style: 'margin:0 0 6px' }, h('span', { class: 'spin' }), 'Adding up everyone\u2019s last four games\u2026') : basis === 'ros' && S.rosLoading ? h('div', { class: 'cap', style: 'margin:0 0 6px' }, h('span', { class: 'spin' }), `Summing projections for weeks ${Math.max(1, S.curWeek)}–${LAST_WEEK}…`) : empty && isActual ? h('div', { class: 'cap', style: 'margin:0 0 6px' }, isSeason ? 'No games played yet this season — the season line fills in from week 1.' : `No stats for week ${S.week} yet.`) : fewNote;
     // Every usage header explains itself on hover; this says it in a line, so
-    // nobody has to know what an opportunity rating is before sorting on one.
-    const gloss = usage ? h('div', { class: 'gloss' },
+    // nobody has to know what opportunity points are before sorting on them.
+    const gloss = deep ? h('div', { class: 'gloss' }, levelKey(), h('span', null, 'He is ranked among the players at his position on the field for a quarter of their team’s snaps, over the same games. A rate is ranked only with enough work behind it; with too little it is drawn dim.'),
+        basis === 'usageS' ? h('span', null, h('span', { class: 'trend up' }, '\u25b2'), h('span', { class: 'trend down' }, '\u25bc'), ' his last four games against his season; no mark is steady.') : null,
         ...cols.filter(([k]) => USAGE[k]).map(([k, lbl, tip]) => h('span', null, h('b', null, lbl), ' ', tip))) : null;
 
     const body = h('div', { class: 'scroll full', 'data-keep': 'players' }, tbl);
@@ -5675,7 +5918,7 @@ function pagePlayers() {
 function svgIcon(kind, cls) {
     const s = document.createElementNS(SVG_NS, 'svg'); s.setAttribute('viewBox', '0 0 24 24'); s.setAttribute('class', cls || '');
     s.setAttribute('fill', 'none'); s.setAttribute('stroke', 'currentColor'); s.setAttribute('stroke-width', '2.2'); s.setAttribute('stroke-linecap', 'round'); s.setAttribute('stroke-linejoin', 'round');
-    const paths = { minus: ['M5 12h14'], news: ['M4 5h13a2 2 0 0 1 2 2v10a2 2 0 0 0 2 2H6a2 2 0 0 1-2-2z', 'M19 7v10a2 2 0 0 0 2 2', 'M8 9h5M8 13h5M8 17h5'], plus: ['M12 5v14M5 12h14'], swap: ['M7 7h11l-3-3M17 17H6l3 3'], x: ['M6 6l12 12M18 6 6 18'] }[kind] || [];
+    const paths = { chat: ['M4 5h16v11h-9l-4 4v-4H4z'], minus: ['M5 12h14'], moves: ['M3 8h17M16 4l4 4-4 4', 'M21 16H4M8 12l-4 4 4 4'], news: ['M4 5h13a2 2 0 0 1 2 2v10a2 2 0 0 0 2 2H6a2 2 0 0 1-2-2z', 'M19 7v10a2 2 0 0 0 2 2', 'M8 9h5M8 13h5M8 17h5'], out: ['M10 5H5v14h14v-5', 'M14 5h5v5', 'M19 5l-8 8'], plus: ['M12 5v14M5 12h14'], swap: ['M7 7h11l-3-3M17 17H6l3 3'], x: ['M6 6l12 12M18 6 6 18'] }[kind] || [];
     for (const d of paths) { const p = document.createElementNS(SVG_NS, 'path'); p.setAttribute('d', d); s.appendChild(p); }
     return s;
 }
@@ -5716,9 +5959,9 @@ function actionCell(pid, o) {
 // quarter of his team's snaps over his last four — is a dot on the row's own
 // scale, and two marks sit under it: the typical starter (the middle of the men
 // started in this league this week) and the top N (the middle of the N scoring
-// most per game, N the number of teams). No good or bad colour: a low aDOT is a
-// style, and a back's EFF is better low.
-const USAGE_ZERO = new Set(['rz', 'fd', 'touch', 'sck', 'rzatt']);   // a count missing from the box score is a zero
+// most per game, N the number of teams). No good or bad colour: how deep a
+// man catches the ball is a style, not a grade.
+const USAGE_ZERO = new Set(['rz', 'touch', 'sck']);   // a count missing from the box score is a zero
 const posGroups = new WeakMap();
 function posGroup(pool, pos) {
     let m = posGroups.get(pool); if (!m) posGroups.set(pool, m = {});
@@ -5729,13 +5972,14 @@ function posGroup(pool, pos) {
     const men = Object.values(pool).filter(e => e && played(e) && ppos(e.pid) === pos);
     const inLineup = new Set(started), n = S.rosters.length || 12;
     const top = men.slice().sort((a, b) => (b.pts || 0) / (b.gp || 1) - (a.pts || 0) / (a.gp || 1)).slice(0, n);
-    return (m[pos] = { sig, n, role: men.filter(e => (usageVal(e, 'snp') ?? 0) >= 0.25), starters: men.filter(e => inLineup.has(e.pid)), topIds: new Set(top.map(e => e.pid)), top, rows: {} });
+    return (m[pos] = { sig, n, started: started.filter((p) => p && p !== '0' && ppos(p) === pos).length, role: men.filter(e => (usageVal(e, 'snp') ?? 0) >= 0.25), starters: men.filter(e => inLineup.has(e.pid)), topIds: new Set(top.map(e => e.pid)), top, rows: {} });
 }
 function usageDist(pool, pos, k, get) {
     const g = posGroup(pool, pos);
     if (k in g.rows) return g.rows[k];
     const ok = (v) => v != null && isFinite(v);
-    const pop = g.role.map(e => [get(e), e.pid]).filter(x => ok(x[0])).sort((a, b) => a[0] - b[0]);
+    const unit = rateUnit(k), men = unit ? g.role.filter((e) => workFor(e, pos, unit).ok) : g.role;   // a rate is ranked among those with the work behind it
+    const pop = men.map(e => [get(e), e.pid]).filter(x => ok(x[0])).sort((a, b) => a[0] - b[0]);
     const mid = (men) => { const s = men.map(get).filter(ok).sort((a, b) => a - b); return s.length ? (s[(s.length - 1) >> 1] + s[s.length >> 1]) / 2 : null; };
     return (g.rows[k] = pop.length >= 10 ? { g, pop, st: mid(g.starters), top: mid(g.top) } : null);
 }
@@ -5801,6 +6045,49 @@ function usageSeason(d, series, show, label, sc, l4w) {
         : sv('line', { class: 'sn', x1: X(m[0]), x2: X(m[0]), y1: H - 4, y2: H }, svTitle(`week ${m[0]} · ${m[2]}`)));
     return svg;
 }
+// The same season, drawn for the tooltip of one number: his games, oldest first,
+// against the three marks of his position over the games in view: the level of
+// its top scorers, the typical starter's, and the middle of those with a role.
+// Each mark is named where its line ends. A game with too little behind a rate
+// is a hollow dot: one play's worth of news. In every cell this was too much;
+// asked for, on one number, it is the answer to "and which way is he going".
+function seasonTip(pid, pos, k, d, show) {
+    const season = seasonWeeks(pid), unit = rateUnit(k), has = (v) => v != null && isFinite(v);
+    const series = seriesFrom(season, (ln, pl) => { const x = usageVal(ln, k, pl); return x == null && USAGE_ZERO.has(k) ? 0 : x; });
+    const played = series.filter((m) => has(m[1]));
+    if (!played.length) return series.some((m) => m[1] === undefined) ? h('p', { class: 'bt-wait' }, 'His games are loading…') : null;
+    if (played.length < 2) return null;   // one game is the number he is already looking at
+    const thin = new Set(unit ? season.filter(([, x]) => x && x.ln && !workFor(x.ln, pos, unit).ok).map(([w]) => w) : []);
+    const n = d.pop.length, mid = (d.pop[(n - 1) >> 1][0] + d.pop[n >> 1][0]) / 2;
+    const refs = [[d.top, 'rt', `top ${d.g.n}`], [d.st, 'rs', 'starter'], [mid, 'rm', 'middle']].filter((r) => has(r[0]));
+    const sc = usageScale(d, [...played.map((m) => m[1]), mid]);
+    const W = 276, H = 92, x0 = 8, x1 = W - 96, y0 = 8, y1 = H - 18, wN = Math.max(4, series.length);
+    const X = (w) => x0 + (w - 1) * (x1 - x0) / (wN - 1), Y = (v) => y1 - (Math.max(sc.lo, Math.min(sc.hi, v)) - sc.lo) / (sc.hi - sc.lo) * (y1 - y0);
+    const svg = sv('svg', { class: 'tsp', viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: 'img',
+        'aria-label': `${USAGE[k][0]} by game: ${series.map(([w, v, why]) => `week ${w} ${has(v) ? show(v) : why || 'loading'}`).join(', ')}; ${refs.map((r) => `${r[2]} ${show(r[0])}`).join(', ')}` });
+    // the games in view are shaded when the view is his last four
+    const inView = l4Basis() ? ((((l4Pool() || {})[pid] || {}).weeks) || []).filter((w) => played.some((m) => m[0] === w)) : [];
+    if (inView.length) svg.append(sv('rect', { class: 'band', x: X(Math.min(...inView)) - 6, y: y0 - 4, width: X(Math.max(...inView)) - X(Math.min(...inView)) + 12, height: y1 - y0 + 8, rx: 3 }));
+    svg.append(sv('line', { class: 'ax', x1: x0 - 4, x2: x1 + 6, y1: y1 + 4.5, y2: y1 + 4.5 }));
+    // the marks, each named at the end of its line; names that would sit on each other are spread
+    const labs = refs.map((r) => ({ r, y: Y(r[0]), at: Y(r[0]) })).sort((a, b) => a.at - b.at);
+    for (let i = 1; i < labs.length; i++) if (labs[i].at - labs[i - 1].at < 11) labs[i].at = labs[i - 1].at + 11;
+    const over = labs.length ? Math.max(0, labs[labs.length - 1].at - (y1 + 2)) : 0;
+    for (const l of labs) { l.at -= over; const [v, cls, word] = l.r;
+        svg.append(sv('line', { class: cls, x1: x0 - 4, x2: x1 + 6, y1: l.y, y2: l.y }), sv('line', { class: cls, x1: x1 + 6, x2: x1 + 12, y1: l.y, y2: l.at }));
+        const t = sv('text', { class: `l${cls}`, x: x1 + 15, y: l.at + 3.5 }); t.textContent = `${word} ${show(v)}`; svg.append(t); }
+    let pen = false, line = '';
+    for (const [w, v] of series) { if (!has(v)) { pen = false; continue; } line += `${pen ? 'L' : 'M'}${X(w).toFixed(1)} ${Y(v).toFixed(1)} `; pen = true; }
+    svg.append(sv('path', { class: 'ln', d: line.trim() }));
+    for (const [w, v, why] of series) {
+        if (has(v)) svg.append(sv('circle', { class: thin.has(w) ? 'pt thin' : 'pt', cx: X(w), cy: Y(v), r: 2.8 }, svTitle(`week ${w} · ${show(v)}`)));
+        else if (why) svg.append(sv('line', { class: 'gap', x1: X(w), x2: X(w), y1: y1 - 1, y2: y1 + 4 }, svTitle(`week ${w} · ${why}`)));
+        const t = sv('text', { class: 'wk', x: X(w), y: H - 2 }); t.textContent = String(w); svg.append(t);
+    }
+    const work = unit && thin.size ? workFor(null, pos, unit) : null;
+    return h('div', { class: 'bt-chart' }, h('div', { class: 'bt-cap' }, `${USAGE[k][0]} by game, weeks 1–${series.length}`), svg,
+        work ? h('div', { class: 'bt-note' }, `A hollow dot is a game with under ${work.per} ${work.word[1]}.`) : null);
+}
 function usageLegend(g, pos, who, lines) {
     const gl = (...kids) => sv('svg', { class: 'udots', width: 12, height: 12, viewBox: '-6 -1 12 12', 'aria-hidden': 'true' }, ...kids);
     return h('div', { class: 'ulegend' },
@@ -5823,23 +6110,7 @@ function usageBlock(pid) {
     if (!wk && !l4 && !sea) return null;
     const tipPos = pos === 'TE' ? 'TE' : key;
     const pool = l4Pool(end), who = (P(pid) || {}).last_name || pname(pid);
-    // His season, week by week, each week read against its own team totals: this
-    // week and the last four from the weeks in hand, older ones from his own
-    // game log and the totals saved for that week. Each week is a line to read,
-    // a reason there is none, or null while it loads.
-    const G = (S.gameLog || {})[pid]; if (!G && S.seasonType === 'regular') loadGameLog(pid).then(render).catch(() => {});
-    const team = (P(pid) || {}).team, upto = S.seasonType === 'regular' ? Math.min(LAST_WEEK, S.curWeek) : 0;
-    const weekOf = (w) => {
-        const pl = S.stats[w]; let ln = null;
-        if (pl) ln = pl[pid] || null;
-        else { if (!G || G.loading) return null; const e = G.st && G.st[String(w)]; if (e && e.stats) { const tm = weekTeamTotals(w, e.team || team); if (tm === undefined) return null; ln = { pid, stats: e.stats, tm }; } }
-        if (ln && ln.stats && ((ln.stats.off_snp || 0) > 0 || (ln.stats.gp || 0) > 0)) return { ln, pl };
-        if (w === S.curWeek && !teamGameOver(pid, w)) return { why: null };   // still to play: nothing to mark yet
-        const sched = S.schedule && S.schedule[w];
-        return { why: sched && Object.keys(sched).length && team && !sched[team] ? 'bye' : 'did not play' };
-    };
-    const season = []; for (let w = 1; w <= upto; w++) season.push([w, weekOf(w)]);
-    const seriesOf = (get) => season.map(([w, x]) => { if (!x) return [w, undefined]; if (!x.ln) return [w, null, x.why]; const v = get(x.ln, x.pl); return v != null && isFinite(v) ? [w, v] : [w, null, 'no number for this one']; });
+    const season = seasonWeeks(pid), seriesOf = (get) => seriesFrom(season, get);
     const viz = (k, label, get, show, withSeason) => {
         const d = pool && usageDist(pool, pos, k, get); if (!d) return [null, null];
         const x = l4 ? get(l4) : null, series = withSeason ? seriesOf(get) : [];
@@ -5847,11 +6118,12 @@ function usageBlock(pid) {
         return [usageStrip(d, x, show, label, who, sc, STRIP_W), series.length ? usageSeason(d, series, show, label, sc, l4 ? l4.weeks : []) : null];
     };
     const row = (k, label, tip, vals, [st, line] = []) => h('div', { class: 'urow' },
-        h('span', { class: 'ulab' }, h('span', tipAttrs(k, tipPos), label), tip ? h('small', null, tip) : null, st),
+        h('span', { class: 'ulab' }, h('span', tipAttrs(k, tipPos, null, 'l4'), label), tip ? h('small', null, tip) : null, st),
         h('span', { class: 'usea' }, line || null),
         ...vals.map((v, i) => h('span', { class: `uv mono ${i === 2 ? 's' : ''}` }, v == null ? '—' : v)));
 
-    const rows = USAGE_SETS[key].map(k => {
+    // the table's set for his position, and the numbers the tables let go that still describe him
+    const rows = [...USAGE_SETS[key], ...(CARD_MORE[key] || [])].map(k => {
         const get = (e, pl) => { const x = usageVal(e, k, pl); return x == null && USAGE_ZERO.has(k) ? 0 : x; };
         // the three numbers agree with the line under them: a count he did not record in a game he played is 0, not a dash
         const v = [[wk, S.stats[S.week]], [l4], [sea, S.seasonStats]].map(([ln, pl]) => (ln && ln.stats && ((ln.stats.off_snp || 0) > 0 || (ln.stats.gp || 0) > 0 || (ln.gp || 0) > 0) ? get(ln, pl) : usageVal(ln, k, pl)));
@@ -6392,7 +6664,6 @@ function txWaivers() {
 // the way the player card places it.
 const CUT_POS = ['WR', 'RB', 'TE'], CUT_GAIN = 10;
 function oppKey(pos) {
-
     const k = keyColFor(pos); if (!k) return null;
     return { k, label: USAGE[k][0], get: (e) => { const x = usageVal(e, k); return x == null && USAGE_ZERO.has(k) ? 0 : x; }, show: (x) => usageFmt(k, x) };
 }
@@ -7038,7 +7309,7 @@ function playOf(g, ev) {
         else if (/^(catch|run|pass|TD|XP|FG)/.test(phrase)) phrase += ' allowed';
     }
     return { t: ev.t, pid: first ? first.pid : null, phrase, dw: own, dp: first ? (first.dp || 0) : (ev.dp || 0), tot: first && first.tot != null ? first.tot : null,
-        helped: ev.side === 'b' ? g.B : g.A, clock: ev.q ? `Q${ev.q} ${ev.clk || ''}`.trim() : '', desc: ev.desc || '', g, sa: ev.sa, sb: ev.sb };
+        helped: ev.side === 'b' ? g.B : g.A, clock: playQuarter(ev.q) ? `${playQuarter(ev.q)} ${ev.clk || ''}`.trim() : '', desc: ev.desc || '', g, sa: ev.sa, sb: ev.sb };
 }
 // The week's games, each with its priced ledger and its plays, newest first.
 // Ledgers are memoised on the play count and the fetch time, so a re-render is
@@ -7454,7 +7725,7 @@ function gcDrives(plays) {
         if (m.is_scoring_play) cur.closed = true;
     }
     const clk = (m) => `${m.time_remaining_minutes ?? 0}:${String(m.time_remaining_seconds ?? 0).padStart(2, '0')}`;
-    const gsec = (m) => { const q = Number(m.quarter_name) || 5; return (Math.min(q, 5) - 1) * 900 + (900 - ((m.time_remaining_minutes || 0) * 60 + (m.time_remaining_seconds || 0))); };
+    const gsec = (m) => { const q = quarterNum(m.quarter_name) || 5; return (q - 1) * 900 + ((q > 4 ? 600 : 900) - ((m.time_remaining_minutes || 0) * 60 + (m.time_remaining_seconds || 0))); };   // overtime is ten minutes
     drives.forEach((d, i) => {
         const first = d.plays[0].metadata, last = d.plays[d.plays.length - 1].metadata, next = drives[i + 1];
         d.key = `${d.pos}:${first.sequence}`;
@@ -7530,7 +7801,7 @@ function gameCenterPage() {
             const dots = (n, c) => n ? h('span', null, ...Array.from({ length: n }, () => h('i', { class: `gcdot ${c}` })), ` ${n} ${c === 'me' ? 'yours' : 'theirs'}`) : null;
             rail.append(h('div', { class: `gcrg ${x.gid === g.gid ? 'on' : ''}`, onclick: () => { S.ui.gcGame = x.gid; S.ui.gcOpen = null; render(); } },
                 h('img', { class: 'gclogo', src: teamLogo(x.away), alt: '' }), h('div', { class: `t ${started && x.as > x.hs ? 'win' : ''}` }, h('span', null, x.away), h('span', { class: 'mono' }, started ? x.as : '')),
-                h('div', { class: 'gst mono' }, x.over ? 'FINAL' : x.live ? `● ${x.q === 'H' ? 'HALF' : 'Q' + (x.qn || x.q)}` : kick(x.t), !started && x.ch ? h('small', null, x.ch) : null),
+                h('div', { class: 'gst mono' }, x.over ? 'FINAL' : x.live ? `● ${quarterLabel(x)}` : kick(x.t), !started && x.ch ? h('small', null, x.ch) : null),
                 h('img', { class: 'gclogo', src: teamLogo(x.home), alt: '' }), h('div', { class: `t ${started && x.hs > x.as ? 'win' : ''}` }, h('span', null, x.home), h('span', { class: 'mono' }, started ? x.hs : '')),
                 h('div', { class: 'stake mono' }, dots(st.mine.length, 'me'), dots(st.opps.length, 'opp'), !st.mine.length && !st.opps.length ? 'no starters in your matchup' : null)));
         }
@@ -7545,7 +7816,7 @@ function gameCenterPage() {
         h('div', null, h('div', { class: 'nm' }, teamNick(t)), (() => { const r2 = rec2 && !/^0-0(-0)?$/.test(String(rec2).trim()) ? rec2 : ''; return h('div', { class: 'rec mono' }, `${r2}${r2 ? ' · ' : ''}${home ? 'home' : 'away'}`); })()),
         home ? h('img', { class: 'gclogo lg', src: teamLogo(t), alt: '' }) : null,
         home ? null : h('div', { class: `sc mono ${lose ? 'lose' : ''}` }, started2 ? sc : ''));
-    const status = g.over ? h('span', { class: 'fin' }, 'FINAL') : g.live ? h('span', { class: 'live' }, `● ${g.q === 'H' ? 'HALFTIME' : `Q${g.qn || g.q} ${g.tr || ''}`}`) : h('span', { class: 'pre' }, `${day(g.t)} ${kick(g.t)}`);
+    const status = g.over ? h('span', { class: 'fin' }, 'FINAL') : g.live ? h('span', { class: 'live' }, `● ${g.q === 'H' ? 'HALFTIME' : `${quarterLabel(g)} ${g.tr || ''}`.trim()}`) : h('span', { class: 'pre' }, `${day(g.t)} ${kick(g.t)}`);
     const bug = h('div', { class: 'gcbug' }, side(g.away, g.arec, g.as, false, g.over && g.as < g.hs),
         h('div', { class: 'gcmid' }, status, h('table', { class: 'gcqt' }, h('tr', null, h('th'), ...['1', '2', '3', '4', 'T'].map(x => h('th', null, x))), qRow(g.away, g.aq || [], g.as), qRow(g.home, g.hq || [], g.hs))),
         side(g.home, g.hrec, g.hs, true, g.over && g.hs < g.as));
@@ -7614,7 +7885,7 @@ function gameCenterPage() {
             h('div', { class: 'gcdh', onclick: () => { if (open) S.ui.gcOpen.delete(d.key); else S.ui.gcOpen.add(d.key); render(); } },
                 h('img', { class: 'gclogo', src: teamLogo(d.pos), alt: '' }),
                 h('div', null, h('div', { class: 'res' }, h('span', { class: `gcrc ${rc}` }, rl), `${d.pos} ${d.result === 'In progress' ? 'drive in progress' : d.result}`),
-                    h('div', { class: 'sum mono' }, `Q${d.q} ${d.start} · ${d.n} play${d.n === 1 ? '' : 's'} · ${d.yds} yds · ${mmss(d.dur)} · from ${d.startYl}`)),
+                    h('div', { class: 'sum mono' }, `${playQuarter(d.q)} ${d.start} · ${d.n} play${d.n === 1 ? '' : 's'} · ${d.yds} yds · ${mmss(d.dur)} · from ${d.startYl}`)),
                 foldCaret(open, 'chev'),
                 fx.length ? h('div', { class: 'fx' }, ...fx.map(([pid, v]) => gcChip(pid, v, oppR))) : null));
         if (open) for (const p of d.plays.concat(d.after).slice().reverse()) {
@@ -7623,7 +7894,7 @@ function gameCenterPage() {
             const goal = m.yards_to_end_zone != null && m.distance != null && m.yards_to_end_zone <= m.distance;
             const dd = m.down ? `${['', '1st', '2nd', '3rd', '4th'][m.down]} & ${goal ? 'Goal' : m.distance} · ${m.yard_line_territory || ''} ${m.yard_line ?? ''}` : /extra_point/.test(m.play_type) ? 'PAT' : '';
             el.append(h('div', { class: `gcplay ${m.is_scoring_play ? 'sc' : ''} ${/INTERCEPTED|FUMBLES/i.test(m.description || '') ? 'bad' : ''}` },
-                h('span', { class: 'cl mono' }, `Q${m.quarter_name} ${m.time_remaining_minutes ?? ''}:${String(m.time_remaining_seconds ?? 0).padStart(2, '0')}`), h('span', { class: 'dd mono' }, dd), h('span', { class: 'ds' }, m.description || m.fantasy_description || ''),
+                h('span', { class: 'cl mono' }, `${playQuarter(m.quarter_name)} ${m.time_remaining_minutes ?? ''}:${String(m.time_remaining_seconds ?? 0).padStart(2, '0')}`), h('span', { class: 'dd mono' }, dd), h('span', { class: 'ds' }, m.description || m.fantasy_description || ''),
                 pfx.length ? h('div', { class: 'fx' }, ...pfx.map(x => gcChip(x.pid, x.pts, oppR))) : null));
         }
         return el;
@@ -7635,7 +7906,7 @@ function gameCenterPage() {
         ...(scoring.length ? scoring.map(({ p, i }) => {
             const m = p.metadata, pat = /field_goal/.test(m.play_type) ? null : plays.slice(i + 1, i + 4).find(x => /extra_point|two_point/.test(x.metadata.play_type));
             const fin = (pat || p).metadata, fx = gcPlayFx(p).concat(pat ? gcPlayFx(pat) : []).filter(x => Math.abs(x.pts) >= 0.5);
-            return h('div', { class: 'gcscr' }, h('img', { class: 'gclogo', src: teamLogo(m.scoring_team || m.possession), alt: '' }), h('span', { class: 'k' }, `Q${m.quarter_name} ${/field_goal/.test(m.play_type) ? 'FG' : 'TD'}`),
+            return h('div', { class: 'gcscr' }, h('img', { class: 'gclogo', src: teamLogo(m.scoring_team || m.possession), alt: '' }), h('span', { class: 'k' }, `${playQuarter(m.quarter_name)} ${/field_goal/.test(m.play_type) ? 'FG' : 'TD'}`),
                 h('span', null, m.scoring_description || m.fantasy_description || m.description, pat ? h('span', { class: 'dim' }, ` · ${/good/i.test(pat.metadata.description || '') ? 'PAT good' : 'PAT'}`) : null),
                 h('span', { class: 'sco mono' }, `${g.away} ${fin.away_points} · ${g.home} ${fin.home_points}`), fx.length ? h('div', { class: 'fx' }, ...fx.map(x => gcChip(x.pid, x.pts, oppR))) : null);
         }) : [h('div', { class: 'gcnone' }, 'No scores yet')]));
@@ -7753,7 +8024,7 @@ function pageMatchup() {
             onclick: (e) => { e.stopPropagation(); S.ui.muPick = false; S.ui.matchupRoster = null; S.ui.muView = 'one'; render(); } },
             avatarEl(S.myRoster, 'xs'), h('span', { class: 'mmlab' }, 'My matchup'), ...scoreKids);
     }
-    const swCard = h('div', { class: 'card span2 swrap mswitch' }, tabs, crumb, h('span', { class: 'mspace' }), mineBtn);
+    const swCard = h('div', { class: 'card span2 swrap mswitch' }, tabs, weekControl(), crumb, h('span', { class: 'mspace' }), mineBtn);
     const shut = () => { if (S.ui.muPick) { S.ui.muPick = false; render(); } };
     if (all) { const p2 = allSixPage(); p2.prepend(swCard); p2.addEventListener('click', shut); return p2; }
     if (nfl) { const p3 = gameCenterPage(); p3.prepend(swCard); p3.addEventListener('click', shut); return p3; }
@@ -7899,8 +8170,9 @@ async function ensureSheetData() {
     }
     if (jobs.length) await Promise.all(jobs);
 }
-// The week in progress, folded into the season sheet "as it stands": its live
-// scores counted as if the week ended now, every column and lens with it. The
+// The week in progress, folded into the season sheet: each game counted at its
+// projected final, every column and lens with it. (It used to count the score
+// so far, "as it stands", which handed the week to whoever had played more men.) The
 // switch is per viewer and holds for the week it was turned on in; once the
 // next week starts it is off again.
 const SHEET_LIVE_KEY = 'badgerSheetLive';
@@ -7923,9 +8195,9 @@ function liveSwitch(focusKey) {
     if (!sheetLiveAvail()) return null;
     const on = sheetLiveOn();
     return h('span', { class: `lvsw${on ? ' on' : ''}`, role: 'switch', tabindex: '0', 'aria-checked': String(on), 'data-focus': focusKey,
-        title: on ? 'Showing the standings with this week counted as it stands. Click for settled weeks only.' : 'Count this week as it stands, as if it ended now',
+        title: on ? `Showing the standings with this week counted ${liveWeekProjects() ? 'as it is projected to finish' : 'as it stands'}. Click for settled weeks only.` : liveWeekProjects() ? 'Count this week as it is projected to finish' : 'Count this week as it stands, as if it ended now',
         onclick: () => setSheetLive(!on), onkeydown: (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setSheetLive(!on); } } },
-        h('span', { class: 'tg' }), h('span', { class: 'dot' }), `Week ${S.curWeek} as it stands`);
+        h('span', { class: 'tg' }), h('span', { class: 'dot' }), `Week ${S.curWeek} ${liveWord()}`);
 }
 // Under the Home card's table while it is on: when, how much is left, who crosses the line.
 function homeLiveCap() {
@@ -7947,7 +8219,7 @@ function sheetInput(live) {
         if (ms.some(m => (m.points || 0) > 0) && (over || w < S.curWeek || (live && w === S.curWeek))) {
             weeks[w] = ms.map(m => ({
                 rosterId: m.roster_id, matchupId: m.matchup_id == null ? null : m.matchup_id,
-                points: m.points || 0, starters: m.starters || [], players: m.players || [],
+                points: live && w === S.curWeek ? countedPoints(m) : m.points || 0, starters: m.starters || [], players: m.players || [],
                 playerPoints: m.players_points || {},
             }));
         } else {
@@ -7990,7 +8262,7 @@ function sheetInput(live) {
 function seasonSheet(live) {
     const inp = sheetInput(live); if (!inp) return null;
     // as it stands, every new point is a new sheet
-    const liveKey = live ? (S.matchups[S.curWeek] || []).map((m) => `${m.roster_id}=${m.points || 0}`).join(',') : '';
+    const liveKey = live ? (S.matchups[S.curWeek] || []).map((m) => `${m.roster_id}=${countedPoints(m)}`).join(',') : '';
     const key = `${Object.keys(inp.weeks).length}:${inp.futureGames.length}:${S.curWeek}:${liveKey}:${Object.keys(inp.odds || {}).length}:${(S.po && S.po.res && S.po.key) || ''}`;
     if (S.sheet && S.sheet.key === key) return S.sheet.val;
     let val = null;
@@ -8068,9 +8340,9 @@ function sheetLiveCap(seeds, settledAt, seats, tail) {
     const seatOf = (rid) => (seeds && seeds[rid] ? seeds[rid].n : 99);   // no seed is outside the seats
     const cross = Object.keys(settledAt).map(Number).filter((rid) => (settledAt[rid] <= seats) !== (seatOf(rid) <= seats));
     const said = cross.map((rid) => `${teamName(rosterById(rid))} ${seatOf(rid) <= seats ? 'moves above' : 'drops below'} the line`);
-    return h('div', { class: 'lvcap' }, h('b', null, `Week ${S.curWeek} as it stands`), `, ${at} · `,
+    return h('div', { class: 'lvcap' }, h('b', null, `Week ${S.curWeek} ${liveWord()}`), `, ${at} · `,
         left ? `${left} starter${left === 1 ? '' : 's'} still to play` : 'every starter has played',
-        ` · ${said.length ? said.join(', ') : 'no one crosses the playoff line'}. ${tail || `Every column counts week ${S.curWeek} as if it ended now.`}`);
+        ` · ${said.length ? said.join(', ') : 'no one crosses the playoff line'}. ${tail || (liveWeekProjects() ? `Every column counts week ${S.curWeek} at its projected final: the points so far plus what the starters still to play are projected for.` : `Every column counts week ${S.curWeek} as if it ended now.`)}`);
 }
 // ── the tab ──────────────────────────────────────────────────────────────────
 function lgStandingsTab() {
@@ -8101,7 +8373,8 @@ function lgStandingsTab() {
     }
     const wk = {}; for (const m of (live ? S.matchups[S.curWeek] || [] : [])) wk[m.roster_id] = m;
     const wkOpp = (rid) => { const m = wk[rid]; if (!m || m.matchup_id == null) return null; return Object.values(wk).find((x) => x.matchup_id === m.matchup_id && x.roster_id !== rid) || null; };
-    const wkRes = (rid) => { const m = wk[rid], o = wkOpp(rid); if (!m || !o) return null; const a = m.points || 0, b = o.points || 0; return a > b ? 'W' : a < b ? 'L' : 'T'; };
+    const wkPts = (rid) => { const m = wk[rid]; return m ? countedPoints(m) : null; };
+    const wkRes = (rid) => { const m = wk[rid], o = wkOpp(rid); if (!m || !o) return null; const a = countedPoints(m), b = countedPoints(o); return a > b ? 'W' : a < b ? 'L' : 'T'; };
     const verdict = {};
     for (const v of SH.verdicts) verdict[v.rosterId] = v;
     const nDiv = (S.league.settings || {}).divisions || 0, byDiv = sheetGroup() === 'division';
@@ -8131,8 +8404,8 @@ function lgStandingsTab() {
     const LENS = {
         record: {
             head: [['PF'], ['PA'], ['All-play', 'Your record against every team every week — the schedule removed'], ['Luck', 'Wins minus what all-play expected of you'], ['Sched pts', 'Points faced against the league average'], ['1-score', 'Record in games decided by under 10'], ['Highs', 'Weeks you were the league top scorer']],
-            row: t => [[m(fmt1(t.pointsFor)), live && wk[t.rosterId] ? h('span', { class: 'lvsub' }, `+${fmt1(wk[t.rosterId].points || 0)} live`) : null],
-                [m(fmt1(t.pointsAgainst), 'dim'), live && wkOpp(t.rosterId) ? h('span', { class: 'lvsub' }, `+${fmt1(wkOpp(t.rosterId).points || 0)}`) : null],
+            row: t => [[m(fmt1(t.pointsFor)), live && wk[t.rosterId] ? h('span', { class: 'lvsub' }, `+${fmt1(wkPts(t.rosterId))} ${liveWeekProjects() ? 'proj' : 'live'}`) : null],   // the figure the total beside it added
+                [m(fmt1(t.pointsAgainst), 'dim'), live && wkOpp(t.rosterId) ? h('span', { class: 'lvsub' }, `+${fmt1(countedPoints(wkOpp(t.rosterId)))}`) : null],
                 m(`${Math.round(t.allPlayW)}–${Math.round(t.allPlayL)}`),
                 m(sg(t.luck), t.luck > 0.5 ? 'green' : t.luck < -0.5 ? 'amber' : 'dim'),
                 m(sg(t.schedulePoints, 0), t.schedulePoints > 60 ? 'amber' : t.schedulePoints < -60 ? 'green' : 'dim'),
@@ -8197,7 +8470,7 @@ function lgStandingsTab() {
                         h('span', { class: `shnm ${mine ? 'teal' : ''}` }, teamName(R)),
                         // the tag carries its own reason now that the three cards above the table are gone
                         v ? h('span', { class: `vchip v-${v.key}`, title: verdictWhy(v, t) }, v.label) : null)),
-                    h('td', { class: 'c mono' }, `${t.wins}–${t.losses}${t.ties ? '–' + t.ties : ''}`, live && wkRes(t.rosterId) ? h('span', { class: 'lvres', title: `Week ${S.curWeek} as it stands: ${fmtS((wk[t.rosterId] || {}).points)}–${fmtS((wkOpp(t.rosterId) || {}).points)}` }, h('i'), wkRes(t.rosterId)) : null),
+                    h('td', { class: 'c mono' }, `${t.wins}–${t.losses}${t.ties ? '–' + t.ties : ''}`, live && wkRes(t.rosterId) ? h('span', { class: 'lvres', title: `Week ${S.curWeek} ${liveWord()}: ${fmtS(wkPts(t.rosterId))}–${fmtS(wkOpp(t.rosterId) ? countedPoints(wkOpp(t.rosterId)) : null)}` }, h('i'), wkRes(t.rosterId)) : null),
                     ...L.row(t).map(c => h('td', null, c)));
             };
             if (!byDiv) return rows.map((t, i) => rowEl(t, i === seats - 1));
@@ -8229,7 +8502,7 @@ function lgStandingsTab() {
         h('div', { class: 'scroll-x', style: 'margin-top:10px' }, tbl),
         live ? sheetLiveCap(seeds, settledAt, seats) : null,
         h('div', { class: 'cap', style: 'margin-top:8px' },
-            `Weeks 1–${SH.weeks[SH.weeks.length - 1]}${live ? `, week ${S.curWeek} as it stands` : ''} · ${byDiv ? `a teal number is one of the ${seats} playoff seats` : 'the dashed line is the playoff cut'} · click a team to open it.`,
+            `Weeks 1–${SH.weeks[SH.weeks.length - 1]}${live ? `, week ${S.curWeek} ${liveWord()}` : ''} · ${byDiv ? `a teal number is one of the ${seats} playoff seats` : 'the dashed line is the playoff cut'} · click a team to open it.`,
             SH.thin.luck ? ' Luck and Manager need four settled weeks.' : '',
             seeds && seedingNote() ? ` ${seedingNote()}` : '',
             lens === 'ahead' && !Object.keys((sheetInput() || {}).odds || {}).length ? ' The odds are still being worked out; this view fills in when they land.' : ''));
@@ -9407,8 +9680,7 @@ function modalFoot(pid, owner) {
         h('button', { class: 'btn s', style: 'margin-left:auto', onclick: () => { S.ui.sel = null; S.ui.dropAsk = null; render(); } }, 'Close'));
 }
 // ── kickoff times (GraphQL scores; the schedule REST has only dates) ─────────
-async function loadKickoffs(force) {
-    const w = S.week;
+async function loadKickoffs(force, w = S.week) {
     if (!force && S.kick && S.kickWeek === w) return;
     S.kickByWeek = S.kickByWeek || {};
     // A week already fetched this visit becomes current at once; a live one is
@@ -9550,6 +9822,7 @@ function wsApply(event, p) {
             const pid = String(p.player_id), pts = scoreStats(p.stats), m = S.stats[S.week];
             if (!m) return false;
             m[pid] = { pid, pts, opp: p.opponent, stats: p.stats };
+            foldStanding(pid, p.player);
             statsGen++;
             // his points in the matchup he starts in, and that side's total, re-summed the way Sleeper sums it
             if (pts != null) for (const mu of S.matchups[S.week] || []) {
@@ -9608,12 +9881,21 @@ async function wsPull(want) {
 // points beside a name could move while "Q3 · 17-13 · 6 rec, 71 yds" stayed
 // frozen. Both now refresh too, but only while something is actually kicking.
 const liveWeek = () => S.seasonType === 'regular' && S.week === S.curWeek;
+// How many NFL games of the current week are under way, whatever week is on
+// screen: kicked off and not yet final. The Scoreboard link says LIVE while this
+// is not zero.
+function gamesLiveNow() {
+    const m = (S.kickByWeek || {})[S.curWeek] || {}, on = new Set();
+    for (const t in m) { const g = m[t]; if (g && !g.over && (g.live || g.started)) on.add(g.gid); }
+    return on.size;
+}
 function gamesInProgress() {
     for (const t in (S.kick || {})) { const g = S.kick[t]; if (g && (g.live || (g.started && !g.over))) return true; }
     return false;
 }
 async function refreshLive() {
-    if (!liveWeek()) return;
+    // reading another week: the current one's games are still asked after, for the bar's LIVE mark
+    if (!liveWeek()) { if (S.seasonType === 'regular' && !S.ui.vault && S.curWeek >= 1 && S.curWeek <= LAST_WEEK) await loadKickoffs(true, S.curWeek); return; }
     await loadKickoffs(true);          // cheap, and it is what tells us a game began
     // the morning after the week's last game moves the pages on, without a reload
     if (settleWeek()) { await ensureData(); return; }
