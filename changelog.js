@@ -7,6 +7,22 @@
 // say adds none and rides under the latest one.
 globalThis.BADGER_NOTES = [
     {
+        v: '2026.10.14', when: 'October 14, 2026', title: 'Waiver claims that say what will happen',
+        items: [
+            '<b>Transactions</b> is two tabs under one search box: <b>Waivers & Adds</b> (your claims, ideas for who to add, and history) and <b>Trades</b> (offers and history).',
+            'One row per player you claim, with your bid and your drop right in the row. Change who a claim drops, or drop nobody, without filing it again.',
+            'Add a condition when you want one: a back-up drop if no spot is open, a back-up bid if you are out of FAAB by then, or a second choice if you miss your first. The × on a condition takes it out.',
+            '<b>What will happen</b> plays out every way the waiver run can go, money, open spots and drops already gone, and says it in sentences. A claim that can fail is flagged on its row, with one press to fix it.',
+            'Change the order of claims at the same bid with the arrows beside them.',
+            'History says what happened to each player in the last run, for you or the whole league.',
+            'Choosing a drop lists your whole roster, fewest rest-of-season points first, with each player’s bye, this week’s projection and rest of season.',
+            'Commissioners: a trade both teams accepted waits under <b>Trades › Review</b>, and on Home, until the review ends. Approve it now or veto it from there.',
+            'Bench a starter with nobody coming in.',
+            'Home’s top bar lists only what needs doing; your claims stay in Transactions.',
+            'D/ST points in the matchup’s play-by-play now match Sleeper’s on forced fumbles, blocked kicks and return touchdowns.',
+        ],
+    },
+    {
         v: '2026.10.12', when: 'October 12, 2026', title: 'Numbers that say where a player stands',
         items: [
             'A new top bar: the pages on the left, <b>Transactions</b> and <b>Chat</b> as buttons on the right, and a <b>Badger</b> menu in the corner for the layout switch, What’s new and feedback. The week picker moved onto the pages that use it.',

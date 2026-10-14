@@ -1058,14 +1058,39 @@ async function submitClaim(adds, drops, bid) {
     const d = await gql('submit_waiver_claim', `mutation submit_waiver_claim($k_adds: [String], $v_adds: [Int], $k_drops: [String], $v_drops: [Int], $k_settings: [String], $v_settings: [Int]) { submit_waiver_claim(league_id: "${S.leagueId}", k_adds: $k_adds, v_adds: $v_adds, k_drops: $k_drops, v_drops: $v_drops, k_settings: $k_settings, v_settings: $v_settings){ ${TXN_FIELDS} } }`, { k_adds: a.keys, v_adds: a.values, k_drops: dr.keys, v_drops: dr.values, k_settings: st.keys, v_settings: st.values });
     return d.submit_waiver_claim;
 }
-async function updateClaim(txn, bid) {
-    const st = kv({ waiver_bid: Math.max(0, Math.round(bid || 0)) });
+// What a claim's settings hold, ready to send back: whole numbers only (the bid,
+// and its place in your claim order once that has been set). Sleeper's own
+// client sends them back whole on a change, so a change made here does too.
+const claimSettings = (t, patch) => { const out = {}; for (const [k, v] of Object.entries(Object.assign({}, (t && t.settings) || {}, patch || {}))) if (Number.isInteger(v)) out[k] = v; return out; };
+const updateClaim = (txn, bid) => setClaimSettings(txn, claimSettings(txn, { waiver_bid: Math.max(0, Math.round(bid || 0)) }));
+async function setClaimSettings(txn, settings) {
+    const st = kv(settings);
     const d = await gql('update_waiver_claim', `mutation update_waiver_claim($k_settings: [String], $v_settings: [Int]) { update_waiver_claim(league_id: "${S.leagueId}", transaction_id: "${txn.transaction_id}", leg: ${txn.leg}, k_settings: $k_settings, v_settings: $v_settings){ ${TXN_FIELDS} } }`, { k_settings: st.keys, v_settings: st.values });
     return d.update_waiver_claim;
 }
 async function cancelClaim(txn) {
     const d = await gql('cancel_waiver_claim', `mutation cancel_waiver_claim { cancel_waiver_claim(league_id: "${S.leagueId}", leg: ${txn.leg}, transaction_id: "${txn.transaction_id}"){ ${TXN_FIELDS} } }`);
     return d.cancel_waiver_claim;
+}
+// The order a team's claims are tried in, as Sleeper's own client sorts them: the
+// bigger bid first, then the place you gave it, then the order they were filed.
+const claimKey = (t) => { const s = t.settings || {}; return { bid: s.waiver_bid || 0, prio: Number.isInteger(s.priority) ? s.priority : Infinity, id: String(t.transaction_id) }; };
+const byClaimKey = (a, b) => b.bid - a.bid || (a.prio === b.prio ? 0 : a.prio - b.prio) || a.id.length - b.id.length || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+// Claims in the order they should be tried, and what has to be sent to make it so:
+// [claim, place] pairs, none when Sleeper's own order already agrees. A claim
+// filed again is a new claim and would otherwise be tried after every other claim
+// of yours at the same bid. `wanted` must already run bigger bid first.
+function claimOrderWrites(wanted) {
+    const natural = wanted.map(t => Object.assign(claimKey(t), { t })).sort(byClaimKey).map(r => r.t);
+    if (natural.every((t, i) => t === wanted[i])) return [];
+    return wanted.map((t, i) => [t, i]).filter(([t, i]) => (t.settings || {}).priority !== i);
+}
+// The commissioner's two moves on a trade in league review, Sleeper's own PROCESS TRADE and REMOVE TRADE (said
+// "Approve trade" and "Veto trade" here: the user's words): process_transaction puts it through now, force_cancel_transaction ends it.
+async function commishTrade(txn, process) {
+    const op = process ? 'process_transaction' : 'force_cancel_transaction';
+    const d = await gql(op, `mutation ${op} { ${op}(league_id: "${S.leagueId}", transaction_id: "${txn.transaction_id}", leg: ${txn.leg}){ ${TXN_FIELDS} } }`);
+    return d[op];
 }
 async function respondTrade(txn, accept) {
     const op = accept ? 'accept_trade' : 'reject_trade';
@@ -2510,7 +2535,7 @@ function pageHome() {
 // at the right. Nothing on the line is an *answer*; answers (who the cover is,
 // which free agent fills the hole) live in the rows underneath, which open by
 // themselves when something is red and filter to one token when you click it.
-const DO_KEYS = ['lineup', 'q', 'bench', 'roster', 'ir', 'faab', 'claims', 'offers', 'byes'];
+const DO_KEYS = ['lineup', 'q', 'bench', 'roster', 'ir', 'faab', 'claims', 'offers', 'review', 'byes'];
 // The bench player who plays LATEST after this one — the man who can still go
 // in after a Questionable starter is ruled out. Same rule as the insights
 // engine's cover, recomputed here because the engine only names one insight
@@ -2642,7 +2667,9 @@ function doTokens(my) {
     // pickup you are not making; it costs nothing but the claim.
     const cap = rosterPositions().filter(p => p !== 'IR' && p !== 'TAXI').length;
     T.roster.val = `${cap - openSpots}/${cap}`;
-    if (openSpots > 0) {
+    // While you have claims in, they are already filling the open spots: the row would only say so again.
+    const claiming = S.pending.some(x => x.type === 'waiver' && (x.roster_ids || []).includes(my.roster_id));
+    if (openSpots > 0 && !claiming) {
         T.roster.sev = 't';
         T.roster.rows.push({ name: `${openSpots} open roster spot${openSpots === 1 ? '' : 's'}`, sev: 't', fact: `nobody has to be dropped — a pickup costs you the claim and nothing else`, btn: 'SHOP', fn: () => go('players', { playersTab: 'available' }) });
     } else T.roster.go = () => go('team');
@@ -2670,40 +2697,12 @@ function doTokens(my) {
     T.faab.label = wi.faab ? 'FAAB' : 'WAIVER';
     T.faab.go = () => go('players', { playersTab: 'available' });
 
-    // CLAIMS — what you have in, and when it runs
+    // CLAIMS — how many you have in, and when they run. The claims themselves, and how the last run went, are the
+    // Transactions drawer's: a row per claim here was the drawer said twice (the user, 2026-10-13: "I dont need you
+    // to redisplay all the damn waiver bids").
     const claims = S.pending.filter(x => x.type === 'waiver' && (x.roster_ids || []).includes(my.roster_id));
     T.claims.val = String(claims.length); T.claims.sev = claims.length ? 't' : '';
-    const named = (o) => Object.keys(o || {}).map(p => (P(p) || {}).last_name || pname(p));
-    const claimLine = (c) => {
-        const add = named(c.adds), drop = named(c.drops);
-        const bid = c.settings && c.settings.waiver_bid;
-        return { name: add.length ? `Claim on ${add.join(', ')}` : 'Waiver claim', fact: `${drop.length ? 'dropping ' + drop.join(', ') + ' · ' : ''}${bid ? '$' + bid + ' bid · ' : ''}processes ${runsWhen()}` };
-    };
-    T.claims.rows = claims.map(c => Object.assign({ sev: 't', btn: 'VIEW', fn: () => openTx({ tab: 'waivers' }) }, claimLine(c)));
-    // How the last run went. A claim that lost is the one you most want to
-    // know about, and until now it was only ever visible in the Pulse.
-    const settled = [];
-    for (const t2 of [...(S.txns[S.week] || []), ...(S.txns[S.week - 1] || [])]) {
-        if (t2.type !== 'waiver' || !(t2.roster_ids || []).includes(my.roster_id)) continue;
-        if (t2.status !== 'complete' && t2.status !== 'failed') continue;
-        const at = t2.status_updated || t2.created || 0;
-        if (Date.now() - at > 4 * 86400e3) continue;
-        settled.push({ t: t2, at });
-    }
-    settled.sort((a, b) => b.at - a.at);
-    for (const { t: c } of settled.slice(0, 3)) {
-        const add = named(c.adds), bid = c.settings && c.settings.waiver_bid;
-        const won = c.status === 'complete';
-        T.claims.rows.push({
-            name: won ? `Won ${add.join(', ') || 'your claim'}` : `Lost ${add.join(', ') || 'a claim'}`,
-            sev: won ? 'g' : 'a',
-            fact: won ? `${bid ? '$' + bid + ' · ' : ''}he is on your roster${named(c.drops).length ? ', ' + named(c.drops).join(', ') + ' dropped' : ''}`
-                : `${bid ? 'your $' + bid + ' bid ' : 'your claim '}${(c.metadata && c.metadata.notes) ? '— ' + String(c.metadata.notes).replace(/\.$/, '').toLowerCase() : 'did not go through'}`,
-            btn: 'PULSE', fn: () => go('home')
-        });
-    }
-    if (!claims.length) T.claims.go = () => go('players', { playersTab: 'available' });
-    if (!claims.length && T.claims.rows.length) T.claims.sev = T.claims.rows.some(r => r.sev === 'a') ? 'a' : 'g';
+    T.claims.go = claims.length ? () => openTx({ tab: 'waivers' }) : () => go('players', { playersTab: 'available' });
     T.claims.sub = runsWhen();
 
     // OFFERS — trades waiting on YOU; the ones you sent are not a to-do
@@ -2723,6 +2722,15 @@ function doTokens(my) {
     }
     if (!offers.length && !T.offers.rows.length) T.offers.go = () => go('team');
 
+    // REVIEW — for the commissioner: a trade both teams accepted is a decision only you can make
+    const inReview = reviewTrades();
+    if (!amCommish()) T.review.hide = true;
+    else {
+        T.review.val = String(inReview.length); T.review.sev = inReview.length ? 'a' : '';
+        T.review.rows = inReview.map(t => ({ name: 'Trade in review', sev: 'a', fact: `${(t.roster_ids || []).map(r => teamName(rosterById(r))).join(' ⇄ ')} · goes through ${atWhen(reviewEnds(t))} unless you act`, btn: 'REVIEW', fn: () => openTx({ tab: 'trades', tpart: 'review' }) }));
+        if (!inReview.length) T.review.go = () => openTx({ tab: 'trades', tpart: 'review' });
+    }
+
     // BYES — the first week two or more of your starters are gone at once
     const byes = byeCalendar(my).find(b => b.who.length >= 2);
     if (byes) {
@@ -2730,7 +2738,7 @@ function doTokens(my) {
         T.byes.rows.push({ name: `Week ${byes.w}`, sev: 'a', fact: `${byes.who.join(', ')} are all on bye`, btn: 'PLAN', fn: () => go('team') });
     } else T.byes.hide = true;
 
-    const LBL = { lineup: 'LINEUP', q: 'Q', bench: 'BENCH▲', roster: 'ROSTER', ir: 'IR', faab: 'FAAB', claims: 'CLAIMS', offers: 'OFFERS', byes: 'BYES' };
+    const LBL = { lineup: 'LINEUP', q: 'Q', bench: 'BENCH▲', roster: 'ROSTER', ir: 'IR', faab: 'FAAB', claims: 'CLAIMS', offers: 'OFFERS', review: 'REVIEW', byes: 'BYES' };
     return DO_KEYS.filter(k => !T[k].hide).map(k => Object.assign({ label: LBL[k] }, T[k]));
 }
 function doBanner() {
@@ -3419,6 +3427,35 @@ function playStatsOf(p) {
 // row, which is authoritative where the tacklers' rows split shared credit.
 const IDP_TO_TEAM = { idp_sack: 'sack', idp_int: 'int', idp_ff: 'ff', idp_fum_rec: 'fum_rec', idp_tkl_loss: 'tkl_loss',
     idp_blk_kick: 'blk_kick', idp_safe: 'safe', idp_def_td: 'def_td', idp_int_td: 'def_td', idp_fum_rec_td: 'def_td' };
+// What a play gave each defence, from its players' rows: [team, stat, count]. A credit goes to the side without the
+// ball, except where the feed books it on someone else's row:
+// - A forced fumble (idp_ff) is on the man who FUMBLED, never on the man who forced it (all 42 of 2026 week 5's).
+//   It belongs to the other side from the fumbler's own team, under the stat Sleeper's line books it as: ff when
+//   his team had the ball at the snap; def_st_ff when he was returning a kick; ff_misc when he was a defender
+//   running back a takeaway. "The side without the ball" handed Turpin's kickoff fumble, forced by Tampa Bay, to
+//   the Dallas D/ST: a point Sleeper never gave (week 5).
+// - A blocked kick is on the kicker's row only (xp_blkd, fg_blkd): blk_kick for the other side, unless the
+//   blocker has a row of his own. A return touchdown is on the returner's (st_td): def_st_td for his team.
+// A stat the defence's own team row already carries on the play is never added twice.
+function defCredits(rows, md) {
+    const offense = md.possession, other = offense && md.team && md.opponent ? (offense === md.team ? md.opponent : md.team) : null, out = [], has = new Set();
+    const ind = rows.filter(r => /^\d+$/.test(String(r.player_id)));
+    for (const r of rows) if (!ind.includes(r)) for (const k in r.stats || {}) has.add(`${r.player_id}:${k}`);
+    const blocker = ind.some(r => (r.stats || {}).idp_blk_kick);
+    for (const r of ind) {
+        const st = r.stats || {}, t = (P(String(r.player_id)) || {}).team, own = t && (t === md.team || t === md.opponent) ? t : null, vs = own ? (own === md.team ? md.opponent : md.team) : other;
+        if (st.pass_sack) out.push([other, 'sack', st.pass_sack]);
+        for (const k in st) {
+            const v = st[k]; if (typeof v !== 'number') continue;
+            if (/^(xp|fg|punt)_blkd$/.test(k)) { if (!blocker) out.push([vs, 'blk_kick', v]); continue; }
+            if (k === 'st_td') { out.push([own || other, 'def_st_td', v]); continue; }
+            const kk = IDP_TO_TEAM[k]; if (!kk || kk === 'sack') continue;
+            if (k !== 'idp_ff' || !st.fum || !own || !offense) { out.push([other, kk, v]); continue; }
+            out.push([vs, own === offense ? 'ff' : /^(kickoff|punt)/.test(md.play_type || '') ? 'def_st_ff' : 'ff_misc', v]);
+        }
+    }
+    return out.filter(c => c[0] && !has.has(`${c[0]}:${c[1]}`));
+}
 // Points and yards allowed are end-state brackets and passes defensed never
 // appear in the feed at all, so those three ride along from the week's official
 // line rather than being rebuilt: flat across the game, right at the whistle.
@@ -3514,7 +3551,7 @@ function buildLedger(A, a, B, b) {
     const gameEnd = {}; for (const p2 of rec.list) if (p2.game_id != null) gameEnd[p2.game_id] = p2.time;
     let prev = null, lastAt = 0, curT = 0;
     for (const p of rec.list) {
-        const md = p.metadata || {}, poss = md.possession, g = p.game_id;
+        const md = p.metadata || {}, g = p.game_id;
         curT = p.time;
         if (md.team && md.opponent) { gameOfTeam[md.team] = g; gameOfTeam[md.opponent] = g; }
         const qn = quarterNum(md.quarter_name);
@@ -3530,21 +3567,18 @@ function buildLedger(A, a, B, b) {
         // sixteen points of drift that the previous three minutes caused.
         const wPre = odds();
         const touched = new Set(), before = {};
-        for (const ps of playStatsOf(p)) {
+        const rows = playStatsOf(p);
+        for (const ps of rows) {   // a started player's row, a started D/ST's own team row among them
             const pid = ps.player_id, st = ps.stats || {};
-            let own = false;
-            if (sides.has(pid)) { if (!(pid in before)) before[pid] = ptsOf(pid); touched.add(pid);
-                for (const k in st) if (typeof st[k] === 'number') acc[pid][k] = (acc[pid][k] || 0) + st[k];
-                own = !/^\d+$/.test(pid); }   // a started D/ST's own team row — already credited, do not credit it again below
-            // a defensive credit, from either a team row or an individual's
-            if (own) continue;
-            const dTeam = !/^\d+$/.test(pid) ? pid : (poss && md.team && md.opponent ? (poss === md.team ? md.opponent : md.team) : null);
-            if (!dTeam || !sides.has(dTeam)) continue;
+            if (!sides.has(pid)) continue;
+            if (!(pid in before)) before[pid] = ptsOf(pid); touched.add(pid);
+            for (const k in st) if (typeof st[k] === 'number') acc[pid][k] = (acc[pid][k] || 0) + st[k];
+        }
+        for (const [dTeam, k, v] of defCredits(rows, md)) {   // and what the players' rows gave a started defence
+            if (!sides.has(dTeam)) continue;
             if (!(dTeam in before)) before[dTeam] = ptsOf(dTeam);
             touched.add(dTeam);
-            if (!/^\d+$/.test(pid)) { for (const k in st) if (typeof st[k] === 'number' && (S.league.scoring_settings || {})[k] != null) acc[dTeam][k] = (acc[dTeam][k] || 0) + st[k]; }
-            else { if (st.pass_sack) acc[dTeam].sack = (acc[dTeam].sack || 0) + st.pass_sack;
-                for (const k in st) { const kk = IDP_TO_TEAM[k]; if (kk && kk !== 'sack' && typeof st[k] === 'number') acc[dTeam][kk] = (acc[dTeam][kk] || 0) + st[k]; } }
+            acc[dTeam][k] = (acc[dTeam][k] || 0) + v;
         }
         if (p.game_id != null && gameStart[p.game_id] == null) gameStart[p.game_id] = p.time;
         const w = odds();
@@ -5013,7 +5047,7 @@ function rosterCard(my, ro) {
                 if (ro) return empty ? null : tradeIcon(my, pid);
                 if (locked) return h('span', { class: 'swap lock', 'aria-disabled': 'true', title: `${pname(pid)}’s game has kicked off: this slot is locked for the week` }, '⇅');
                 const irOk = !empty && irEligible(pid);
-                return h('span', { class: `swap ${swapping ? 'on' : irOk ? 'ir' : bad || empty ? 'hot' : ''}`, title: swapping ? 'Cancel' : irOk ? 'IR-eligible — swap him, or place him in an empty IR slot below' : 'Swap: pick a bench player or another starter', onclick: (ev) => { ev.stopPropagation(); if (sw && !swapping) return; S.ui.swapFrom = swapping ? null : { i, slot: sl, pid: empty ? null : pid }; render(); } }, '⇅');
+                return h('span', { class: `swap ${swapping ? 'on' : irOk ? 'ir' : bad || empty ? 'hot' : ''}`, title: swapping ? 'Cancel' : irOk ? 'IR-eligible — swap him, or place him in an empty IR slot below' : empty ? 'Swap: pick a bench player or another starter' : 'Swap: pick a bench player or another starter. Or pick the Bench header to bench him and leave the slot empty', onclick: (ev) => { ev.stopPropagation(); if (sw && !swapping) return; S.ui.swapFrom = swapping ? null : { i, slot: sl, pid: empty ? null : pid }; render(); } }, '⇅');
             })()), 'fx2'),
             // An empty slot's insight ("no kicker — best FA: …") lives beside the
             // chip, in the 280px player cell that is otherwise blank; in the
@@ -5029,6 +5063,12 @@ function rosterCard(my, ro) {
         if (swb && swb.type === 'ir') {
             const row = h('tr', { class: 'secrow cantake', title: `Activate ${pname(swb.pid)} to the bench` }, h('td', { colspan: 4, class: 'fxsec' }, h('b', null, 'Bench'), h('span', { class: 'dim', style: 'margin-left:10px;font-size:11px;font-weight:600' }, `← click to activate ${pname(swb.pid)} to the bench`)), h('td', { colspan: NCOLS - 4 }));
             row.addEventListener('click', () => { S.ui.swapFrom = null; act(() => setReserve((my.reserve || []).filter(x => x !== swb.pid)), `${pname(swb.pid)} activated`); });
+            tbl.append(row);
+        } else if (swb && !swb.type && swb.pid) {
+            // a starter is picked: the header takes him with nobody coming in, and the slot is left empty
+            const slot = FLEX[swb.slot] ? 'FLEX' : swb.slot;
+            const row = h('tr', { class: 'secrow cantake', 'data-act': 'bench-out', title: `Bench ${pname(swb.pid)} and leave ${slot} empty` }, h('td', { colspan: 4, class: 'fxsec' }, h('b', null, 'Bench'), h('span', { class: 'dim', style: 'margin-left:10px;font-size:11px;font-weight:600' }, `← click to bench ${shortName(swb.pid)}, ${slot} left empty`)), h('td', { colspan: NCOLS - 4 }));
+            row.addEventListener('click', () => doBench(swb));
             tbl.append(row);
         } else tbl.append(h('tr', { class: 'secrow' }, h('td', { colspan: 4, class: 'fxsec' }, h('b', null, 'Bench'), h('span', { class: 'dim', style: 'margin-left:10px;font-size:11px;font-weight:600' }, swb && swb.type === 'bench' ? `Placing ${pname(swb.pid)} — pick the slot above` : swb ? 'Pick the player for that slot' : `${bench.length} of ${benchSlots} used · grouped by type, best first`)), h('td', { colspan: NCOLS - 4 })));
     }
@@ -5054,11 +5094,14 @@ function rosterCard(my, ro) {
             insightTd(pid)));
     }
     // A bench spot you are not using is a free pickup: nobody has to be dropped.
-    for (let n = 0; n < openBench; n++) tbl.append(h('tr', { class: 'openrow', title: 'Nobody has to be dropped to fill it' },
-        fx(h('td', null, h('span', { class: 'pos BN open' }, 'BN')), 'fx1'), fx(h('td', { class: 'swcol' }), 'fx2'),
+    // With a starter picked, an open spot takes him the same way the Bench header does.
+    const swo = (ro ? null : S.ui.swapFrom), benchOut = swo && !swo.type && swo.pid ? swo : null;
+    for (let n = 0; n < openBench; n++) tbl.append(h('tr', { class: benchOut ? 'openrow cantake' : 'openrow', title: benchOut ? `Bench ${pname(benchOut.pid)} and leave ${FLEX[benchOut.slot] ? 'FLEX' : benchOut.slot} empty` : 'Nobody has to be dropped to fill it', onclick: benchOut ? (() => doBench(benchOut)) : null },
+        fx(h('td', null, h('span', { class: 'pos BN open' }, 'BN')), 'fx1'), fx(h('td', { class: 'swcol' }, benchOut ? h('span', { class: 'swap go' }, '⇅') : null), 'fx2'),
         fx(h('td', null, h('div', { class: 'openbn' }, h('b', null, 'Open bench spot'),
-            ro ? null : h('button', { class: 'btn sm s', onclick: () => go('players', { playersTab: 'available' }) }, 'Find a player →'))), 'fx3'),
-        h('td', { colspan: NCOLS - 3 }, n === 0 ? h('span', { class: 'dim', style: 'font-size:11.5px' }, openBench > 1 ? `${openBench} spots open — nobody has to be dropped to fill them` : 'nobody has to be dropped — a pickup costs you the claim and nothing else') : null)));
+            benchOut ? (n === 0 ? h('span', { class: 'dim', style: 'font-size:11.5px' }, `← bench ${shortName(benchOut.pid)} here`) : null)
+                : ro ? null : h('button', { class: 'btn sm s', onclick: () => go('players', { playersTab: 'available' }) }, 'Find a player →'))), 'fx3'),
+        h('td', { colspan: NCOLS - 3 }, n === 0 && !benchOut ? h('span', { class: 'dim', style: 'font-size:11.5px' }, openBench > 1 ? `${openBench} spots open — nobody has to be dropped to fill them` : 'nobody has to be dropped — a pickup costs you the claim and nothing else') : null)));
     if (!bench.length && !openBench) tbl.append(h('tr', null, h('td', { colspan: NCOLS, class: 'empty' }, 'Everyone is starting.')));
     // ── IR ──
     const irSlots = (S.league.settings || {}).reserve_slots || 0;
@@ -5111,6 +5154,14 @@ async function doSwap(from, benchPid) {
     if (j >= 0) st[j] = from.pid || '0';
     S.ui.swapFrom = null;
     await act(() => setStarters(st), `${pname(benchPid)} starts at ${FLEX[from.slot] ? 'FLEX' : from.slot}`);
+}
+// A starter to the bench with nobody coming in. The slot is left empty ('0' is
+// how Sleeper holds one), to be filled later or not at all.
+async function doBench(from) {
+    const st = (S.myRoster.starters || []).slice();
+    st[from.i] = '0';
+    S.ui.swapFrom = null;
+    await act(() => setStarters(st), `${pname(from.pid)} to the bench, ${FLEX[from.slot] ? 'FLEX' : from.slot} left empty`);
 }
 async function doStarterExchange(from, j) {
     const st = (S.myRoster.starters || []).slice();
@@ -6443,6 +6494,13 @@ function runsWhen() {
 }
 const myClaims = () => { const my = S.myRoster; return my ? S.pending.filter(t => t.type === 'waiver' && (t.roster_ids || []).includes(my.roster_id)) : []; };
 const myTrades = () => { const my = S.myRoster; return my ? S.pending.filter(t => t.type === 'trade' && (t.roster_ids || []).includes(my.roster_id)) : []; };
+// A trade both teams accepted is "pending" in Sleeper until the league's review ends, waiting on nobody but the
+// commissioner. The drawer listed only your own team's trades, so a commissioner never saw one (2026-10-14).
+// Sleeper's league users carry is_owner for the commissioner. The review runs from acceptance (status_updated).
+const amCommish = () => (S.users || []).some(u => String(u.user_id) === String(S.myUserId) && u.is_owner);
+const reviewTrades = () => amCommish() ? S.pending.filter(t => t.type === 'trade' && t.status === 'pending') : [];
+const reviewEnds = (t) => (t.status_updated || t.created) + ((S.league.settings || {}).trade_review_days || 0) * 86400e3;
+const atWhen = (ms) => `${DAY[new Date(ms).getDay()]} ${chatClock(ms)}`;
 // An offer waits on you until your roster has consented; one every side has
 // consented to is sitting out the league's review window.
 function tradeRole(t) {
@@ -6487,26 +6545,6 @@ function txLoad(force) {
     for (let w = 1; w < cw; w++) jobs.push(loadTxns(w));
     Promise.all(jobs).catch(() => {}).then(() => { S.txLoading = false; S.txLoadedAt = Date.now(); render(); });
 }
-function openTx(o) {
-    if (!S.myRoster) { toast('You do not manage a team in this league', 'err'); return; }
-    S.ui.chat = false; S.ui.notes = false; S.ui.composer = null; S.ui.trade = null;
-    const toYou = myTrades().some(t => tradeRole(t) === 'toyou');
-    S.ui.tx = Object.assign({ tab: toYou ? 'trades' : 'waivers', view: 'list', from: 'list', seenBefore: txSeenAt() }, o || {});
-    txLoad(); render();
-}
-function closeTx() { S.ui.tx = null; S.ui.composer = null; S.ui.trade = null; render(); }
-// Straight into a composer. It returns to wherever it was opened from: the
-// list or the finder in the drawer, or the page (the drawer closes).
-function openComposer(pid, waiv, drop) {
-    if (!S.myRoster) return;
-    const was = S.ui.tx;
-    S.ui.composer = { pid, waiv, drop: drop != null ? drop : openRosterSlots() > 0 ? '' : ((suggestDrop(pid) || {}).pid || ''), bid: waiv ? Math.min(faabLeft(S.myRoster), 1) : 0 };
-    S.ui.chat = false; S.ui.notes = false;
-    S.ui.tx = Object.assign({ tab: 'waivers', seenBefore: txSeenAt() }, was || {}, { view: 'compose', from: was ? (was.view === 'compose' ? was.from : was.view || 'list') : 'page' });
-    if (waiv && waiverInfo().faab) loadPriceHistory();
-    txLoad(); render();
-}
-function txBack(to) { const tx = S.ui.tx; S.ui.composer = null; S.ui.trade = null; if (!tx) return render(); if (to === 'page') return closeTx(); tx.view = to || 'list'; render(); }
 
 // ── rows ──
 // The Team tab's name line, exactly (playerCell uses it too).
@@ -6529,13 +6567,12 @@ function oppLine(pid, week) {
 const DIRS = { in: 'ADD', out: 'DROP', get: 'GET', send: 'SEND' };
 function txRow(pid, o) {
     o = o || {};
-    const lab = o.dir ? h('span', { class: `dir ${o.dir === 'in' || o.dir === 'get' ? 'in' : 'out'}` }, DIRS[o.dir])
-        : o.radio != null ? h('span', { class: 'txradio', 'aria-hidden': 'true' }) : h('span');
+    const lab = o.dir ? h('span', { class: `dir ${o.dir === 'in' || o.dir === 'get' ? 'in' : 'out'}` }, DIRS[o.dir]) : h('span');
     const played = alreadyPlayed(pid, txWeek());
     return h('div', Object.assign({ class: `txr ${o.cls || ''}`.trim() }, o.onclick ? { onclick: o.onclick } : {}, o.attrs || {}),
         h('img', { class: 'hs', src: headshot(pid), alt: '', loading: 'lazy', onerror: hideBroken }),
         lab,
-        h('div', { class: 'txw' }, nameLine(pid, true), oppLine(pid, txWeek()), o.sub ? h('div', { class: 'txsub', title: [].concat(o.sub).map(x => typeof x === 'string' ? x : (x && x.textContent) || '').join('') }, o.sub) : null),
+        h('div', { class: 'txw' }, nameLine(pid, true), o.noOpp ? null : oppLine(pid, txWeek()), o.sub ? h('div', { class: 'txsub', title: [].concat(o.sub).map(x => typeof x === 'string' ? x : (x && x.textContent) || '').join('') }, o.sub) : null),
         h('span', { class: 'txn1' }, played ? '—' : fmt1(txWk(pid))),
         h('span', { class: 'txn2' }, txRos(pid) != null ? fmt0(txRos(pid)) : (S.ros ? '—' : '…')),
         o.btn ? h('span', { class: 'txbw' }, o.btn) : null);
@@ -6546,11 +6583,8 @@ function txHead(title, meta, opts) {
     return h('div', { class: `txhead ${opts.btns ? 'btns' : ''}`.trim() }, h('span', { class: 'txht' }, h('b', null, title), meta ? h('span', { class: 'shm' }, meta) : null),
         opts.right || h('span'), opts.cols === false ? null : h('span', { class: 'txc' }, `WK ${txWeek()}`), opts.cols === false ? null : h('span', { class: 'txc' }, 'RoS'), opts.btns ? h('span') : null);
 }
-const claimBtn = (pid) => h('button', { class: 'btn sm warn', 'data-act': 'claim', onclick: (e) => { e.stopPropagation(); openComposer(pid, true); } }, '+ Claim');
-const addBtn = (pid) => h('button', { class: 'btn sm p', 'data-act': 'add', onclick: (e) => { e.stopPropagation(); openComposer(pid, false); } }, '+ Add');
-const pickBtn = (pid) => onWaiversNow(pid) ? claimBtn(pid) : addBtn(pid);
 const txEmpty = (text) => h('div', { class: 'txempty' }, text);
-const kAdds = (n) => n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+const kAdds = (n) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 10000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 function txCard(o) {
     return h('div', Object.assign({ class: `txcard ${o.cls || ''}`.trim() }, o.attrs || {}),
         h('div', { class: 'txh' }, o.R ? avatarEl(o.R, 'xs') : null, h('b', { class: o.me ? 'me' : '' }, o.who),
@@ -6562,98 +6596,685 @@ function txCard(o) {
 const shortName = (pid) => { const p = P(pid) || {}; return ppos(pid) === 'DEF' ? pname(pid) : p.last_name ? `${(p.first_name || '?')[0]}. ${p.last_name}` : pname(pid); };
 const seg = (labels, on, pick) => h('span', { class: 'txseg', role: 'group' }, ...labels.map((l, i) => h('button', { class: i === on ? 'on' : '', 'aria-pressed': i === on ? 'true' : 'false', onclick: () => pick(i) }, l)));
 
-// ── the list: Waivers and Trades ──
+// ── the drawer: its frame ──
+// Two tabs, by kind. Each has the thing you start with pinned on top (the search
+// box; "Propose a trade"), and under it the parts: what is live, and History.
+// Waivers & Adds also has Ideas, the players worth a look.
+const TX_PARTS = { waivers: [['claims', 'Claims'], ['ideas', 'Ideas'], ['history', 'History']], trades: [['offers', 'Offers'], ['history', 'History']] };
+// The commissioner's Trades has Review between them, always, so nothing moves when a trade arrives.
+const txPartList = (tab) => tab === 'trades' && amCommish() ? [['offers', 'Offers'], ['review', 'Review'], ['history', 'History']] : TX_PARTS[tab];
+const lastNm = (pid) => (ppos(pid) === 'DEF' ? pname(pid) : (P(pid) || {}).last_name || pname(pid));
+const runDay = (at) => { const d = new Date(at); return `${DAY[d.getDay()]} ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`; };
+const NUMW = ['no', 'one', 'two', 'three', 'four', 'five', 'six'];
+const flagEl = (kind, word) => h('span', { class: `txflag ${kind}` }, word);
+const pills = (list, cur, pick, label) => h('div', { class: 'txpl', role: 'group', 'aria-label': label }, ...list.map(([k, t]) => h('button', { class: cur === k ? 'on' : '', type: 'button', 'aria-pressed': String(cur === k), 'data-pill': k, onclick: () => pick(k) }, t)));
 function txTabs() {
-    const tx = S.ui.tx, runs = waiverRuns(), newest = runs.length ? runs[0].at : 0;
-    const dot = !!newest && newest > (tx.seenBefore || 0);
-    if (tx.tab === 'waivers' && newest) txMarkSeen(newest);   // the dot and the NEW tag stay for this visit
-    const nC = myClaims().length, nT = myTrades().length;
-    const tab = (k, label, n, extra) => h('button', { class: tx.tab === k ? 'on' : '', role: 'tab', 'aria-selected': tx.tab === k ? 'true' : 'false', 'data-tab': k, onclick: () => { tx.tab = k; render(); } },
-        label, n ? h('i', null, n) : null, extra || null);
-    return h('div', { class: 'txtabs', role: 'tablist' },
-        tab('waivers', 'Waivers', nC, dot ? h('b', { class: 'txdot', title: 'A waiver run was processed since you last looked' }) : null),
-        tab('trades', 'Trades', nT));
+    const tx = S.ui.tx, nC = claimGroups().length, nT = new Set([...myTrades(), ...reviewTrades()]).size;
+    const tab = (k, label, n) => h('button', { class: tx.tab === k ? 'on' : '', role: 'tab', 'aria-selected': tx.tab === k ? 'true' : 'false', 'data-tab': k, onclick: () => { tx.tab = k; render(); } }, label, n ? h('i', null, n) : null);
+    return h('div', { class: 'txtabs', role: 'tablist' }, tab('waivers', 'Waivers & Adds', nC), tab('trades', 'Trades', nT));
 }
-function claimCardTx(t) {
+function txParts() {
+    const tx = S.ui.tx, w = tx.tab === 'waivers', cur = w ? tx.part : tx.tpart;
+    const runs = waiverRuns(), newest = runs.length ? runs[0].at : 0, dot = w && !!newest && newest > (tx.seenBefore || 0);
+    if (w && cur === 'history' && newest) txMarkSeen(newest);   // the dot and the NEW tag stay for this visit
+    const n = { claims: claimGroups().length, offers: myTrades().length, review: reviewTrades().length }, warn = w && claimItems().some(it => liveWarn(it));
+    return h('div', { class: 'txparts', role: 'tablist' }, ...txPartList(tx.tab).map(([k, label]) => h('button', { class: cur === k ? 'on' : '', role: 'tab', 'aria-selected': String(cur === k), 'data-part': k,
+        onclick: () => { if (w) tx.part = k; else tx.tpart = k; render(); } }, label, n[k] ? h('i', null, n[k]) : null,
+        k === 'claims' && warn ? h('span', { class: 'txwtab', title: 'One of your claims fails in some outcome' }, warnIcon()) : null,
+        k === 'history' && dot ? h('b', { class: 'txdot', title: 'A waiver run was processed since you last looked' }) : null)));
+}
+// the mark on a claim that fails in some outcome, always beside words that say why
+const warnIcon = () => sv('svg', { class: 'txwi', viewBox: '0 0 16 16', width: 13, height: 13, 'aria-hidden': 'true' },
+    sv('path', { d: 'M8 1.6 15.2 14.2H.8z', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.6, 'stroke-linejoin': 'round' }),
+    sv('path', { d: 'M8 6.2v3.5', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.7, 'stroke-linecap': 'round' }),
+    sv('circle', { cx: 8, cy: 11.9, r: 1, fill: 'currentColor' }));
+function txPinned() {
     const tx = S.ui.tx, my = S.myRoster, wi = waiverInfo();
-    const bid = t.settings && t.settings.waiver_bid;
-    const fresh = tx.justFiled && String(tx.justFiled) === String(t.transaction_id);
-    const editing = tx.editBid && String(tx.editBid) === String(t.transaction_id);
-    const acts = [];
-    if (wi.faab) {
-        if (editing) {
-            acts.push(h('span', { class: 'txbin sm' }, '$', h('input', { type: 'number', min: 0, max: faabLeft(my) + (bid || 0), value: tx.bidDraft ?? bid ?? 0, 'data-act': 'claim-bid', 'data-focus': 'tx-editbid', 'aria-label': 'New bid in dollars', oninput: (e) => { tx.bidDraft = Number(e.target.value) || 0; } })),
-                h('button', { class: 'btn sm p', 'data-act': 'claim-bid-save', 'data-txn': t.transaction_id, onclick: async () => { const v = Math.max(0, Math.round(tx.bidDraft ?? bid ?? 0)); tx.editBid = null; tx.bidDraft = null; await act(() => updateClaim(t, v), `Bid now $${v}`); } }, 'Save'),
-                h('button', { class: 'btn sm s', onclick: () => { tx.editBid = null; tx.bidDraft = null; render(); } }, 'Keep'));
-        } else acts.push(h('button', { class: 'btn sm s', 'data-act': 'claim-edit', 'data-txn': t.transaction_id, onclick: () => { tx.editBid = t.transaction_id; tx.bidDraft = bid ?? 0; render(); } }, 'Edit bid'));
+    if (tx.tab === 'trades') {
+        const st = S.league.settings || {}, dl = st.trade_deadline, rv = st.trade_review_days;
+        return [h('button', { class: 'txprop', type: 'button', 'data-act': 'trade-new', onclick: () => openTrade(null) }, h('span', { class: 'plus', 'aria-hidden': 'true' }, '+'), 'Propose a trade with…', caret()),
+            h('div', { class: 'txmeans' }, dl && dl <= LAST_WEEK ? ['deadline ', h('b', null, `week ${dl}`)] : 'no trade deadline', rv ? ` · ${rv}-day league review` : '')];
     }
-    if (!editing) acts.push(h('button', { class: 'btn sm danger', 'data-act': 'claim-cancel', 'data-txn': t.transaction_id, onclick: () => act(() => cancelClaim(t), 'Claim cancelled') }, 'Cancel'));
-    const add = Object.keys(t.adds || {})[0];
-    const rv = add && wi.faab ? rivalBidders(ppos(add)) : null;
-    const foot = [fresh ? h('b', { class: 'txjust' }, 'Just filed') : null, fresh && rv ? ' · ' : null,
-        rv ? (rv.needers.length ? `${rv.needers.length} other team${rv.needers.length === 1 ? ' is' : 's are'} short at ${posLabel(ppos(add))}` : `nobody else is short at ${posLabel(ppos(add))}`) : null];
-    return txCard({ R: my, me: true, who: 'Your claim', kind: 'WAIVER', bid: wi.faab ? bid : null, pill: ['wait', 'FILED'], when: runsWhen(), cls: fresh ? 'txfresh' : '',
-        attrs: { 'data-claim': t.transaction_id },
-        rows: [...Object.keys(t.adds || {}).map(p => txRow(p, { dir: 'in' })), ...Object.keys(t.drops || {}).map(p => txRow(p, { dir: 'out' }))],
-        foot, acts });
+    const open = openRosterSlots();
+    return [h('div', { class: 'search txsearch' }, '🔍', h('input', { placeholder: 'Add a player: type a name', value: tx.q || '', 'data-focus': 'tx-search', 'aria-label': 'Search available players',
+            oninput: (e) => { tx.q = e.target.value; if (tx.q.trim().length >= 2) tx.part = 'ideas'; render(); } })),
+        h('div', { class: 'txmeans' }, wi.faab ? [h('b', null, `$${faabLeft(my)}`), ' FAAB left · '] : `priority #${my.settings.waiver_position} · `, h('b', { class: 't' }, open), ` open spot${open === 1 ? '' : 's'} · runs ${runsWhen()}`)];
 }
-function runCard(r) {
-    const tx = S.ui.tx, my = S.myRoster, faab = waiverInfo().faab, me = my.roster_id;
-    const bidOf = (t) => (t.settings || {}).waiver_bid;
-    const won = r.txns.filter(t => t.status === 'complete').sort((a, b) => (bidOf(b) || 0) - (bidOf(a) || 0));
-    const lost = r.txns.filter(t => t.status !== 'complete');
-    const d = new Date(r.at), isNew = tx.seenBefore ? r.at > tx.seenBefore : r.first;
-    const mineW = won.filter(t => (t.roster_ids || []).includes(me)), mineL = lost.filter(t => (t.roster_ids || []).includes(me));
-    const names = (ts) => ts.flatMap(t => Object.keys(t.adds || {})).map(shortName).join(', ');
-    const you = mineW.length || mineL.length ? h('div', { class: 'txyou' }, [mineW.length ? `You won ${names(mineW)}` : null, mineL.length ? (faab ? `You were outbid on ${names(mineL)}` : `You lost ${names(mineL)} on priority`) : null].filter(Boolean).join(' · ')) : null;
-    const key = String(r.at), open = !!(tx.openRuns && tx.openRuns[key]);
-    const shown = open || won.length <= 4 ? won : won.slice(0, 3);
-    const who = (rid) => rid === me ? 'you' : teamName(rosterById(rid));
-    const cards = shown.map(t => {
-        const rid = (t.roster_ids || [])[0], pids = Object.keys(t.adds || {});
-        const beat = lost.filter(x => Object.keys(x.adds || {}).some(p => pids.includes(p)));
-        return txCard({ R: rosterById(rid), me: rid === me, who: rid === me ? 'You' : teamName(rosterById(rid)), bid: faab ? bidOf(t) : null,
-            rows: [...pids.map(p => txRow(p, { dir: 'in' })), ...Object.keys(t.drops || {}).map(p => txRow(p, { dir: 'out' }))],
-            foot: beat.length ? [faab ? 'Outbid: ' : 'Lost on priority: ', ...beat.flatMap((x, i) => { const xr = (x.roster_ids || [])[0]; return [i ? ' · ' : '', h('b', { class: xr === me ? 'me' : '' }, who(xr)), faab && bidOf(x) != null ? ` $${bidOf(x)}` : '']; })] : null });
+
+// ── your claims, as you think of them ──
+// Sleeper holds one claim per drop. Here a claim is a player: his bid, and the
+// drops it will try in order (the first is the plain claim, the rest are its
+// back-ups). They are read back in the order Sleeper tries them.
+const TX_SECOND = () => `badgerTxSecond-${S.leagueId}`, TX_QUIET = () => `badgerTxQuiet-${S.leagueId}`;
+function txLinks() { try { return JSON.parse(localStorage.getItem(TX_SECOND()) || '{}') || {}; } catch (e) { return {}; } }
+function txSetLink(pid, first) { try { const l = txLinks(); if (first) l[pid] = first; else delete l[pid]; localStorage.setItem(TX_SECOND(), JSON.stringify(l)); } catch (e) { /* private window: the link is not kept */ } }
+function txQuiet() { try { return JSON.parse(localStorage.getItem(TX_QUIET()) || '[]') || []; } catch (e) { return []; } }
+function txHush(key) { try { localStorage.setItem(TX_QUIET(), JSON.stringify([...new Set([...txQuiet(), key])].slice(-40))); } catch (e) { /* asked again next time */ } }
+const txBidMin = () => Math.max(0, (S.league.settings || {}).waiver_bid_min || 0);
+function groupClaims(claims, links) {
+    const ordered = claims.map(t => Object.assign(claimKey(t), { t })).sort(byClaimKey).map(r => r.t), by = new Map();
+    for (const t of ordered) {
+        const pid = Object.keys(t.adds || {})[0]; if (!pid) continue;
+        const b = (t.settings || {}).waiver_bid || 0, d = Object.keys(t.drops || {})[0] || '';
+        let g = by.get(pid); if (!g) by.set(pid, g = { pid, bid: b, bids: [], claims: [], drops: [] });
+        // a lower bid on the same player is a back-up bid: it is tried when the bigger one cannot be paid
+        g.claims.push(t); if (!g.bids.includes(b)) g.bids.push(b); if (!g.drops.includes(d)) g.drops.push(d);
+    }
+    const groups = [...by.values()];
+    // a second choice (a link kept in this browser) holds only while both claims drop the same player
+    for (const g of groups) { const a = (links || {})[g.pid], first = a && by.get(a); g.secondOf = first && first.drops[0] && first.drops[0] === g.drops[0] && !(links || {})[a] ? a : null; }
+    return groups;
+}
+const claimGroups = () => groupClaims(myClaims(), txLinks());
+// what "What will happen" says about the claims filed now, and the warnings you have not set aside
+const claimItems = () => { const gs = claimGroups(); return gs.length ? claimStory(gs, openRosterSlots(), { faab: !!waiverInfo().faab, left: faabLeft(S.myRoster), name: lastNm }) : []; };
+const warnKey = (it) => `${it.warn}:${it.g ? it.g.pid : ''}:${it.g ? it.g.drops.join(',') : ''}:${it.g && it.g.bids ? it.g.bids.join(',') : ''}`;
+const liveWarn = (it) => !!it.warn && !txQuiet().includes(warnKey(it));
+// What your claims will do, in sentences. Pure: `groups` are your claims in the
+// order Sleeper tries them ({ pid, bid, bids, drops, secondOf }), `open` your open
+// roster spots, `o.left` your FAAB. Every combination of each player being there
+// to be had, or taken by someone else, is played the way Sleeper plays a run: your
+// claims bigger bid first, then in your order; a claim it cannot pay for fails, as
+// does one with no room or with a drop an earlier claim already used. Each item is
+// { say, warn: 'cash' | 'room' | 'drop' | null, g, cause, flag, fix }: a warning is
+// a claim that fails in some outcome, `cause` the claims above it that make it
+// fail, `flag` the few words its row shows, `fix` the back-up bid that would cure
+// a 'cash' one (what you would have left).
+function claimStory(groups, open, o) {
+    const nm = o.name, out = [], B = (pid) => ({ b: nm(pid) }), G = groups.slice(0, 10), n = G.length;
+    const list = (gs) => gs.flatMap((g, i) => [i ? (i === gs.length - 1 ? ' and ' : ', ') : '', B(g.pid)]);
+    const names = (gs) => gs.map(g => nm(g.pid)).join(gs.length > 2 ? ', ' : ' and ').replace(/, ([^,]*)$/, ' and $1');
+    const orList = (gs) => gs.flatMap((g, i) => [i ? (i === gs.length - 1 ? ' or ' : ', ') : '', B(g.pid)]), orNames = (gs) => gs.map(g => nm(g.pid)).join(', ').replace(/, ([^,]*)$/, ' or $1');
+    const come = (gs) => (gs.length === 1 ? ' comes in' : gs.length === 2 ? ' both come in' : ' all come in');
+    const hits = (gs) => (gs.length === 1 ? ' hits' : ' hit');
+    const bidsOf = (g) => (g.bids && g.bids.length ? g.bids : [g.bid || 0]);
+    const win = (g, b) => (o.faab && b > 0 ? [`If your $${b} wins `, B(g.pid)] : ['If you get ', B(g.pid)]);
+    const tries = [];
+    G.forEach((g, gi) => bidsOf(g).forEach((b, bi) => g.drops.forEach((d, di) => tries.push({ gi, b, d, k: bi * 100 + di }))));
+    tries.sort((x, y) => y.b - x.b || x.gi - y.gi || x.k - y.k);
+    const runs = [];
+    for (let m = 0; m < (1 << n); m++) {
+        let cash = o.faab ? o.left : Infinity, spots = open;
+        const gone = new Set(), got = new Map(), why = new Map(), had = new Map(), lost = new Map();
+        for (const t of tries) {
+            if (got.has(t.gi) || !((m >> t.gi) & 1)) continue;
+            if (t.b > cash) { why.set(t.gi, 'cash'); had.set(t.gi, cash); continue; }
+            if (t.d) { if (gone.has(t.d)) { why.set(t.gi, 'drop'); lost.set(t.gi, t.d); continue; } gone.add(t.d); }
+            else if (spots > 0) spots--; else { why.set(t.gi, 'room'); continue; }
+            cash -= t.b; got.set(t.gi, { b: t.b, d: t.d });
+        }
+        runs.push({ m, got, why, had, lost, spent: o.faab ? o.left - cash : 0 });
+    }
+    // the claims above one, in every run of `rs`
+    const above = (rs, gi) => G.slice(0, gi).filter((x, xi) => rs.length && rs.every(r => r.got.has(xi)));
+    const sure = []; let plain = true;
+    const flush = () => { if (!sure.length) return; const k = sure.length;
+        out.push({ say: [...list(sure), k === 1 ? ' goes into an open spot.' : ` go into ${k === open ? 'your ' + (NUMW[k] || k) : (NUMW[k] || k) + ' of your ' + (NUMW[open] || open)} open spots.`], sure: true }); sure.length = 0; };
+    G.forEach((g, gi) => {
+        if (g.secondOf) return;   // told with its first choice
+        const si = G.findIndex(x => x.secondOf === g.pid);
+        if (si >= 0) {
+            const s = G[si], base = g.drops[0];
+            flush(); plain = false;
+            out.push({ say: [...win(g, bidsOf(g)[0]), ', ', B(base), ' is dropped for him and ', B(s.pid), ' is not claimed.'] });
+            out.push({ say: ['If you miss ', B(g.pid), ', ', B(s.pid), o.faab ? ` is claimed for $${bidsOf(s)[0]} and ` : ' is claimed and ', B(base), ' is dropped for him instead.'] });
+            return;
+        }
+        const mine = runs.filter(r => (r.m >> gi) & 1), fails = mine.filter(r => !r.got.has(gi)), first = { b: bidsOf(g)[0], d: g.drops[0] || '' };
+        if (fails.length) {
+            const count = {}; for (const r of fails) { const k = r.why.get(gi); count[k] = (count[k] || 0) + 1; }
+            const kind = Object.keys(count).sort((a, b) => count[b] - count[a])[0], rs = fails.filter(r => r.why.get(gi) === kind), lostD = kind === 'drop' ? rs[0].lost.get(gi) : null;
+            // a claim above is a cause only by doing the thing that hurts: spending money, taking a spot, dropping the same man
+            const role = (x) => (kind === 'cash' ? x.b > 0 : kind === 'room' ? !x.d : x.d === lostD);
+            const C = G.slice(0, gi).filter((x, xi) => rs.every(r => r.got.has(xi) && (kind === 'drop' || role(r.got.get(xi)))));
+            // no one claim above causes it in every case: then any of the ones that can, "Etienne or Bernard"
+            const any = C.length ? [] : G.slice(0, gi).filter((x, xi) => rs.some(r => r.got.has(xi) && role(r.got.get(xi))) && !mine.every(r => r.got.has(xi))), by = C.length ? C : any;
+            const ifIn = C.length ? ['If ', ...list(C), come(C)] : ['If ', ...orList(any), ' comes in'], flagIf = C.length ? `${names(C)}${hits(C)}` : `${orNames(any)} hits`;
+            flush(); plain = false;
+            if (kind === 'cash') {
+                const have = Math.max(0, Math.min(...rs.map(r => r.had.get(gi) || 0)));
+                out.push({ warn: 'cash', g, cause: by, fix: have, flag: first.b > o.left ? 'more than you have' : by.length ? `fails if ${flagIf}` : 'fails if the money runs out',
+                    say: first.b > o.left ? [B(g.pid), `’s $${first.b} is more than your $${o.left}, so his claim fails.`]
+                        : by.length ? [...ifIn, ` you have $${have} left, so `, B(g.pid), `’s $${first.b} claim cannot be paid, and it fails.`]
+                        : ['If your other claims spend your money first, ', B(g.pid), `’s $${first.b} claim cannot be paid.`] });
+            } else if (kind === 'room') {
+                out.push({ warn: 'room', g, cause: by, flag: by.length ? `no room if ${flagIf}` : 'no open spot',
+                    say: C.length ? [B(g.pid), ' comes in only if ', ...(C.length === 1 ? [B(C[0].pid), ' misses'] : [C.length === 2 ? 'either of them misses' : 'one of them misses']), '. If ', ...list(C), come(C), ' there is no room, and his claim fails.']
+                        : any.length ? [...ifIn, ' there is no room for ', B(g.pid), ', and his claim fails.']
+                        : ['You have no open spot, so ', B(g.pid), '’s claim fails as it stands.'] });
+            } else {
+                const d = lostD;
+                out.push({ warn: 'drop', g, cause: by, flag: by.length ? `fails if ${flagIf}` : `${nm(d)} is already gone`,
+                    say: by.length ? (d === (g.drops[0] || '') ? [B(g.pid), ' drops ', B(d), ' too. ', ...ifIn, ', ', B(d), ' is already gone and ', B(g.pid), '’s claim fails.']
+                        : [B(g.pid), ' drops ', B(d), ' too when there is no open spot. ', ...ifIn, ', ', B(d), ' is already gone and his claim fails.'])
+                        : [B(d), ' is no longer yours to drop, so ', B(g.pid), '’s claim fails.'] });
+            }
+            return;
+        }
+        // he comes in whenever he is there to be had; say how, and what decides it
+        const ways = new Set(mine.map(r => { const x = r.got.get(gi); return `${x.b}|${x.d}`; }));
+        if (ways.size === 1) {
+            const x = mine[0].got.get(gi);
+            if (!x.d && x.b === first.b) { sure.push(g); return; }
+            flush(); plain = false;
+            out.push({ say: x.d ? [...win(g, x.b), ', ', B(x.d), ' is dropped for him.'] : [B(g.pid), ` goes into an open spot at $${x.b}.`] });
+            return;
+        }
+        flush(); plain = false;
+        const alt = mine.filter(r => { const x = r.got.get(gi); return x.b !== first.b || x.d !== first.d; }), C = above(alt, gi), ax = alt[0].got.get(gi);
+        if (ax.b !== first.b && ax.d === first.d) out.push({ say: [...(C.length ? ['If ', ...list(C), come(C), ', '] : ['If the money runs short, ']), B(g.pid), ' is claimed at ', { am: `$${ax.b}` }, ax.d ? [' and ', B(ax.d), ' is dropped for him'] : ' and goes into an open spot', '. ',
+            ...(C.length === 1 ? ['If you miss ', B(C[0].pid), ', ', B(g.pid), ` is claimed at $${first.b}.`] : [`Otherwise he is claimed at $${first.b}.`])].flat() });
+        else if (!first.d && ax.d) out.push({ say: [B(g.pid), ' takes an open spot if one is left. If ', ...list(C), come(C), ', ', B(ax.d), ' is dropped for him.'] });
+        else if (first.d && ax.d) out.push({ say: [...win(g, first.b), ', ', B(first.d), ' is dropped for him. If ', B(first.d), ' has already gone, ', B(ax.d), ' is dropped instead.'] });
+        else out.push({ say: [B(g.pid), ' comes in either way. How depends on the claims above him.'] });
     });
-    const orphans = lost.filter(x => !won.some(t => Object.keys(t.adds || {}).some(p => Object.keys(x.adds || {}).includes(p))));
-    return h('div', { class: `txrun ${isNew ? 'new' : ''}`.trim() },
-        h('div', { class: 'txrunh' }, h('b', null, `${DAY[d.getDay()]} ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} · ${chatClock(r.at)}`),
-            h('span', { class: 'shm' }, `${won.length} claim${won.length === 1 ? '' : 's'}${lost.length ? ` · ${lost.length} ${faab ? 'outbid' : 'lost'}` : ''}`),
-            isNew ? h('span', { class: 'txnew' }, 'NEW') : null),
-        you, ...cards,
-        shown.length < won.length ? h('button', { class: 'txmore', onclick: () => { tx.openRuns = Object.assign({}, tx.openRuns, { [key]: true }); render(); } }, `Show ${won.length - shown.length} more claims`) : null,
-        orphans.length && (open || won.length <= 4) ? h('div', { class: 'txorph' }, 'Not claimed: ', orphans.map(x => `${who((x.roster_ids || [])[0])} on ${names([x])}${faab && bidOf(x) != null ? ` ($${bidOf(x)})` : ''}`).join(' · ')) : null);
-}
-function txWaivers() {
-    const tx = S.ui.tx, my = S.myRoster, wi = waiverInfo();
-    const out = [h('div', { class: 'txbar' }, h('span', { class: 'shm' }, `Runs ${runsWhen()} · ${wi.faab ? `$${faabLeft(my)} FAAB left` : `priority #${my.settings.waiver_position}`}`),
-        h('button', { class: 'btn sm', 'data-act': 'tx-find', onclick: () => { tx.view = 'find'; tx.q = ''; render(); } }, '+ Add a player'))];
-    const claims = myClaims().slice().sort((a, b) => (String(b.transaction_id) === String(tx.justFiled)) - (String(a.transaction_id) === String(tx.justFiled)));
-    if (claims.length) out.push(h('div', { class: 'txcols' }, h('span'), h('span', { class: 'txc' }, `WK ${txWeek()}`), h('span', { class: 'txc' }, 'RoS')), ...claims.map(claimCardTx));
-    else out.push(txEmpty(`No claims filed. Claims run ${runsWhen()}.`));
-    // how the last run went for you, when you were in it
-    const runs = waiverRuns(), last = runs.find(r => r.txns.some(t => (t.roster_ids || []).includes(my.roster_id)));
-    if (last && Date.now() - last.at < 7 * 86400e3) {
-        const mine = last.txns.filter(t => (t.roster_ids || []).includes(my.roster_id));
-        const lostT = mine.filter(t => t.status !== 'complete'), wonT = mine.filter(t => t.status === 'complete');
-        const winnerOf = (t) => last.txns.find(x => x.status === 'complete' && Object.keys(x.adds || {}).some(p => (t.adds || {})[p] != null));
-        const lines = [...wonT.map(t => `you won ${Object.keys(t.adds || {}).map(shortName).join(', ')}${wi.faab && t.settings && t.settings.waiver_bid != null ? ` at $${t.settings.waiver_bid}` : ''}`),
-            ...lostT.map(t => { const w = winnerOf(t); const b = (t.settings || {}).waiver_bid; return `you ${wi.faab ? 'were outbid' : 'lost on priority'} on ${Object.keys(t.adds || {}).map(shortName).join(', ')}${wi.faab && b != null ? ` — your $${b}${w && w.settings && w.settings.waiver_bid != null ? `, won at $${w.settings.waiver_bid}` : ''}` : ''}`; })];
-        out.push(h('div', { class: 'txlast' }, h('span', { class: 'txk' }, 'LAST RUN'), h('span', null, `${DAY[new Date(last.at).getDay()]} ${chatClock(last.at)} · ${lines.join(' · ')}`)));
-    }
-    out.push(...cutUpgrades());
-    const jd = justDropped().slice(0, 6);
-    if (jd.length) out.push(txHead('Just dropped', 'on waivers now', { btns: true }), ...jd.map(x => txRow(x.pid, { cls: 'btns', sub: [h('span', { class: 'amber' }, clearsLabel(x.pid)), ` · dropped ${DAY[new Date(x.at).getDay()]} by ${teamName(rosterById(x.rid))}`], btn: claimBtn(x.pid) })));
-    const mineOnly = !!tx.runsMine;
-    const list = mineOnly ? runs.filter(r => r.txns.some(t => (t.roster_ids || []).includes(my.roster_id))) : runs;
-    const n = tx.runsN || 3;
-    out.push(txHead('Past runs', null, { cols: false, right: seg(['All teams', 'Yours'], mineOnly ? 1 : 0, (i) => { tx.runsMine = i === 1; render(); }) }));
-    if (!list.length) out.push(txEmpty(S.txLoading ? 'Reading the league’s waiver runs…' : mineOnly ? 'You haven’t been in a waiver run this season.' : 'No waiver runs yet this season.'));
-    out.push(...list.slice(0, n).map(runCard));
-    if (list.length > n) out.push(h('button', { class: 'txmore', onclick: () => { tx.runsN = n + 5; render(); } }, 'Earlier runs'));
+    flush();
+    if (plain && out.length === 1) out[0].say.push(' Nobody is dropped.');
+    if (o.faab && n) out.push({ say: ['The most this can spend is ', { am: `$${Math.max(0, ...runs.map(r => r.spent))}` }, ` of your $${o.left}.`] });
     return out;
 }
+// One waiver run as it went for one team, a player at a time. Sleeper records a
+// result per claim; the claims were made to get players, so that is how it is
+// told. A claim that failed on a player the team won anyway was a back-up that
+// was not needed, never "outbid".
+function runStory(txns, me) {
+    const mine = txns.filter(t => (t.roster_ids || []).includes(me)), by = new Map();
+    for (const t of mine) { const pid = Object.keys(t.adds || {})[0]; if (!pid) continue; if (!by.has(pid)) by.set(pid, []); by.get(pid).push(t); }
+    const bidOf = (t) => (t.settings || {}).waiver_bid || 0, rows = [];
+    for (const [pid, ts] of by) {
+        const won = ts.find(t => t.status === 'complete'), bid = Math.max(...ts.map(bidOf));
+        const taker = txns.find(t => t.status === 'complete' && !(t.roster_ids || []).includes(me) && (t.adds || {})[pid] != null);
+        const note = ts.map(t => (t.metadata || {}).notes || '').find(Boolean) || '';
+        rows.push(won ? { pid, res: 'won', bid: bidOf(won), drop: Object.keys(won.drops || {})[0] || null }
+            : taker ? { pid, res: 'outbid', bid, to: (taker.roster_ids || [])[0], price: (taker.settings || {}).waiver_bid }
+            : /too many players/i.test(note) ? { pid, res: 'room', bid } : { pid, res: 'missed', bid, note });
+    }
+    rows.sort((a, b) => (b.res === 'won') - (a.res === 'won') || b.bid - a.bid);
+    const got = rows.filter(r => r.res === 'won');
+    return { rows, claims: mine.length, got: got.length, spent: got.reduce((s, r) => s + r.bid, 0) };
+}
+function openTx(o) {
+    if (!S.myRoster) { toast('You do not manage a team in this league', 'err'); return; }
+    S.ui.chat = false; S.ui.notes = false; S.ui.composer = null; S.ui.trade = null;
+    const toYou = myTrades().some(t => tradeRole(t) === 'toyou');
+    S.ui.tx = Object.assign({ tab: toYou ? 'trades' : 'waivers', part: 'claims', tpart: 'offers', view: 'list', from: 'list', seenBefore: txSeenAt() }, o || {});
+    txLoad(); render();
+}
+function closeTx() { S.ui.tx = null; S.ui.composer = null; S.ui.trade = null; render(); }
+// "+ Claim" or "+ Add": the player's row opens with his bid and who is dropped.
+// Nothing is sent until the button in the row is pressed.
+function newPick(pid, waiv, drop, where) {
+    return { pid, waiv: !!waiv, where: where || 'top', bid: waiv && waiverInfo().faab ? Math.min(faabLeft(S.myRoster), txBidMin()) : 0, backs: [],
+        drops: [drop != null ? drop : openRosterSlots() > 0 ? '' : ((suggestDrop(pid) || {}).pid || '')], cond: false, more: false, adding: false };
+}
+// From anywhere on the page: the drawer opens on Ideas with that player on top.
+function openComposer(pid, waiv, drop) {
+    if (!S.myRoster) return;
+    const was = S.ui.tx;
+    S.ui.chat = false; S.ui.notes = false;
+    S.ui.tx = Object.assign({ seenBefore: txSeenAt(), tpart: 'offers', from: 'list' }, was || {}, { tab: 'waivers', part: 'ideas', view: 'list', edit: null, pick: newPick(pid, waiv, drop, 'top') });
+    if (waiv && waiverInfo().faab) loadPriceHistory();
+    txLoad(); render();
+}
+function txBack(to) { const tx = S.ui.tx; S.ui.composer = null; S.ui.trade = null; if (!tx) return render(); if (to === 'page') return closeTx(); tx.view = to || 'list'; render(); }
+
+// ── the writes behind a claim ──
+// Claims in the order they should be tried. Sleeper sorts by bid first, so only
+// claims at the same bid can be put in an order, and only then is anything sent.
+async function keepClaimOrder(wanted) {
+    for (const [t, place] of claimOrderWrites(wanted)) Object.assign(t, await setClaimSettings(t, claimSettings(t, { priority: place })) || {});
+}
+// Sleeper cannot change the drop on a filed claim: update_waiver_claim takes the
+// bid and the claim order and nothing else (its server refuses a drops argument,
+// asked 2026-10-13, and its own app has no such edit). So a changed drop is a
+// claim filed and a claim withdrawn.
+// A claim made to hold `want`: its bid, and a Sleeper claim for each drop in
+// order. What is already filed is kept, what is missing is filed FIRST, and only
+// then is what is no longer wanted withdrawn: if Sleeper refuses a new one, the
+// claims you had still stand. `all` is every group, for the order.
+async function applyGroup(g, want) {
+    const my = S.myRoster, bids = want.bids || [want.bid], had = g.bids || [g.bid], keep = [], line = []; let sent = 0;
+    const dropOf = (t) => Object.keys(t.drops || {})[0] || '', bidOf = (t) => (t.settings || {}).waiver_bid || 0;
+    try {
+        for (let bi = 0; bi < bids.length; bi++) for (const drop of want.drops) {
+            // the claim already filed for this drop at this rank of bid is kept, its bid moved if it changed
+            const have = g.claims.find(t => !keep.includes(t) && dropOf(t) === drop && had.indexOf(bidOf(t)) === bi) || g.claims.find(t => !keep.includes(t) && dropOf(t) === drop && bidOf(t) === bids[bi]);
+            if (have) { keep.push(have); if (bidOf(have) !== bids[bi]) { Object.assign(have, await updateClaim(have, bids[bi]) || {}); sent++; } line.push(have); }
+            else { line.push(await submitClaim({ [g.pid]: my.roster_id }, drop ? { [drop]: my.roster_id } : {}, bids[bi])); sent++; }
+        }
+        for (const t of g.claims) if (!keep.includes(t)) { await cancelClaim(t); sent++; }
+    } catch (e) { throw new Error(`${e.message || e} ${sent ? 'Part of your change went through: the list shows where things stand.' : 'Your claims stand as they were.'}`); }
+    return line;
+}
+// blocks of claims ({ ts }) in your order of players; Sleeper still takes the bigger
+// bid first, and a back-up bid sits with its player among the claims at its bid
+const orderBlocks = (blocks) => keepClaimOrder(blocks.flatMap((b, gi) => b.ts.map((t, ti) => ({ t, gi, ti, bid: (t.settings || {}).waiver_bid || 0 }))).sort((x, y) => y.bid - x.bid || x.gi - y.gi || x.ti - y.ti).map(x => x.t));
+async function saveClaimGroup(g, want, all) {
+    const line = await applyGroup(g, want);
+    await orderBlocks((all || [g]).map(x => ({ ts: x.pid === g.pid ? line : x.claims })));
+}
+async function txWrite(fn, okText) {
+    const tx = S.ui.tx; if (!tx || tx.busy) return false;
+    tx.busy = true; render(); let ok = true;
+    try { await fn(); if (okText) toast(okText, 'ok'); } catch (e) { ok = false; console.error(TAG, e); toast(String(e.message || e), 'err'); }
+    try { await refreshAfterAction(); if (await tidyOrder()) await refreshAfterAction(); } catch (e) { console.error(TAG, e); }
+    if (S.ui.tx) S.ui.tx.busy = false; render(); return ok;
+}
+// After any write: each player's claims tried together in your order, his back-up
+// bid among the claims at that bid. Sends nothing when Sleeper's order already agrees.
+async function tidyOrder() {
+    const gs = claimGroups(); if (gs.length < 2) return 0;
+    const wanted = gs.flatMap((g, gi) => g.claims.map((t, ti) => ({ t, gi, ti, bid: (t.settings || {}).waiver_bid || 0 }))).sort((x, y) => y.bid - x.bid || x.gi - y.gi || x.ti - y.ti).map(x => x.t);
+    const w = claimOrderWrites(wanted);
+    for (const [t, place] of w) await setClaimSettings(t, claimSettings(t, { priority: place }));
+    return w.length;
+}
+function filePick(pk) {
+    const tx = S.ui.tx, my = S.myRoster, drops = editDrops(pk), bids = editBids(pk);
+    return txWrite(async () => {
+        if (pk.waiv) { let first = null; for (const b of bids) for (const d of drops) { const t = await submitClaim({ [pk.pid]: my.roster_id }, d ? { [d]: my.roster_id } : {}, b); first = first || t; }
+            Object.assign(tx, { pick: null, q: '', part: 'claims', justFiled: first ? first.transaction_id : null }); }
+        else { await addDrop({ [pk.pid]: my.roster_id }, drops[0] ? { [drops[0]]: my.roster_id } : {}); Object.assign(tx, { pick: null, q: '' }); }
+    }, pk.waiv ? `Claim filed · ${pname(pk.pid)}` : `${pname(pk.pid)} added`);
+}
+function openEdit(g, second, more) {
+    const tx = S.ui.tx;
+    tx.pick = null;
+    tx.edit = Object.assign({ pid: g.pid, bid: g.bid, backs: (g.bids || [g.bid]).slice(1), drops: g.drops.slice(), second: second ? second.pid : null, cond: g.drops.length > 1 || (g.bids || []).length > 1 || !!second, more: false, adding: false }, more || {});
+    render();
+}
+const editDrops = (ed) => [...new Set(ed.drops)].filter((d, i) => i === 0 || d);
+// the bids a claim will try, biggest first: its bid, then each back-up bid below it
+const editBids = (ed) => [ed.bid, ...(ed.backs || []).filter(b => b != null && b < ed.bid)].filter((b, i, a) => a.indexOf(b) === i).sort((a, b) => b - a);
+// a rule added but not filled in: a back-up drop or a second choice with nobody picked yet
+const editEmpty = (ed) => !!ed && (ed.drops.slice(1).some(d => !d) || ed.second === '');
+const claimDirty = (g, second, ed) => ed.bid !== g.bid || editBids(ed).join() !== (g.bids || [g.bid]).join() || editDrops(ed).join() !== g.drops.join() || (ed.second || null) !== (second ? second.pid : null);
+function saveEdit(g, second) {
+    const tx = S.ui.tx, ed = tx.edit, groups = claimGroups(), drops = editDrops(ed), bids = editBids(ed), other = ed.second ? groups.find(x => x.pid === ed.second) : null;
+    if (editEmpty(ed)) return toast('Pick a player for the condition you added, or remove it.', 'err');
+    if (other && !drops[0]) return toast('Pick who both claims drop. Sleeper only stops at one when they drop the same player.', 'err');
+    if (other && other.bid > ed.bid) return toast(`Sleeper tries the bigger bid first, so ${lastNm(other.pid)} at $${other.bid} would be tried before ${lastNm(g.pid)}. Lower his bid, or raise this one.`, 'err');
+    return txWrite(async () => {
+        const mine = await applyGroup(g, { bids, drops });
+        // a second choice takes this claim's drop, and is tried straight after it
+        const his = other ? (other.drops.join() !== drops[0] ? await applyGroup(other, { bids: other.bids || [other.bid], drops: [drops[0]] }) : other.claims) : null;
+        const blocks = [];
+        for (const x of groups) { if (other && x.pid === other.pid) continue; blocks.push({ ts: x.pid === g.pid ? mine : x.claims }); if (x.pid === g.pid && other) blocks.push({ ts: his }); }
+        await orderBlocks(blocks);
+        if (other) txSetLink(other.pid, g.pid);
+        if (second && (!other || other.pid !== second.pid)) txSetLink(second.pid, null);
+        tx.edit = null;
+    }, 'Claim saved');
+}
+// Swap a claim with its neighbour at the same bid. Sleeper takes the bigger bid
+// first, so equal bids are the only ones an order changes; it is sent at once.
+function moveClaim(firsts, i, j, groups) {
+    const order = firsts.slice(); [order[i], order[j]] = [order[j], order[i]];
+    const blocks = [];
+    for (const g of order) { blocks.push({ ts: g.claims }); for (const x of groups) if (x.secondOf === g.pid) blocks.push({ ts: x.claims }); }
+    return txWrite(() => orderBlocks(blocks), `${lastNm(firsts[i].pid)} is now tried ${j < i ? 'before' : 'after'} ${lastNm(firsts[j].pid)}`);
+}
+function cancelGroup(g, second) {
+    return txWrite(async () => { for (const t of g.claims) await cancelClaim(t); txSetLink(g.pid, null); if (second) txSetLink(second.pid, null); S.ui.tx.edit = null; }, 'Claim cancelled');
+}
+
+// ── the fields a claim is made of ──
+// Who to drop: your whole roster, fewest rest-of-season points first (the user's order, 2026-10-13). Not the
+// bench first: a star on bye sits on the bench for a week, and that list led with Chase and Burrow. `hole` marks a
+// man whose drop would leave a lineup spot of his position empty (not when the claim is for his position): he stays
+// in the menu, but is never one of the quick picks.
+function dropCands(forPid) {
+    const my = S.myRoster, mine = (my.players || []).filter(p => !(my.reserve || []).includes(p) && !(my.taxi || []).includes(p));
+    const slots = {}, have = {};
+    for (const s of rosterPositions()) slots[s] = (slots[s] || 0) + 1;
+    for (const p of mine) have[ppos(p)] = (have[ppos(p)] || 0) + 1;
+    return mine.map(pid => { const pos = ppos(pid);
+        return { pid, pos, ros: txRos(pid), rk: rosRank(pid), hole: (!forPid || ppos(forPid) !== pos) && have[pos] - 1 < (slots[pos] || 0) };
+    }).sort((a, b) => (a.ros || 0) - (b.ros || 0));
+}
+function bidField(o, pid, key) {
+    const max = faabLeft(S.myRoster), mk = S.histReady ? marketRead(ppos(pid)) : null, rv = rivalBidders(ppos(pid));
+    const set = (v) => { o.bid = Math.max(txBidMin(), Math.min(max, Math.round(v) || 0)); render(); };
+    return h('div', { class: 'txfl' }, h('span', { class: 'lab' }, 'BID'), h('div', { class: 'fx' },
+        h('span', { class: 'txstep' }, h('button', { type: 'button', title: 'Bid one dollar less', 'aria-label': 'Bid one dollar less', onclick: () => set((o.bid || 0) - 1) }, '−'),
+            h('span', { class: 'cur' }, '$'), h('input', { type: 'number', min: txBidMin(), max, value: o.bid, 'data-act': 'claim-bid', 'data-focus': key, 'aria-label': 'Your bid in dollars', oninput: (e) => { o.bid = Math.max(0, Math.min(max, Math.round(Number(e.target.value) || 0))); render(); } }),
+            h('button', { type: 'button', title: 'Bid one dollar more', 'aria-label': 'Bid one dollar more', onclick: () => set((o.bid || 0) + 1) }, '+')),
+        h('span', { class: 'shm' }, `of your $${max}`),
+        h('span', { class: 'shm txmkt', title: 'What has won at this position in this league, and who else has a hole there' },
+            mk && mk.lo != null ? `${posLabel(ppos(pid))} has gone for $${mk.lo}${mk.hi !== mk.lo ? `–$${mk.hi}` : ''} here · ` : '', rv.needers.length ? `${rv.needers.length} other team${rv.needers.length === 1 ? ' is' : 's are'} short at ${posLabel(ppos(pid))}` : `nobody else is short at ${posLabel(ppos(pid))}`)));
+}
+function dropSel(o, i) {
+    const used = new Set(o.drops.filter((d, j) => j !== i && d)), cands = dropCands(o.pid).filter(c => !used.has(c.pid)), cur = o.drops[i] || '';
+    const wk = txWeek();
+    const op = (c) => { const bye = byeWeekOf((P(c.pid) || {}).team), w = txWk(c.pid);
+        return h('option', { value: c.pid, selected: cur === c.pid }, [posLabel(c.pos), pname(c.pid), statusOf(c.pid), bye ? `bye ${bye}` : null,
+            bye === wk ? `wk ${wk} bye` : `wk ${wk} ${w == null ? '—' : fmt1(w)}`, c.ros == null ? 'no projection' : `RoS ${fmt0(c.ros)}${c.rk ? ` (${posLabel(c.pos)}${c.rk})` : ''}`].filter(Boolean).join(' · ')); };
+    return h('select', { class: 'sel txsel', 'data-act': 'drop-sel', 'aria-label': i ? 'Who is dropped instead' : 'Who is dropped for him', onchange: (e) => { o.drops[i] = e.target.value; render(); } },
+        i === 0 ? h('option', { value: '', selected: cur === '' }, openRosterSlots() > 0 ? 'nobody: use an open spot' : 'pick a player') : (cur ? null : h('option', { value: '', selected: true }, 'pick a player')),
+        ...cands.map(op));
+}
+function dropField(o, pid) {
+    const open = openRosterSlots(), cur = o.drops[0] || '', quick = dropCands(pid).filter(c => !c.hole).slice(0, 2).map(c => c.pid);
+    const shown = [...new Set([...(open > 0 || cur === '' ? [''] : []), ...quick, ...(cur ? [cur] : [])])];
+    const opt = (d) => h('button', { class: `txopt${cur === d ? ' on' : ''}`, type: 'button', role: 'radio', 'aria-checked': String(cur === d), 'data-drop': d, disabled: !d && open <= 0, title: !d && open <= 0 ? 'Your roster is full: someone has to be dropped' : null,
+        onclick: () => { o.drops[0] = d; render(); } }, d ? [shortName(d), h('em', { title: 'Rest of season, Sleeper’s projection' }, `RoS ${fmt0(txRos(d))}`)] : 'Nobody: open spot');
+    return h('div', { class: 'txfl' }, h('span', { class: 'lab' }, 'DROP'), h('div', { class: 'fx', role: 'radiogroup', 'aria-label': 'Who is dropped for him' }, ...shown.map(opt),
+        o.more ? [dropSel(o, 0), h('button', { class: 'lnk', type: 'button', 'data-act': 'tx-cut-vs', onclick: () => { const tx = S.ui.tx; tx.vs = pid; tx.view = 'cut'; render(); } }, 'compare with your roster')]
+            : h('button', { class: 'lnk', type: 'button', 'data-act': 'drop-more', 'aria-expanded': 'false', onclick: () => { o.more = true; render(); } }, 'someone else', foldCaret(false))));
+}
+// a condition under its claim; × takes it out (in the claim's Edit, so Save confirms it)
+const ifLine = (cond, then, rm) => h('div', { class: 'txif' }, h('span', { class: 'ifk' }, 'IF'), h('span', null, cond), h('span', { class: 'ifa', 'aria-hidden': 'true' }, '→'), h('span', { class: 'ift' }, then),
+    rm ? h('button', { class: 'txifx', type: 'button', 'data-act': 'if-remove', title: 'Take this condition out', 'aria-label': 'Take this condition out', onclick: rm }, '×') : null);
+const ruleTx = (cond, then, rm) => h('div', { class: 'txrule' }, h('div', null, h('span', { class: 'ifk' }, 'IF'), h('span', { class: 'ifc' }, cond), rm ? h('button', { class: 'lnk', type: 'button', 'data-act': 'rule-remove', onclick: rm }, 'remove') : null),
+    h('div', null, h('span', { class: 'thk' }, 'THEN'), then));
+// the rules on a claim, and the ones that can still be added to it
+function rulesTx(o, groups) {
+    const kids = [ruleTx('I win him', ['drop ', dropSel(o, 0)])];
+    for (let i = 1; i < o.drops.length; i++) kids.push(ruleTx(o.drops[i - 1] ? `${lastNm(o.drops[i - 1])} has already gone` : 'no spot is open by then', ['drop ', dropSel(o, i), ' instead'], () => { o.drops.splice(i, 1); render(); }));
+    (o.backs || []).forEach((b, i) => {
+        const prev = i ? o.backs[i - 1] : o.bid, max = Math.max(0, prev - 1);
+        kids.push(ruleTx(b === 0 ? 'I’m out of FAAB by then' : `I can’t pay $${prev} by then`, ['bid ', h('select', { class: 'sel txsel', 'data-act': 'backbid-sel', 'aria-label': 'Your back-up bid', onchange: (e) => { o.backs[i] = Number(e.target.value); render(); } },
+            ...Array.from({ length: max + 1 }, (_, v) => h('option', { value: v, selected: v === b }, `$${v}`))), ' instead'], () => { o.backs.splice(i, 1); render(); }));
+    });
+    if (o.second != null) {
+        const others = (groups || []).filter(x => (x.pid !== o.pid && !x.secondOf) || x.pid === o.second);
+        kids.push(ruleTx('I don’t get him', ['add ', h('select', { class: 'sel txsel', 'data-act': 'second-sel', 'aria-label': 'Who you go after instead', onchange: (e) => { o.second = e.target.value; render(); } },
+            o.second ? null : h('option', { value: '', selected: true }, 'pick one of your claims'), ...others.map(x => h('option', { value: x.pid, selected: o.second === x.pid }, `${pname(x.pid)}${waiverInfo().faab ? ` · $${x.bid}` : ''}`))), ' instead'], () => { o.second = null; render(); }));
+        kids.push(h('div', { class: 'txnote' }, 'Sleeper only stops at one when both claims drop the same player, so the second choice takes this claim’s drop.'));
+    }
+    return kids;
+}
+function condMenu(o, groups) {
+    const last = o.drops[o.drops.length - 1] || '', items = [];
+    const add = (label, fn, off) => items.push(h('button', { class: 'txmi', type: 'button', disabled: !!off, title: off || null, onclick: () => { fn(); o.cond = true; o.adding = false; render(); } }, ...label));
+    const IF = (t) => [h('span', { class: 'ifk' }, 'IF'), ` ${t} `, h('span', { class: 'thk' }, 'THEN')];
+    // the player is chosen by you: the new rule opens with nobody in it
+    add([...IF(last ? `${lastNm(last)} has already gone` : 'no spot is open by then'), last ? ' drop someone else' : ' drop someone'], () => { o.drops.push(''); });
+    if (waiverInfo().faab && o.waiv !== false) { const lowest = (o.backs || []).length ? o.backs[o.backs.length - 1] : o.bid;
+        add([...IF(lowest > 0 && !(o.backs || []).length ? 'I’m out of FAAB by then' : `I can’t pay $${lowest} by then`), ' bid less'], () => { o.backs = [...(o.backs || []), 0]; }, lowest > 0 ? null : 'There is nothing below a $0 bid'); }
+    if (groups && o.second == null) { const k = groups.filter(x => x.pid !== o.pid && !x.secondOf).length;
+        add([...IF('I don’t get him'), ' go after someone else'], () => { o.second = ''; if (!o.drops[0]) o.drops[0] = ''; }, k ? null : 'Claim the other player first, then name him here'); }
+    return h('div', { class: 'txmenu', role: 'menu' }, h('div', { class: 'mh' }, `Add a condition to ${lastNm(o.pid)}’s claim`), ...items);
+}
+
+// ── Claims ──
+function claimRowTx(g, n, groups, items, move) {
+    const tx = S.ui.tx, wi = waiverInfo(), ed = tx.edit && tx.edit.pid === g.pid ? tx.edit : null, second = groups.find(x => x.secondOf === g.pid) || null;
+    const dirty = !!ed && claimDirty(g, second, ed), empty = editEmpty(ed), id = g.claims[0].transaction_id, fresh = tx.justFiled && g.claims.some(t => String(t.transaction_id) === String(tx.justFiled));
+    const it = !ed ? (items || []).find(x => x.g && x.g.pid === g.pid && liveWarn(x)) : null;
+    const dropEl = (d) => (d ? [h('span', { class: 'dir out' }, 'DROP'), ' ', h('b', null, pname(d))] : 'no drop · uses an open spot');
+    // the fix, inside the flag: a back-up bid is filed at once; a drop is yours to choose
+    const fix = !it ? null : it.warn === 'cash'
+        ? h('button', { class: 'btn xs p', type: 'button', 'data-act': 'flag-bid', 'data-txn': id, disabled: !!tx.busy, onclick: () => txWrite(() => saveClaimGroup(g, { bids: [...(g.bids || [g.bid]), it.fix].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => b - a), drops: g.drops }, groups), `${lastNm(g.pid)}: a $${it.fix} back-up bid is filed`) }, `Bid $${it.fix} then`)
+        : h('button', { class: 'btn xs p', type: 'button', 'data-act': 'flag-choose', 'data-txn': id, onclick: () => openEdit(g, second, { cond: true, drops: [...g.drops, ''] }) }, it.warn === 'room' ? 'Choose a drop for that case' : 'Choose a back-up drop');
+    const row = h('div', { class: `txcl${ed ? ' open' : ''}${fresh ? ' txfresh' : ''}${it ? ' wr' : ''}`, 'data-claim': id, 'data-pid': g.pid, 'data-warn': it ? it.warn : null },
+        h('span', { class: 'ordc' }, move && move.up ? h('button', { class: 'txord', type: 'button', 'data-act': 'claim-up', 'data-txn': id, title: `Try ${lastNm(g.pid)} earlier`, 'aria-label': `Try ${lastNm(g.pid)} earlier`, disabled: !!tx.busy, onclick: move.up }, '▲') : null,
+            h('span', { class: 'ord', title: `Tried ${ordinal(n)}` }, n),
+            move && move.down ? h('button', { class: 'txord', type: 'button', 'data-act': 'claim-down', 'data-txn': id, title: `Try ${lastNm(g.pid)} later`, 'aria-label': `Try ${lastNm(g.pid)} later`, disabled: !!tx.busy, onclick: move.down }, '▼') : null),
+        h('img', { class: 'hs', src: headshot(g.pid), alt: '', loading: 'lazy', onerror: hideBroken }),
+        h('div', { class: 'txw' }, h('div', { class: 'txl1' }, h('span', { class: 'dir in' }, 'ADD'), nameLine(g.pid, true)), h('div', { class: 'txl2' }, dropEl(ed ? editDrops(ed)[0] : g.drops[0]), fresh ? [' · ', h('b', { class: 'txjust' }, 'just filed')] : null),
+            it ? h('div', { class: 'txl3' }, h('span', { class: 'wf' }, warnIcon(), it.flag), fix) : null),
+        wi.faab ? h('span', { class: 'txbidc' }, `$${ed ? ed.bid : g.bid}`) : h('span'),
+        h('button', { class: `btn sm ${dirty || empty ? 'p' : 's'}`, type: 'button', 'data-act': ed ? (dirty || empty ? 'claim-save' : 'claim-done') : 'claim-edit', 'data-txn': id, disabled: !!tx.busy || empty, title: empty ? 'Pick a player for the condition you added first' : null,
+            onclick: () => (ed ? (dirty ? saveEdit(g, second) : (tx.edit = null, render())) : openEdit(g, second)) }, ed ? (dirty || empty ? (tx.busy ? 'Saving…' : 'Save') : 'Done') : 'Edit'));
+    if (!ed) {
+        const out = (more) => () => openEdit(g, second, Object.assign({ cond: true }, more));
+        const ifs = g.drops.slice(1).map((d, i) => ifLine(g.drops[i] ? `${lastNm(g.drops[i])} has already gone` : 'no spot is open', dropEl(d), out({ drops: g.drops.filter((x, j) => j !== i + 1) })));
+        (g.bids || []).slice(1).forEach((b, i) => ifs.push(ifLine(b === 0 ? 'I’m out of FAAB by then' : `I can’t pay $${g.bids[i]} by then`, [h('span', { class: 'thk' }, 'BID'), ' ', h('b', { class: 'am' }, `$${b}`), ' instead'], out({ backs: g.bids.slice(1).filter((x, j) => j !== i) }))));
+        if (second) ifs.push(ifLine('I don’t get him', [h('span', { class: 'dir in' }, 'ADD'), ' ', h('b', null, pname(second.pid)), wi.faab ? ` for $${second.bid}` : '', ' instead, same drop'], out({ second: null })));
+        return [row, ...ifs];
+    }
+    const refile = editDrops(ed).join() !== g.drops.join();
+    return [row, h('div', { class: 'txed' },
+        wi.faab ? bidField(ed, g.pid, 'tx-editbid') : null,
+        ed.cond ? rulesTx(ed, groups) : dropField(ed, g.pid),
+        h('div', { class: 'txedf' }, h('button', { class: 'btn sm danger', type: 'button', 'data-act': 'claim-cancel', 'data-txn': id, disabled: !!tx.busy, onclick: () => cancelGroup(g, second) }, 'Cancel claim'),
+            h('button', { class: 'lnk', type: 'button', 'data-act': 'claim-cond', 'aria-expanded': String(!!ed.adding), onclick: () => { ed.adding = !ed.adding; render(); } }, ed.cond ? '+ another condition' : '+ Add a condition')),
+        ed.adding ? condMenu(ed, groups) : null,
+        refile ? h('div', { class: 'txnote' }, 'Sleeper cannot change the drop on a filed claim, so saving files it again and withdraws the old one. Its place among your claims is kept.') : null)];
+}
+function txStory(groups, items) {
+    const say = (parts) => parts.map(p => (typeof p === 'string' ? p : p.b != null ? h('b', null, p.b) : h('b', { class: 'am' }, p.am)));
+    return [h('div', { class: 'txsech' }, h('b', null, 'What will happen')), h('ul', { class: 'txwill', 'data-story': '1' }, ...items.map(it => {
+        if (!it.warn) return h('li', null, say(it.say));
+        const g = it.g, hushed = !liveWarn(it), links = [];
+        // the fix sits on the claim's row; here, only what else you can say about it
+        if (!hushed && it.warn === 'drop' && g && it.cause && it.cause.length === 1 && it.cause[0].drops[0] === g.drops[0] && g.drops.length === 1) {
+            const a = it.cause[0];
+            links.push(h('button', { class: 'lnk', type: 'button', 'data-act': 'story-onlyone', onclick: () => { if (g.bid > a.bid) return toast(`Sleeper tries the bigger bid first, so ${lastNm(g.pid)} at $${g.bid} would be tried before ${lastNm(a.pid)}. Lower his bid first.`, 'err'); txSetLink(g.pid, a.pid); render(); } }, 'I only want one of them'));
+        }
+        if (!hushed && g) links.push(h('button', { class: 'lnk', type: 'button', 'data-act': 'story-leave', onclick: () => { txHush(warnKey(it)); render(); } }, 'Leave it'));
+        return h('li', { 'data-warn': it.warn }, flagEl('warn', 'HEADS UP'), say(it.say), links.length ? [' ', ...links.flatMap((l, i) => (i ? [' · ', l] : [l]))] : null);
+    }))];
+}
+function txClaims() {
+    const tx = S.ui.tx, my = S.myRoster, wi = waiverInfo(), groups = claimGroups(), out = [];
+    if (!groups.length) out.push(txEmpty(`No claims filed. Claims run ${runsWhen()}. Type a name in the search box, or look under Ideas.`));
+    else {
+        const items = claimStory(groups, openRosterSlots(), { faab: !!wi.faab, left: faabLeft(my), name: lastNm });
+        out.push(h('div', { class: 'txsech' }, h('b', null, 'Your claims'), h('span', { class: 'shm' }, 'tried top to bottom')));
+        const firsts = groups.filter(g => !g.secondOf);
+        firsts.forEach((g, i) => out.push(...claimRowTx(g, i + 1, groups, items, {
+            up: i > 0 && firsts[i - 1].bid === g.bid ? () => moveClaim(firsts, i, i - 1, groups) : null,
+            down: i < firsts.length - 1 && firsts[i + 1].bid === g.bid ? () => moveClaim(firsts, i, i + 1, groups) : null })));
+        out.push(...txStory(groups, items));
+    }
+    const last = waiverRuns().find(r => r.txns.some(t => (t.roster_ids || []).includes(my.roster_id)));
+    if (last) { const st = runStory(last.txns, my.roster_id);
+        out.push(h('button', { class: 'txfold', type: 'button', 'data-act': 'tx-lastrun', title: 'How your last run went, in History', onclick: () => { Object.assign(tx, { part: 'history', hkind: 'waivers', hwho: 'yours' }); render(); } },
+            h('span', { class: 'txk' }, 'LAST RUN'), h('span', { class: 'txft' }, `${runDay(last.at)} · got `, h('b', null, `${st.got} of ${st.rows.length}`), wi.faab ? ` · spent $${st.spent}` : ''), h('span', { class: 'lnk' }, 'History', foldCaret(false)))); }
+    return out;
+}
+
+// ── Ideas: who is worth a look, and the row that makes the claim ──
+function pickPanel(pk) {
+    const tx = S.ui.tx, wi = waiverInfo(), open = openRosterSlots(), groups = claimGroups(), kids = [];
+    if (pk.waiv && wi.faab) kids.push(bidField(pk, pk.pid, 'tx-bid'));
+    else if (pk.waiv) kids.push(h('div', { class: 'txfl' }, h('span', { class: 'lab' }, 'ORDER'), h('div', { class: 'fx shm' }, `Waiver priority #${S.myRoster.settings.waiver_position} · claims run ${runsWhen()}`)));
+    kids.push(pk.cond ? rulesTx(pk, null) : dropField(pk, pk.pid));
+    // what this claim would run into among the ones already filed, said before it is filed
+    if (pk.waiv && !editEmpty(pk)) {
+        const me = { pid: pk.pid, bid: pk.bid, bids: editBids(pk), drops: editDrops(pk), secondOf: null };
+        const it = claimStory([...groups.filter(g => g.pid !== pk.pid), me], open, { faab: !!wi.faab, left: faabLeft(S.myRoster), name: lastNm }).find(x => x.warn && x.g === me);
+        if (it) kids.push(h('div', { class: 'txsugl' }, h('span', { class: 'wf' }, warnIcon()), it.say.map(p => (typeof p === 'string' ? p : p.b != null ? h('b', null, p.b) : p.am)),
+            h('div', { class: 'txsug' }, it.warn === 'cash'
+                ? h('button', { class: 'btn sm s', type: 'button', 'data-act': 'pick-backbid', onclick: () => { pk.backs = [...(pk.backs || []), it.fix]; pk.cond = true; render(); } }, `Also bid $${it.fix} for that case`)
+                : h('button', { class: 'btn sm s', type: 'button', 'data-act': 'pick-choose', onclick: () => { pk.drops.push(''); pk.cond = true; render(); } }, it.warn === 'room' ? 'Choose a drop for that case' : 'Choose a back-up drop'))));
+    }
+    const needs = !pk.drops[0] && open <= 0, empty = editEmpty(pk), bids = editBids(pk);
+    kids.push(h('div', { class: 'txedf' }, h('button', { class: 'btn p', type: 'button', 'data-act': 'composer-submit', disabled: needs || empty || !!tx.busy, title: needs ? 'Your roster is full: pick who is dropped' : empty ? 'Pick a player for the condition you added first' : null, onclick: () => filePick(pk) },
+            tx.busy ? 'Sending…' : pk.waiv ? `File claim${wi.faab ? ` · $${bids.join(', then $')}` : ''}` : 'Add now'),
+        pk.waiv ? h('button', { class: 'lnk', type: 'button', 'data-act': 'claim-cond', 'aria-expanded': String(!!pk.adding), onclick: () => { pk.adding = !pk.adding; render(); } }, pk.cond ? '+ another condition' : '+ Add a condition')
+            : h('span', { class: 'shm' }, 'He joins your team at once.')));
+    if (pk.adding) kids.push(condMenu(pk, null));
+    if (needs) kids.push(h('div', { class: 'txnote' }, 'Your roster is full, so someone has to be dropped for him.'));
+    return h('div', { class: 'txed txpick', 'data-pick': pk.pid }, ...kids);
+}
+function ideaRow(pid, where, o) {
+    o = o || {};
+    const tx = S.ui.tx, pk = tx.pick, open = !!pk && pk.pid === pid && pk.where === where, waiv = onWaiversNow(pid), has = claimGroups().some(g => g.pid === pid);
+    const btn = open ? h('button', { class: 'lnk', type: 'button', 'data-act': 'pick-close', 'aria-expanded': 'true', onclick: () => { tx.pick = null; render(); } }, 'close', foldCaret(true))
+        : has ? h('button', { class: 'txtag', type: 'button', title: 'You have a claim on him: see Claims', onclick: () => { tx.part = 'claims'; render(); } }, 'claimed')
+        : h('button', { class: `btn sm ${waiv ? 'warn' : 'p'}`, type: 'button', 'data-act': waiv ? 'claim' : 'add', disabled: !S.myRoster,
+            onclick: (e) => { e.stopPropagation(); tx.pick = newPick(pid, waiv, o.drop, where); tx.edit = null; if (waiv && waiverInfo().faab) loadPriceHistory(); render(); } }, waiv ? '+ Claim' : '+ Add');
+    const row = txRow(pid, { cls: `btns${open ? ' txopen' : ''}`, sub: o.sub, noOpp: o.noOpp, btn, attrs: { 'data-idea': pid, 'data-where': where } });
+    return open ? [row, pickPanel(pk)] : [row];
+}
+function txIdeas() {
+    const tx = S.ui.tx, wk = txWeek(), out = [];
+    if (!S.proj[wk]) loadProj(wk).then(render).catch(() => {});
+    const pos = tx.pos || 'ALL', q = (tx.q || '').trim().toLowerCase();
+    const okPos = (pid) => pos === 'ALL' || ppos(pid) === pos;
+    const rostered = rosteredSet(), avail = (pid) => !rostered.has(pid) && !!P(pid) && POS_ORDER.includes(ppos(pid));
+    const sub = (pid) => (onWaiversNow(pid) ? h('span', { class: 'amber' }, clearsLabel(pid)) : 'free agent');
+    const byProj = (a, b) => (projOf(b, wk) || 0) - (projOf(a, wk) || 0);
+    const pk = tx.pick;
+    if (pk && pk.where === 'top') out.push(txHead('Your pick', null, { btns: true }), ...ideaRow(pk.pid, 'top', { sub: sub(pk.pid) }));
+    out.push(h('div', { class: 'txchips', role: 'group', 'aria-label': 'Position' }, ...['ALL', ...POS_ORDER].map(p => h('button', { class: pos === p ? 'on' : '', type: 'button', 'aria-pressed': pos === p ? 'true' : 'false', onclick: () => { tx.pos = p; render(); } }, p === 'ALL' ? 'All' : posLabel(p)))));
+    if (q.length >= 2) {
+        const hits = Object.keys(S.proj[wk] || {}).filter(pid => avail(pid) && okPos(pid) && pname(pid).toLowerCase().includes(q)).sort(byProj).slice(0, 25);
+        out.push(txHead(`${hits.length} available`, `matching “${tx.q.trim()}”`, { btns: true }), ...hits.flatMap(pid => ideaRow(pid, 'find', { sub: sub(pid) })));
+        if (!hits.length) out.push(txEmpty(`No available player matches “${tx.q.trim()}”. Rostered players are left out.`));
+        out.push(h('button', { class: 'txmore', type: 'button', 'data-act': 'tx-clear', onclick: () => { tx.q = ''; render(); } }, 'Clear the search'));
+        return out;
+    }
+    // upgrades over your own roster, by rest of season
+    const b = cutBoard();
+    if (!b) out.push(txHead('Upgrades', 'rest of season', { cols: false }), txEmpty('Reading Sleeper’s rest-of-season projections…'));
+    else {
+        // cutting an IR player frees no bench spot, and an Out one is in the projection already
+        const ups = b.rows.filter(r => r.up && r.slot !== 'IR' && !r.out && okPos(r.fa)).sort((x, y) => y.gain - x.gain);
+        out.push(txHead('Upgrades', 'rest of season', { btns: true }));
+        if (!ups.length) out.push(txEmpty(`Nobody available projects ${CUT_GAIN} more the rest of the way than a receiver, back or tight end you roster.`));
+        const seen = new Set();
+        for (const r of ups) { if (seen.has(r.fa) || seen.size >= 3) continue; seen.add(r.fa);
+            out.push(...ideaRow(r.fa, 'up', { noOpp: true, drop: openRosterSlots() > 0 ? '' : r.pid, sub: [h('span', { class: 'delta up' }, `+${fmt0(r.gain)}`), ` over ${pname(r.pid)}`] }).map((el, i) => (i ? el : (el.setAttribute('data-upgrade', r.pid), el)))); }
+        out.push(h('button', { class: 'txmore', type: 'button', 'data-act': 'tx-cut', onclick: () => { tx.vs = null; tx.view = 'cut'; render(); } }, 'Your whole roster against waivers ›'));
+    }
+    const jd = justDropped().filter(x => okPos(x.pid)).slice(0, 5);
+    if (jd.length) out.push(txHead('Just dropped', 'on waivers now', { btns: true }), ...jd.flatMap(x => ideaRow(x.pid, 'jd', { noOpp: true, sub: h('span', { title: `Dropped by ${teamName(rosterById(x.rid))}` }, h('span', { class: 'amber' }, clearsLabel(x.pid)), ` · dropped ${DAY[new Date(x.at).getDay()]}`) })));
+    const tr = Object.entries(S.trending || {}).filter(([pid, v]) => v.add && avail(pid) && okPos(pid)).sort((a, c) => c[1].add - a[1].add).slice(0, 5);
+    out.push(txHead('Most added', 'all Sleeper leagues, 24h', { btns: true }));
+    if (tr.length) out.push(...tr.flatMap(([pid, v]) => ideaRow(pid, 'tr', { noOpp: true, sub: [h('span', { class: 'up' }, `▲ ${kAdds(v.add)}`), ' adds'] })));
+    else out.push(txEmpty(S.trending ? 'Nobody trending is available here.' : 'Reading Sleeper’s adds…'));
+    // Not free agents only: between the last game and the run, everyone unrostered
+    // is claim-only, and filtering those out left this list empty for two days.
+    const best = Object.keys(S.proj[wk] || {}).filter(pid => avail(pid) && okPos(pid) && !alreadyPlayed(pid, wk)).sort(byProj).slice(0, 5);
+    out.push(txHead('Best this week', `by week ${wk} projection`, { btns: true }));
+    if (best.length) out.push(...best.flatMap(pid => ideaRow(pid, 'best', {})));
+    else out.push(txEmpty(`Nobody left to pick up for week ${wk}.`));
+    out.push(h('div', { class: 'txfoot2' }, 'Every player, with filters and stats: ', h('button', { class: 'lnk', type: 'button', onclick: () => { closeTx(); go('players'); } }, 'Players page ›')));
+    return out;
+}
+
+// ── History: what is settled, the league's or yours ──
+function runMine(r, open) {
+    const tx = S.ui.tx, my = S.myRoster, wi = waiverInfo(), st = runStory(r.txns, my.roster_id), key = String(r.at), isNew = tx.seenBefore ? r.at > tx.seenBefore : false;
+    const B = (pid) => h('b', null, lastNm(pid)), team = (rid) => teamName(rosterById(rid));
+    const gotTxt = st.rows.filter(x => x.res === 'won').map(x => `${shortName(x.pid)}${wi.faab ? ` $${x.bid}` : ''}`).join(', ');
+    if (!open) return h('button', { class: 'txfold', type: 'button', 'data-run': key, 'aria-expanded': 'false', onclick: () => { tx.openRuns = Object.assign({}, tx.openRuns, { [key]: true }); render(); } },
+        h('span', { class: 'txk' }, runDay(r.at).replace(/^\w+ /, '').toUpperCase()), h('span', { class: 'txft' }, 'got ', h('b', null, `${st.got} of ${st.rows.length}`), gotTxt ? ` · ${gotTxt}` : ''), h('span', { class: 'lnk' }, 'show', foldCaret(false)));
+    const hap = (x) => {
+        const say = x.res === 'won' ? [B(x.pid), ` came in${wi.faab ? ` for $${x.bid}` : ''}`, x.drop ? ['. ', h('b', null, pname(x.drop)), ' was dropped for him.'] : ', into your open spot.']
+            : x.res === 'outbid' ? [B(x.pid), ' went to ', team(x.to), wi.faab && x.price != null ? ` for $${x.price}. You bid $${x.bid}.` : '. They were ahead of you in the waiver order.']
+            : x.res === 'room' ? [B(x.pid), ' had no room: your roster was full when his claim came up.']
+            : [B(x.pid), ' was not claimed. ', x.note || ''];
+        const word = x.res === 'won' ? 'WON' : x.res === 'outbid' ? (wi.faab ? 'OUTBID' : 'MISSED') : x.res === 'room' ? 'NO ROOM' : 'MISSED';
+        return h('div', { class: 'txhap', 'data-res': x.res }, h('img', { class: 'hs', src: headshot(x.pid), alt: '', loading: 'lazy', onerror: hideBroken }), h('div', { class: 'say' }, say), h('span', { class: `txres ${x.res}` }, word));
+    };
+    return h('div', { class: `txrb${isNew ? ' new' : ''}`, 'data-run': key },
+        h('div', { class: 'txrbh' }, h('span', { class: 'txk' }, 'WAIVERS'), h('b', null, runDay(r.at)), isNew ? h('span', { class: 'txnew' }, 'NEW') : null, h('span', { class: 'shm' }, `got ${st.got} of ${st.rows.length}${wi.faab ? ` · spent $${st.spent}` : ''}`)),
+        h('div', { class: 'txhapt' }, 'What happened'), ...st.rows.map(hap),
+        st.claims > st.rows.length ? h('div', { class: 'txrbf' }, `Sleeper tried ${st.claims} claims of yours to get there: ${st.claims - st.rows.length} were back-ups it did not need, or had no room.`) : null);
+}
+function runLeague(r, open) {
+    const tx = S.ui.tx, me = S.myRoster.roster_id, faab = waiverInfo().faab, key = String(r.at), isNew = tx.seenBefore ? r.at > tx.seenBefore : false;
+    const bidOf = (t) => (t.settings || {}).waiver_bid, who = (rid) => (rid === me ? 'you' : teamName(rosterById(rid)));
+    const won = r.txns.filter(t => t.status === 'complete').sort((a, b) => (bidOf(b) || 0) - (bidOf(a) || 0) || ((a.settings || {}).seq || 0) - ((b.settings || {}).seq || 0));
+    const lost = r.txns.filter(t => t.status !== 'complete');
+    if (!open) { const top = won[0], tp = top && Object.keys(top.adds || {})[0];
+        return h('button', { class: 'txfold', type: 'button', 'data-run': key, 'aria-expanded': 'false', onclick: () => { tx.openRuns = Object.assign({}, tx.openRuns, { [key]: true }); render(); } },
+            h('span', { class: 'txk' }, runDay(r.at).replace(/^\w+ /, '').toUpperCase()), h('span', { class: 'txft' }, won.length === 1 && tp ? [`${shortName(tp)} to ${who((top.roster_ids || [])[0])}`, faab && bidOf(top) != null ? [' · ', h('b', null, `$${bidOf(top)}`)] : ''] : `${won.length} players · ${r.txns.length} claims`), h('span', { class: 'lnk' }, 'show', foldCaret(false))); }
+    const all = !!(tx.wideRuns && tx.wideRuns[key]), shown = all || won.length <= 7 ? won : won.slice(0, 6);
+    const row = (t) => {
+        const rid = (t.roster_ids || [])[0], pid = Object.keys(t.adds || {})[0], others = lost.filter(x => (x.adds || {})[pid] != null && (x.roster_ids || [])[0] !== rid);
+        const teams = new Set(others.map(x => (x.roster_ids || [])[0])), next = others.length ? Math.max(...others.map(x => bidOf(x) || 0)) : null, mine = others.filter(x => (x.roster_ids || [])[0] === me);
+        const note = !others.length ? 'nobody else bid' : [faab ? `next best $${next}` : `${teams.size} other${teams.size === 1 ? '' : 's'} claimed`, mine.length && faab ? ` · you bid $${Math.max(...mine.map(x => bidOf(x) || 0))}` : faab && teams.size > 1 ? ` · ${teams.size} others bid` : ''];
+        return h('div', { class: 'txwon', 'data-won': pid }, h('img', { class: 'hs', src: headshot(pid), alt: '', loading: 'lazy', onerror: hideBroken }),
+            h('div', { class: 'txw' }, nameLine(pid, true), h('div', { class: 'txl2' }, 'to ', h('b', { class: rid === me ? 'me' : '' }, who(rid)), ' · ', note)), faab && bidOf(t) != null ? h('span', { class: 'txbidc' }, `$${bidOf(t)}`) : h('span'));
+    };
+    return h('div', { class: `txrb${isNew ? ' new' : ''}`, 'data-run': key },
+        h('div', { class: 'txrbh' }, h('span', { class: 'txk' }, 'WAIVERS'), h('b', null, runDay(r.at)), isNew ? h('span', { class: 'txnew' }, 'NEW') : null, h('span', { class: 'shm' }, `${won.length} player${won.length === 1 ? '' : 's'} · ${r.txns.length} claim${r.txns.length === 1 ? '' : 's'}`)),
+        ...shown.map(row),
+        shown.length < won.length ? h('button', { class: 'txrbf txrbm', type: 'button', onclick: () => { tx.wideRuns = Object.assign({}, tx.wideRuns, { [key]: true }); render(); } }, `${won.length - shown.length} more${faab ? `, down to $${bidOf(won[won.length - 1]) || 0}` : ''}`, h('span', { class: 'lnk' }, 'show', foldCaret(false))) : null);
+}
+function moveRowTx(t, league) {
+    const me = S.myRoster.roster_id, rid = (t.roster_ids || [])[0], adds = Object.keys(t.adds || {}), drops = Object.keys(t.drops || {}), at = t.status_updated || t.created;
+    const when = Date.now() - at < 20 * 3600e3 && new Date(at).getDate() === new Date().getDate() ? 'today' : runDay(at);
+    return h('div', { class: 'txmv', 'data-move': t.transaction_id }, h('img', { class: 'hs', src: headshot(adds[0] || drops[0]), alt: '', loading: 'lazy', onerror: hideBroken }),
+        h('div', { class: 'txw' }, league ? h('div', { class: 'txl2' }, h('b', { class: rid === me ? 'me' : '' }, rid === me ? `${teamName(rosterById(rid))} (you)` : teamName(rosterById(rid)))) : null,
+            ...adds.map(p => h('div', { class: 'txl1' }, h('span', { class: 'dir in' }, 'ADD'), nameLine(p, true))), ...drops.map(p => h('div', { class: 'txl1' }, h('span', { class: 'dir out' }, 'DROP'), nameLine(p, true)))),
+        h('span', { class: 'txwhen', title: new Date(at).toLocaleString() }, when));
+}
+function spendFold() {
+    const tx = S.ui.tx, my = S.myRoster, me = my.roster_id, budget = (S.league.settings || {}).waiver_budget || 0, rows = [];
+    for (let w = 1; w <= Math.max(1, S.curWeek); w++) for (const t of S.txns[w] || []) if (t.type === 'waiver' && t.status === 'complete' && (t.roster_ids || []).includes(me) && (t.settings || {}).waiver_bid > 0) rows.push({ pid: Object.keys(t.adds || {})[0], bid: t.settings.waiver_bid });
+    rows.sort((a, b) => b.bid - a.bid);
+    const used = budget - faabLeft(my), max = rows.length ? rows[0].bid : 1;
+    return [h('button', { class: 'txfold', type: 'button', 'data-act': 'tx-spend', 'aria-expanded': String(!!tx.spend), onclick: () => { tx.spend = !tx.spend; render(); } }, h('span', { class: 'txk' }, 'FAAB'), h('span', { class: 'txft' }, h('b', null, `$${used}`), ` of $${budget} spent`), h('span', { class: 'lnk' }, 'on whom', foldCaret(!!tx.spend))),
+        tx.spend ? h('div', { class: 'txspend' }, ...(rows.length ? rows.map(x => h('div', null, h('span', null, shortName(x.pid)), h('i', { style: `width:${Math.max(3, x.bid / max * 100)}%` }), h('b', null, `$${x.bid}`))) : [txEmpty('Nothing spent on a claim that went through.')])) : null];
+}
+function txHistory() {
+    const tx = S.ui.tx, me = S.myRoster.roster_id, wi = waiverInfo(), kind = tx.hkind || 'all', yours = tx.hwho === 'yours', out = [];
+    out.push(h('div', { class: 'txplrow' }, pills([['all', 'All'], ['waivers', 'Waivers'], ['fa', 'Free agents']], kind, (k) => { tx.hkind = k; tx.hN = 0; render(); }, 'Kind of move'),
+        pills([['league', 'League'], ['yours', 'Yours']], yours ? 'yours' : 'league', (k) => { tx.hwho = k; tx.hN = 0; render(); }, 'Whose moves')));
+    if (yours && wi.faab && kind !== 'fa') out.push(...spendFold());
+    const runs = kind === 'fa' ? [] : waiverRuns().filter(r => !yours || r.txns.some(t => (t.roster_ids || []).includes(me))), moves = [];
+    if (kind !== 'waivers') for (let w = 1; w <= Math.max(1, S.curWeek); w++) for (const t of S.txns[w] || []) if (t.type === 'free_agent' && t.status === 'complete' && (!yours || (t.roster_ids || []).includes(me))) moves.push(t);
+    const items = [...runs.map(r => ({ at: r.at, run: r })), ...moves.map(t => ({ at: t.status_updated || t.created, move: t }))].sort((a, b) => b.at - a.at);
+    if (!items.length) out.push(txEmpty(S.txLoading ? 'Reading the league’s moves…' : yours ? 'Nothing of yours yet this season.' : 'Nothing in this league yet this season.'));
+    const n = tx.hN || 14; let firstRun = true;
+    for (const it of items.slice(0, n)) {
+        if (it.move) { out.push(moveRowTx(it.move, !yours)); continue; }
+        const open = firstRun || !!(tx.openRuns && tx.openRuns[String(it.run.at)]); firstRun = false;
+        out.push(yours ? runMine(it.run, open) : runLeague(it.run, open));
+    }
+    if (items.length > n) out.push(h('button', { class: 'txmore', type: 'button', onclick: () => { tx.hN = n + 14; render(); } }, 'Earlier'));
+    return out;
+}
+
+// ── Trades: offers in flight, and the ones that went through ──
+function txOffers() {
+    const tx = S.ui.tx, ts = myTrades(), by = { toyou: [], sent: [], review: [] };
+    for (const t of ts) by[tradeRole(t)].push(t);
+    if (!ts.length) { const dl = (S.league.settings || {}).trade_deadline; return [txEmpty(`No offers either way.${dl && dl <= LAST_WEEK ? ` The deadline is week ${dl}.` : ''}`)]; }
+    return [h('div', { class: 'txcols' }, h('span'), h('span', { class: 'txc' }, `WK ${txWeek()}`), h('span', { class: 'txc' }, 'RoS')), ...[...by.toyou, ...by.sent, ...by.review].map(tradeCardTx)];
+}
+function txTradeHistory() {
+    const tx = S.ui.tx, me = S.myRoster.roster_id, yours = tx.twho === 'yours', done = [], out = [];
+    for (let w = 1; w <= Math.max(1, S.curWeek); w++) for (const t of S.txns[w] || []) if (t.type === 'trade' && t.status === 'complete') done.push(t);
+    done.sort((a, b) => (b.status_updated || b.created) - (a.status_updated || a.created));
+    const list = yours ? done.filter(t => (t.roster_ids || []).includes(me)) : done;
+    out.push(h('div', { class: 'txplrow' }, h('span'), pills([['league', 'League'], ['yours', 'Yours']], yours ? 'yours' : 'league', (k) => { tx.twho = k; render(); }, 'Whose trades')));
+    if (!list.length) out.push(txEmpty(S.txLoading ? 'Reading the league’s trades…' : yours ? 'You haven’t made a trade this season.' : 'No trades in this league yet this season.'));
+    for (const t of list.slice(0, tx.tradesN || 10)) {
+        const sides = (t.roster_ids || []).map(rid => {
+            const got = Object.entries(t.adds || {}).filter(([, r]) => r === rid).map(([p]) => shortName(p))
+                .concat((t.draft_picks || []).map(normPick).filter(dp => dp.owner_id === rid && dp.previous_owner_id !== rid).map(pickLabel))
+                .concat(budgetOf(t).filter(b => b.receiver === rid).map(b => `$${b.amount} FAAB`));
+            return `${rid === me ? 'You' : teamName(rosterById(rid))} get${rid === me ? '' : 's'} ${got.join(', ') || 'nothing'}`;
+        });
+        const d = new Date(t.status_updated || t.created);
+        out.push(h('div', { class: 'txline' }, avatarEl(rosterById((t.roster_ids || [])[0]), 'xs'),
+            h('div', { class: 'txw' }, h('b', { class: (t.roster_ids || []).includes(me) ? 'me' : '' }, (t.roster_ids || []).map(r => (r === me ? 'You' : teamName(rosterById(r)))).join(' ⇄ ')), h('div', { class: 'txsub', title: sides.join(' · ') }, sides.join(' · '))),
+            h('span', { class: 'txwhen' }, d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }))));
+    }
+    if (list.length > (tx.tradesN || 10)) out.push(h('button', { class: 'txmore', type: 'button', onclick: () => { tx.tradesN = (tx.tradesN || 10) + 10; render(); } }, 'Earlier trades'));
+    return out;
+}
+
+// ── the drawer ──
+function txDrawer() {
+    const tx = S.ui.tx; if (!tx || !S.myRoster) return null;
+    if (!tx.part) tx.part = 'claims'; if (!tx.tpart || (tx.tpart === 'review' && !amCommish())) tx.tpart = 'offers';
+    const back = (label, fn) => h('button', { class: 'btn sm s', type: 'button', 'data-act': 'tx-back', onclick: fn || (() => txBack('list')) }, label || '‹ Transactions');
+    let w = 420, head, body, top = null;
+    if (tx.view === 'trade' && S.ui.trade) { w = 760; head = [back(), h('span', null, 'Propose a trade')]; body = [tradeBody()]; }
+    else if (tx.view === 'cut') {
+        w = 1060; const vs = tx.vs && tx.pick && tx.pick.pid === tx.vs ? tx.vs : null;
+        head = vs ? [back(`‹ ${tx.pick.waiv ? 'Claim' : 'Add'}`, () => { tx.view = 'list'; tx.part = 'ideas'; render(); }), h('span', null, `Your roster against ${pname(vs)}`)] : [back(), h('span', null, 'Your roster against waivers')];
+        body = txCut();
+    } else {
+        tx.view = 'list'; head = [h('span', null, 'Transactions')]; top = [txTabs(), ...txPinned(), txParts()];
+        body = tx.tab === 'trades' ? (tx.tpart === 'history' ? txTradeHistory() : tx.tpart === 'review' ? txReview() : txOffers()) : tx.part === 'ideas' ? txIdeas() : tx.part === 'history' ? txHistory() : txClaims();
+    }
+    const part = tx.tab === 'trades' ? tx.tpart : tx.part;
+    return h('div', { class: 'drawer txd', style: `width:${w}px`, role: 'dialog', 'aria-label': 'Transactions', 'data-view': tx.view, 'data-tab': tx.tab, 'data-part': part },
+        h('div', { class: 'dh' }, ...head, h('span', { style: 'flex:1' }), h('button', { class: 'btn sm s', type: 'button', onclick: closeTx }, 'Close · Esc')),
+        top ? h('div', { class: 'txtop' }, ...top) : null,
+        h('div', { class: 'db', 'data-keep': `tx-${tx.view}-${tx.tab}-${part}` }, ...body));
+}
+
 // ── who to cut: your roster against the waiver wire ──
 // Receivers, backs and tight ends you roster, lowest rest-of-season projection
 // first (Sleeper's, in this league's scoring), each with the best player on
@@ -6681,25 +7302,12 @@ function cutBoard() {
     return { rows, best };
 }
 const cutPick = (fa, drop) => openComposer(fa, onWaiversNow(fa), drop);
-function cutUpgrades() {
-    const b = cutBoard(); if (!b) return [txHead('Upgrades on waivers', null, { cols: false }), txEmpty('Reading Sleeper’s rest-of-season projections…')];
-    // cutting an IR player frees no bench spot, and an Out one is in the projection already
-    const ups = b.rows.filter(r => r.up && r.slot !== 'IR' && !r.out).sort((x, y) => y.gain - x.gain);
-    const out = [txHead('Upgrades on waivers', 'by rest of season', { cols: false })];
-    if (!ups.length) out.push(txEmpty(`Nobody on waivers projects ${CUT_GAIN} more the rest of the way than a receiver, back or tight end you roster.`));
-    for (const r of ups.slice(0, 3)) out.push(txCard({ R: S.myRoster, me: true, who: 'Upgrade', kind: posLabel(r.pos), attrs: { 'data-upgrade': r.pid },
-        rows: [txRow(r.fa, { dir: 'in' }), txRow(r.pid, { dir: 'out' })],
-        foot: [h('span', { class: 'delta up' }, `+${fmt0(r.gain)}`), ' rest of season'],
-        acts: [h('button', { class: `btn sm ${onWaiversNow(r.fa) ? 'warn' : 'p'}`, 'data-act': 'upgrade-claim', onclick: () => cutPick(r.fa, r.pid) }, onWaiversNow(r.fa) ? '+ Claim' : '+ Add')] }));
-    out.push(h('button', { class: 'txmore', 'data-act': 'tx-cut', onclick: () => { S.ui.tx.vs = null; S.ui.tx.view = 'cut'; render(); } }, `Your whole roster against waivers${ups.length > 3 ? ` · ${ups.length - 3} more upgrade${ups.length - 3 === 1 ? '' : 's'}` : ''} ›`));
-    return out;
-}
 // The drawer's wide view, two ways. Against the wire: every receiver, back and
 // tight end you roster, each beside the best player on waivers at his position.
 // Against one player (opened from a claim, tx.vs): everyone you could drop for
 // him, each beside what swapping him in is worth — and Drop him picks that drop.
 function txCut() {
-    const tx = S.ui.tx, c = S.ui.composer, vs = tx.vs && c && c.pid === tx.vs ? tx.vs : null;
+    const tx = S.ui.tx, c = tx.pick, vs = tx.vs && c && c.pid === tx.vs ? tx.vs : null;
     const b = cutBoard(), pool = wantL4(), my = S.myRoster;
     if (!b) return [txEmpty('Reading Sleeper’s rest-of-season projections…')];
     const who = (pid) => (P(pid) || {}).last_name || pname(pid);
@@ -6742,16 +7350,16 @@ function txCut() {
     for (const r of rows) {
         let last;
         if (vs) {
-            const dR = (txRos(vs) || 0) - r.ros, dW = (txWk(vs) || 0) - (txWk(r.pid) || 0), on = c.drop === r.pid;
+            const dR = (txRos(vs) || 0) - r.ros, dW = (txWk(vs) || 0) - (txWk(r.pid) || 0), on = c.drops[0] === r.pid;
             last = h('div', { class: 'cutfa' }, h('div', { class: 'cutfn' }, h('span', { class: 'shm' }, 'rest of season'), h('b', { class: dcls(dR) }, sign(dR))),
                 h('div', { class: 'cutfn' }, h('span', { class: 'shm' }, `week ${wk}`), h('b', { class: dcls(dW) }, sign(dW))),
-                h('button', { class: `btn sm ${on ? 'danger' : 's'}`, 'data-act': 'cut-drop', 'aria-pressed': on ? 'true' : 'false', onclick: () => { c.drop = r.pid; tx.view = 'compose'; render(); } }, on ? `Dropping ${who(r.pid)} ✓` : `Drop ${who(r.pid)}`));
+                h('button', { class: `btn sm ${on ? 'danger' : 's'}`, 'data-act': 'cut-drop', 'aria-pressed': on ? 'true' : 'false', onclick: () => { c.drops[0] = r.pid; tx.view = 'list'; tx.part = 'ideas'; render(); } }, on ? `Dropping ${who(r.pid)} ✓` : `Drop ${who(r.pid)}`));
         } else last = h('div', { class: 'cutfa' }, !r.up ? h('span', { class: 'shm' }, `no one on waivers projects ${CUT_GAIN} more`) : [
             h('div', { class: 'cutfn' }, h('b', null, pname(r.fa)), h('span', { class: 'delta up' }, `+${fmt0(r.gain)}`)),
             h('div', { class: 'shm' }, (() => { const ok = oppKey(r.pos), d = pool && ok ? usageDist(pool, r.pos, ok.k, ok.get) : null, fv = ok && pool && pool[r.fa] ? ok.get(pool[r.fa]) : null;
                 return `${(P(r.fa) || {}).team || ''} · ${fmt0(txRos(r.fa) || 0)} · ${posLabel(r.pos)}${rosRank(r.fa) || '?'}${ok && fv != null ? ` · ${ok.label} ${ok.show(fv)}${d ? ` (${ordinal(usagePct(d, fv))})` : ''}` : ''}${statusOf(r.fa) ? ' · ' + statusOf(r.fa) : ''}`; })()),
             r.slot !== 'IR' ? h('button', { class: `btn sm ${onWaiversNow(r.fa) ? 'warn' : 'p'}`, 'data-act': 'cut-claim', onclick: () => cutPick(r.fa, r.pid) }, onWaiversNow(r.fa) ? `+ Claim, drop ${who(r.pid)}` : `+ Add, drop ${who(r.pid)}`) : null]);
-        out.push(h('div', { class: `cutg cutr${vs && c.drop === r.pid ? ' on' : ''}`, 'data-cut': r.pid },
+        out.push(h('div', { class: `cutg cutr${vs && c.drops[0] === r.pid ? ' on' : ''}`, 'data-cut': r.pid },
             h('div', { class: 'txw cutw' }, nameLine(r.pid, true), h('div', { class: 'cutm' }, h('span', { class: r.slot === 'START' ? 'cst' : '' }, r.slot), !vs && r.up && r.slot !== 'IR' && !r.out ? h('span', { class: 'cutc' }, 'CUT CANDIDATE') : null)),
             rosCell(r.pid, r.pos, r.ros, tickOf(r)), ppg(r.pid), oppCell(r.pid), last));
     }
@@ -6792,174 +7400,44 @@ function tradeCardTx(t) {
         cls: fresh ? 'txfresh' : '', attrs: { 'data-trade': t.transaction_id, 'data-role': role }, rows,
         foot: fresh ? [h('b', { class: 'txjust' }, 'Just sent'), ' · ', foot] : foot, acts });
 }
-function txTrades() {
-    const tx = S.ui.tx, my = S.myRoster, me = my.roster_id;
-    const ts = myTrades(), by = { toyou: [], sent: [], review: [] };
-    for (const t of ts) by[tradeRole(t)].push(t);
-    const waiting = by.sent.length + by.review.length;
-    const out = [h('div', { class: 'txbar' }, h('span', { class: 'shm' }, ts.length ? [by.toyou.length ? `${by.toyou.length} need${by.toyou.length === 1 ? 's' : ''} you` : null, waiting ? `${waiting} waiting` : null].filter(Boolean).join(' · ') : 'Nothing in flight'),
-        h('button', { class: 'btn sm', 'data-act': 'trade-new', onclick: () => openTrade(null) }, '+ Propose trade'))];
-    if (ts.length) out.push(h('div', { class: 'txcols' }, h('span'), h('span', { class: 'txc' }, `WK ${txWeek()}`), h('span', { class: 'txc' }, 'RoS')), ...[...by.toyou, ...by.sent, ...by.review].map(tradeCardTx));
-    else { const dl = (S.league.settings || {}).trade_deadline; out.push(txEmpty(`No offers either way.${dl && dl <= LAST_WEEK ? ` Trade deadline: week ${dl}.` : ''}`)); }
-    const done = [];
-    for (let w = 1; w <= Math.max(1, S.curWeek); w++) for (const t of S.txns[w] || []) if (t.type === 'trade' && t.status === 'complete') done.push(t);
-    done.sort((a, b) => (b.status_updated || b.created) - (a.status_updated || a.created));
-    const mineOnly = !!tx.tradesMine, list = mineOnly ? done.filter(t => (t.roster_ids || []).includes(me)) : done;
-    out.push(txHead('Completed', null, { cols: false, right: seg(['All teams', 'Yours'], mineOnly ? 1 : 0, (i) => { tx.tradesMine = i === 1; render(); }) }));
-    if (!list.length) out.push(txEmpty(S.txLoading ? 'Reading the league’s trades…' : mineOnly ? 'You haven’t made a trade this season.' : 'No trades in this league yet this season.'));
-    for (const t of list.slice(0, tx.tradesN || 10)) {
-        const sides = (t.roster_ids || []).map(rid => {
-            const got = Object.entries(t.adds || {}).filter(([, r]) => r === rid).map(([p]) => shortName(p))
-                .concat((t.draft_picks || []).map(normPick).filter(dp => dp.owner_id === rid && dp.previous_owner_id !== rid).map(pickLabel))
-                .concat(budgetOf(t).filter(b => b.receiver === rid).map(b => `$${b.amount} FAAB`));
-            return `${rid === me ? 'You' : teamName(rosterById(rid))} get${rid === me ? '' : 's'} ${got.join(', ') || 'nothing'}`;
-        });
-        const d = new Date(t.status_updated || t.created);
-        out.push(h('div', { class: 'txline' }, avatarEl(rosterById((t.roster_ids || [])[0]), 'xs'),
-            h('div', { class: 'txw' }, h('b', { class: (t.roster_ids || []).includes(me) ? 'me' : '' }, (t.roster_ids || []).map(r => r === me ? 'You' : teamName(rosterById(r))).join(' ⇄ ')), h('div', { class: 'txsub', title: sides.join(' · ') }, sides.join(' · '))),
-            h('span', { class: 'txwhen' }, d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }))));
-    }
-    if (list.length > (tx.tradesN || 10)) out.push(h('button', { class: 'txmore', onclick: () => { tx.tradesN = (tx.tradesN || 10) + 10; render(); } }, 'Earlier trades'));
-    return out;
+// Review: each trade in league review, both sides, what will happen, and the commissioner's two moves. Each move
+// asks once in the card, since neither can be undone.
+function txReview() {
+    const list = reviewTrades(), days = (S.league.settings || {}).trade_review_days || 0;
+    if (!list.length) return [txEmpty(`No trade is waiting on your review. When both teams accept one, it waits here${days ? ` through the league’s ${days}-day review` : ''}, and you can approve it now or veto it.`)];
+    return [h('div', { class: 'txcols' }, h('span'), h('span', { class: 'txc' }, `WK ${txWeek()}`), h('span', { class: 'txc' }, 'RoS')), ...list.map(reviewCardTx)];
 }
-
-// ── finding a player: Just dropped, Most added, Best available ──
-function txFind() {
-    const tx = S.ui.tx, wk = txWeek();
-    if (!S.proj[wk]) loadProj(wk).then(render).catch(() => {});
-    const pos = tx.pos || 'ALL', q = (tx.q || '').trim().toLowerCase();
-    const okPos = (pid) => pos === 'ALL' || ppos(pid) === pos;
-    const rostered = rosteredSet(), avail = (pid) => !rostered.has(pid) && !!P(pid) && POS_ORDER.includes(ppos(pid));
-    const sub = (pid) => onWaiversNow(pid) ? h('span', { class: 'amber' }, clearsLabel(pid)) : 'free agent';
-    const out = [h('div', { class: 'search txsearch' }, '🔍', h('input', { placeholder: 'Search available players…', value: tx.q || '', 'data-focus': 'tx-search', 'aria-label': 'Search available players', oninput: (e) => { tx.q = e.target.value; render(); } })),
-        h('div', { class: 'txchips', role: 'group', 'aria-label': 'Position' }, ...['ALL', ...POS_ORDER].map(p => h('button', { class: pos === p ? 'on' : '', 'aria-pressed': pos === p ? 'true' : 'false', onclick: () => { tx.pos = p; render(); } }, p === 'ALL' ? 'All' : posLabel(p))))];
-    const byProj = (a, b) => (projOf(b, wk) || 0) - (projOf(a, wk) || 0);
-    if (q.length >= 2) {
-        const hits = Object.keys(S.proj[wk] || {}).filter(pid => avail(pid) && okPos(pid) && pname(pid).toLowerCase().includes(q)).sort(byProj).slice(0, 25);
-        out.push(txHead('Results', String(hits.length), { btns: true }), ...hits.map(pid => txRow(pid, { cls: 'btns', sub: sub(pid), btn: pickBtn(pid) })));
-        if (!hits.length) out.push(txEmpty(`No available player matches “${tx.q.trim()}”.`));
-        return out;
-    }
-    const jd = justDropped().filter(x => okPos(x.pid)).slice(0, 5);
-    if (jd.length) out.push(txHead('Just dropped', 'on waivers', { btns: true }), ...jd.map(x => txRow(x.pid, { cls: 'btns', sub: h('span', { class: 'amber' }, clearsLabel(x.pid)), btn: claimBtn(x.pid) })));
-    const tr = Object.entries(S.trending || {}).filter(([pid, v]) => v.add && avail(pid) && okPos(pid)).sort((a, b) => b[1].add - a[1].add).slice(0, 5);
-    out.push(txHead('Most added', 'Sleeper, 24h', { btns: true }));
-    if (tr.length) out.push(...tr.map(([pid, v]) => txRow(pid, { cls: 'btns', sub: [h('span', { class: 'up' }, `▲ ${kAdds(v.add)}`), ' adds'], btn: pickBtn(pid) })));
-    else out.push(txEmpty(S.trending ? 'Nobody trending is available here.' : 'Reading Sleeper’s adds…'));
-    // Not free agents only: between the last game and the run, everyone unrostered
-    // is claim-only, and filtering those out left this list empty for two days.
-    // Each row says which it is, and carries the button that matches.
-    const best = Object.keys(S.proj[wk] || {}).filter(pid => avail(pid) && okPos(pid) && !alreadyPlayed(pid, wk)).sort(byProj).slice(0, 5);
-    out.push(txHead('Best available', `by wk ${wk}`, { btns: true }));
-    if (best.length) out.push(...best.map(pid => txRow(pid, { cls: 'btns', sub: sub(pid), btn: pickBtn(pid) })));
-    else out.push(txEmpty(`Nobody left to pick up for week ${wk}.`));
-    out.push(h('div', { class: 'txfoot2' }, 'Every player, with filters and stats: ', h('button', { class: 'lnk', onclick: () => { closeTx(); go('players'); } }, 'Players page ›')));
-    return out;
-}
-
-// ── the composer: the card it will create, with the whole decision in it ──
-// Who you add, what you bid and why (competition, what this position has cost
-// here), what it does with the drop you pick, then who goes. Nothing below the
-// card; the button stays at the foot of the drawer.
-function txCompose(c) {
-    const my = S.myRoster, wi = waiverInfo(), wk = txWeek(), pos = ppos(c.pid), tx = S.ui.tx;
-    const startersSet = new Set((my.starters || []).filter(p => p && p !== '0'));
-    const dropOpts = (my.players || []).filter(p => !(my.reserve || []).includes(p) && !(my.taxi || []).includes(p));
-    const openSlots = openRosterSlots(), needsDrop = openSlots <= 0;
-    const rosOn = S.ros && S.rosFrom === Math.max(1, S.curWeek);
-    if (!rosOn && !S.rosLoading) { S.rosLoading = true; loadRos().then(() => { S.rosLoading = false; render(); }).catch(() => { S.rosLoading = false; }); }
-    if (!S.proj[wk]) loadProj(wk).then(render).catch(() => {});
-    const net = (txWk(c.pid) || 0) - (c.drop ? (txWk(c.drop) || 0) : 0);
-    const netRos = rosOn ? (txRos(c.pid) || 0) - (c.drop ? (txRos(c.drop) || 0) : 0) : null;
-    const from = Math.max(1, S.curWeek);
-    const byeOf = (pid) => { const pl = P(pid); const w = pl && pl.team ? byeWeekOf(pl.team) : null; return w != null && w >= from ? w : null; };
-    const byeTxt = (pid) => `${(P(pid) || {}).team || '?'} ${byeOf(pid) ? 'wk ' + byeOf(pid) : 'none left'}`;
-    const sign = (v) => `${v > 0 ? '+' : ''}${fmt1(v)}`;
-    const dcls = (v) => `delta ${v > 0 ? 'up' : v < 0 ? 'dn' : ''}`;
-    // the bid, and what should set it
-    let bidEl = null;
-    if (c.waiv && wi.faab) {
-        const setBid = (v) => { c.bid = Math.max(0, Math.min(faabLeft(my), Math.round(v))); render(); };
-        let chips = null, ev = null;
-        if (!S.histReady) { loadPriceHistory(); ev = h('div', { class: 'txev' }, h('span', { class: 'spin' }), ' Reading this league’s price history…'); }
-        else {
-            const mk = marketRead(pos);
-            const tag = (r) => r.season !== S.season ? ' last yr' : r.week ? ` wk ${r.week}` : '';
-            if (mk && mk.lo != null) {
-                chips = h('span', { class: 'txmk' }, h('span', { class: 'shm' }, 'market'),
-                    h('button', { class: 'chip amber', title: 'Bid the low end of what has won here', onclick: () => setBid(mk.lo) }, `$${mk.lo}`),
-                    mk.hi !== mk.lo ? h('button', { class: 'chip amber', title: 'Bid the most that has won here', onclick: () => setBid(mk.hi) }, `$${mk.hi}`) : null);
-                ev = h('div', { class: 'txev' }, `Winning ${posLabel(pos)} bids here: `, ...mk.ev.flatMap((r, i) => [i ? ' · ' : '', h('span', { class: r.ok ? 'g' : 'r' }, r.ok ? 'won' : 'lost'), ` $${r.bid} ${shortName(r.pid)}${tag(r)}`]));
-            } else ev = h('div', { class: 'txev' }, mk && mk.nComp ? `No winning ${posLabel(pos)} bids in this league’s history yet.` : `No ${posLabel(pos)} claims in this league’s history yet: you set the market.`);
-        }
-        const rv = rivalBidders(pos);
-        const who = rv.needers.length
-            ? h('div', { class: 'txwho' }, h('b', null, `${rv.needers.length} other team${rv.needers.length === 1 ? ' is' : 's are'} short at ${posLabel(pos)}: `), rv.needers.slice(0, 3).map(n => `${teamName(n.R)} ($${n.left})`).join(' · '))
-            : h('div', { class: 'txwho' }, h('b', null, `Nobody else is short at ${posLabel(pos)}.`), rv.others ? ` ${rv.others} other team${rv.others === 1 ? ' has' : 's have'} no ${posLabel(pos)} need; the richest holds $${rv.maxOther}.` : '');
-        bidEl = [h('div', { class: 'txbidrow' }, h('b', null, 'Your bid'),
-            h('span', { class: 'txbin' }, '$', h('input', { type: 'number', min: 0, max: faabLeft(my), value: c.bid, 'data-act': 'composer-bid', 'data-focus': 'tx-bid', 'aria-label': 'Your bid in dollars', oninput: (e) => { c.bid = Math.max(0, Math.min(faabLeft(my), Math.round(Number(e.target.value) || 0))); render(); } })),
-            h('span', { class: 'shm' }, `of $${faabLeft(my)}`), chips),
-            h('div', { class: 'txbidctx' }, who, ev)];
-    } else if (c.waiv) bidEl = h('div', { class: 'txbidrow' }, h('span', { class: 'shm' }, `Waiver priority #${my.settings.waiver_position} · claims run ${runsWhen()}, by priority`));
-    const netEl = h('div', { class: 'txnet' },
-        h('div', { class: 'txnh' }, c.drop ? ['With ', h('b', null, pname(c.drop)), ' dropped'] : needsDrop ? 'Pick someone to drop' : `No drop · ${openSlots} open spot${openSlots === 1 ? '' : 's'}`),
-        h('div', { class: 'txnv' },
-            h('div', null, h('span', { class: 'txlb' }, 'THIS WEEK'), h('b', { class: dcls(net) }, sign(net))),
-            h('div', null, h('span', { class: 'txlb' }, 'REST OF SEASON'), netRos == null ? h('span', { class: 'spin' }) : h('b', { class: dcls(netRos) }, sign(netRos))),
-            h('div', null, h('span', { class: 'txlb' }, c.drop ? 'BYES' : 'BYE'), h('span', { class: 'txby' }, c.drop ? `${byeTxt(c.pid)} · ${byeTxt(c.drop)}` : byeTxt(c.pid)))));
-    const byRos = (a, b) => (txRos(a) ?? txWk(a) ?? 0) - (txRos(b) ?? txWk(b) ?? 0);
-    const bench = dropOpts.filter(p => !startersSet.has(p)).sort(byRos), starters = dropOpts.filter(p => startersSet.has(p)).sort(byRos);
-    const choose = (pid) => { c.drop = pid; render(); };
-    const drow = (pid) => txRow(pid, { dir: c.drop === pid ? 'out' : null, radio: c.drop === pid ? null : false, cls: `txdrop ${c.drop === pid ? 'on' : ''}`, onclick: () => choose(pid),
-        attrs: { 'data-drop': pid, role: 'radio', 'aria-checked': c.drop === pid ? 'true' : 'false', tabindex: '0', onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(pid); } } } });
-    const none = !needsDrop ? h('div', { class: `txr txdrop txnone ${!c.drop ? 'on' : ''}`, role: 'radio', 'aria-checked': !c.drop ? 'true' : 'false', tabindex: '0', 'data-drop': '', onclick: () => choose(''), onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(''); } } },
-        h('span'), h('span', { class: 'txradio', 'aria-hidden': 'true' }), h('div', { class: 'txw' }, h('b', null, `No drop · keep an open spot`)), h('span'), h('span')) : null;
-    const card = h('div', { class: 'txcard txcomp' },
-        h('div', { class: 'txh' }, avatarEl(my, 'xs'), h('b', { class: 'me' }, c.waiv ? 'Your claim' : 'Your add'), h('span', { class: 'txk' }, c.waiv ? 'WAIVER' : 'FREE AGENT'),
-            h('span', { class: `txwhen ${c.waiv ? 'amber' : ''}` }, c.waiv ? clearsLabel(c.pid) : 'goes through at once')),
-        h('div', { class: 'txcols' }, h('span'), h('span', { class: 'txc' }, `WK ${wk}`), h('span', { class: 'txc' }, 'RoS')),
-        txRow(c.pid, { dir: 'in', cls: 'txadd' }),
-        bidEl, netEl,
-        h('div', { class: 'txsec txsecl' }, h('span', null, needsDrop ? 'DROP ONE · BENCH' : 'DROP ONE, OR KEEP THE SPOT · BENCH'),
-            h('button', { class: 'lnk', 'data-act': 'tx-cut-vs', onclick: () => { tx.vs = c.pid; tx.view = 'cut'; render(); } }, 'Compare with your roster ›')), none, ...bench.map(drow),
-        starters.length ? h('div', { class: 'txsec' }, 'STARTERS · dropping one opens a slot') : null, ...starters.map(drow));
-    const submit = async () => {
-        const adds = { [c.pid]: my.roster_id }, drops = c.drop ? { [c.drop]: my.roster_id } : {};
-        if (!c.waiv && !confirm(`Add ${pname(c.pid)}${c.drop ? ' and drop ' + pname(c.drop) : ''}? Free-agent moves are immediate.`)) return;
-        c.busy = true; render();
-        try {
-            const r = c.waiv ? await submitClaim(adds, drops, c.bid) : await addDrop(adds, drops);
-            S.ui.composer = null;
-            if (S.ui.tx) Object.assign(S.ui.tx, { view: 'list', tab: 'waivers', justFiled: c.waiv && r ? r.transaction_id : null });
-            toast(c.waiv ? `Claim filed · ${pname(c.pid)}` : `${pname(c.pid)} added`, 'ok');
-            await refreshAfterAction();
-        } catch (e) { c.busy = false; console.error(TAG, e); toast(String(e.message || e), 'err'); render(); }
-    };
-    const foot = h('div', { class: 'txfoot' },
-        h('button', { class: 'btn p', disabled: (needsDrop && !c.drop) || !!c.busy, 'data-act': 'composer-submit', onclick: submit }, c.busy ? 'Sending…' : c.waiv ? `File claim${wi.faab ? ` · $${c.bid || 0}` : ''}` : 'Add now'),
-        h('button', { class: 'btn s', onclick: () => txBack(tx.from) }, 'Cancel'),
-        h('span', { class: 'txfn' }, c.waiv ? `Runs ${runsWhen()}${wi.faab ? ', by bid; ties by priority' : ', by waiver priority'}.` : 'Goes through Sleeper at once, as its own Add button would.'));
-    return { body: [card], foot };
-}
-
-// ── the drawer ──
-function txDrawer() {
-    const tx = S.ui.tx; if (!tx || !S.myRoster) return null;
-    const back = (label) => h('button', { class: 'btn sm s', 'data-act': 'tx-back', onclick: () => txBack('list') }, label || '‹ Transactions');
-    let w = 420, head, body, foot = null;
-    if (tx.view === 'compose' && S.ui.composer) { w = 460; head = [back(), h('span', null, S.ui.composer.waiv ? 'Claim' : 'Add')]; const r = txCompose(S.ui.composer); body = r.body; foot = r.foot; }
-    else if (tx.view === 'trade' && S.ui.trade) { w = 760; head = [back(), h('span', null, 'Propose a trade')]; body = [tradeBody()]; }
-    else if (tx.view === 'find') { w = 480; head = [back(), h('span', null, 'Add a player')]; body = txFind(); }
-    else if (tx.view === 'cut') {
-        w = 1060; const vs = tx.vs && S.ui.composer && S.ui.composer.pid === tx.vs ? tx.vs : null;
-        head = vs ? [h('button', { class: 'btn sm s', 'data-act': 'tx-back', onclick: () => { tx.view = 'compose'; render(); } }, `‹ ${S.ui.composer.waiv ? 'Claim' : 'Add'}`), h('span', null, `Your roster against ${pname(vs)}`)]
-            : [back(), h('span', null, 'Your roster against waivers')];
-        body = txCut();
-    }
-    else { tx.view = 'list'; head = [h('span', null, 'Transactions')]; body = [txTabs(), ...(tx.tab === 'trades' ? txTrades() : txWaivers())]; }
-    return h('div', { class: 'drawer txd', style: `width:${w}px`, role: 'dialog', 'aria-label': 'Transactions', 'data-view': tx.view, 'data-tab': tx.tab },
-        h('div', { class: 'dh' }, ...head, h('span', { style: 'flex:1' }), h('button', { class: 'btn sm s', onclick: closeTx }, 'Close · Esc')),
-        h('div', { class: 'db', 'data-keep': `tx-${tx.view}-${tx.tab}` }, ...body),
+function reviewCardTx(t) {
+    const tx = S.ui.tx, ask = tx.ask && tx.ask.id === t.transaction_id ? tx.ask.kind : null, ends = reviewEnds(t), cap = rosterPositions().filter(x => x !== 'IR' && x !== 'TAXI').length;
+    const picks = (t.draft_picks || []).map(normPick), cash = budgetOf(t), days = (S.league.settings || {}).trade_review_days || 0;
+    const sides = (t.roster_ids || []).map(rid => { const R = rosterById(rid), held = new Set([...(R.reserve || []), ...(R.taxi || [])]);
+        const gets = Object.entries(t.adds || {}).filter(([, r]) => r === rid).map(([p]) => p), sends = Object.entries(t.drops || {}).filter(([, r]) => r === rid).map(([p]) => p);
+        const active = (R.players || []).filter(p => !held.has(p)).length;
+        return { R, rid, gets, sends, after: active - sends.filter(p => !held.has(p)).length + gets.length, ros: gets.reduce((a, p) => a + (txRos(p) || 0), 0) }; });
+    const extra = (s) => [...picks.filter(dp => dp.owner_id === s.rid && dp.previous_owner_id !== s.rid).map(dp => h('div', { class: 'txr txpk' }, h('span', { class: 'hs txpkic' }, 'PICK'), h('span'), h('div', { class: 'txw' }, h('b', null, pickLabel(dp))), h('span'), h('span'))),
+        ...cash.filter(b => b.receiver === s.rid).map(b => h('div', { class: 'txr txpk' }, h('span', { class: 'hs txpkic' }, '$'), h('span'), h('div', { class: 'txw' }, h('b', null, `$${b.amount} FAAB`)), h('span'), h('span')))];
+    const rk = (p) => rosRank(p) ? `${posLabel(ppos(p))}${rosRank(p)} by rest of season` : null;
+    const says = [ends > Date.now() ? ['If nobody acts, it goes through ', h('b', null, atWhen(ends)), `, when the league’s ${days}-day review ends.`] : 'Its review has ended: Sleeper puts it through on its next pass.'];
+    for (const s of sides) if (s.after > cap) says.push([h('b', null, teamName(s.R)), ` would have ${s.after} players for ${cap} spots. Sleeper locks their lineup until they drop ${s.after - cap === 1 ? 'one' : NUMW[s.after - cap] || s.after - cap}.`]);
+    if (S.ros && sides.length === 2) says.push(['Rest of season, by Sleeper’s projection: ', teamName(sides[0].R), ' get ', h('b', null, fmt0(sides[0].ros)), ', ', teamName(sides[1].R), ' get ', h('b', null, fmt0(sides[1].ros)), '.']);
+    const id = t.transaction_id, maker = (S.users || []).find(u => String(u.user_id) === String(t.creator));
+    const move = (process) => txWrite(async () => { await commishTrade(t, process); tx.ask = null; }, process ? 'Trade approved' : 'Trade vetoed');
+    const foot = ask === 'veto'
+        ? h('div', { class: 'txask', 'data-ask': 'veto' }, h('span', null, h('b', null, 'Veto this trade? '), 'Both teams keep their players, and it can’t be undone.'),
+            h('span', { class: 'txacts' }, h('button', { class: 'btn sm', type: 'button', 'data-act': 'review-keep', onclick: () => { tx.ask = null; render(); } }, 'Keep it'),
+                h('button', { class: 'btn sm danger', type: 'button', 'data-act': 'review-veto-yes', 'data-txn': id, disabled: !!tx.busy, onclick: () => move(false) }, 'Veto trade')))
+        : ask === 'process'
+        ? h('div', { class: 'txask go', 'data-ask': 'process' }, h('span', null, h('b', null, 'Approve this trade now? '), 'It goes through at once, before the review ends.'),
+            h('span', { class: 'txacts' }, h('button', { class: 'btn sm', type: 'button', 'data-act': 'review-keep', onclick: () => { tx.ask = null; render(); } }, 'Not yet'),
+                h('button', { class: 'btn sm p', type: 'button', 'data-act': 'review-process-yes', 'data-txn': id, disabled: !!tx.busy, onclick: () => move(true) }, 'Approve trade')))
+        : h('div', { class: 'txf' }, h('span', { class: 'txft', title: `Proposed ${atWhen(t.created)}, accepted ${atWhen(t.status_updated || t.created)}` }, maker ? `proposed by ${maker.display_name}` : ''),
+            h('span', { class: 'txacts' }, h('button', { class: 'btn sm danger', type: 'button', 'data-act': 'review-veto', 'data-txn': id, onclick: () => { tx.ask = { id, kind: 'veto' }; render(); } }, 'Veto trade'),
+                h('button', { class: 'btn sm p', type: 'button', 'data-act': 'review-process', 'data-txn': id, onclick: () => { tx.ask = { id, kind: 'process' }; render(); } }, 'Approve trade')));
+    return h('div', { class: 'txcard txrv', 'data-review': id },
+        h('div', { class: 'txh' }, h('span', { class: 'txpill amb' }, 'IN REVIEW'), h('b', { class: 'txrvt', title: sides.map(s => teamName(s.R)).join(' ⇄ ') }, sides.map(s => teamName(s.R)).join(' ⇄ ')), h('span', { class: 'txwhen', title: `The league’s ${days}-day review ends ${atWhen(ends)}` }, ends > Date.now() ? `ends ${atWhen(ends)}` : 'review over')),
+        ...sides.flatMap(s => [h('div', { class: 'txrvs' }, avatarEl(s.R, 'xs'), h('b', null, teamName(s.R)), h('span', { class: 'shm' }, record(s.R)), h('span', { class: 'txrvg' }, 'gets')),
+            ...s.gets.map(p => txRow(p, { noOpp: true, sub: rk(p) })), ...extra(s)]),
+        h('div', { class: 'txrvw' }, 'What will happen'), h('ul', { class: 'txwill' }, ...says.map(x => h('li', null, x))),
         foot);
 }
 function trendingCard() {
@@ -7698,13 +8176,12 @@ function gcOwner(pid, oppR) {
 // that only settle at the whistle, so they stay out of a single play's chip.
 function gcPlayFx(p) {
     const out = [], def = {}, md = p.metadata || {};
-    const offense = md.possession, other = md.team && md.opponent ? (offense === md.team ? md.opponent : md.team) : null;
     const credit = (team, k, v) => { if (!team || typeof v !== 'number' || /^(pts_allow|yds_allow)/.test(k)) return; (def[team] = def[team] || {})[k] = (def[team][k] || 0) + v; };
-    for (const s of playStatsOf(p)) {
+    const rows = playStatsOf(p);
+    for (const [team, k, v] of defCredits(rows, md)) credit(team, k, v);
+    for (const s of rows) {
         const pid = String(s.player_id), st = s.stats || {};
         if (!/^\d+$/.test(pid)) { for (const k in st) if ((S.league.scoring_settings || {})[k] != null) credit(pid, k, st[k]); continue; }   // a team row
-        for (const k in st) if (IDP_TO_TEAM[k] && IDP_TO_TEAM[k] !== 'sack') credit(other, IDP_TO_TEAM[k], st[k]);
-        if (st.pass_sack) credit(other, 'sack', st.pass_sack);
         if (!GC_POS.has(ppos(pid))) continue;
         const v = scoreStats(st); if (v == null || Math.abs(v) < 0.05) continue;
         out.push({ pid, pts: Math.round(v * 100) / 100 });
@@ -10156,7 +10633,7 @@ async function sendTrade() {
         S.ui.trade = null;
         // back to the list, the offer on top, marked as just sent
         const id = d && d.propose_trade && d.propose_trade.transaction_id;
-        if (S.ui.tx) Object.assign(S.ui.tx, { view: 'list', tab: 'trades', justSent: id || null });
+        if (S.ui.tx) Object.assign(S.ui.tx, { view: 'list', tab: 'trades', tpart: 'offers', justSent: id || null });
         toast(`Offer sent to ${teamName(other)}`, 'ok');
         await loadPending(); render();
     } catch (e) { tr.sending = false; render(); toast(e.message, 'err'); }
