@@ -866,6 +866,9 @@ const teamName = (roster) => { const u = userOf(roster); return (u && u.metadata
 const teamAvatar = (roster) => { const u = userOf(roster); return (u && u.metadata && u.metadata.avatar) || (u && u.avatar && avatarUrl(u.avatar)) || null; };
 const rosterById = (id) => S.rosters.find(r => String(r.roster_id) === String(id)) || null;
 const ownerOf = (pid) => S.rosters.find(r => (r.players || []).includes(pid)) || null;   // who rosters him, league-wide
+// Sleeper's player nicknames: a team names the players on its own roster (its metadata, p_nick_<pid>). A team keeps
+// names for players it has let go, so only the team that has him now names him.
+const nickOf = (pid) => { const R = ownerOf(pid), v = R && R.metadata ? R.metadata[`p_nick_${pid}`] : null; return v && String(v).trim() ? String(v).trim() : null; };
 const record = (r) => `${r.settings.wins}–${r.settings.losses}${r.settings.ties ? '–' + r.settings.ties : ''}`;
 const pf = (r) => (r.settings.fpts || 0) + (r.settings.fpts_decimal || 0) / 100;
 const pa = (r) => (r.settings.fpts_against || 0) + (r.settings.fpts_against_decimal || 0) / 100;
@@ -1402,6 +1405,7 @@ function render() {
     if (!S.orphaned && contextGone()) orphaned();
     if (S.killed) return;
     if (!app) return;
+    if (S.ui && S.ui.nickEdit && S.ui.sel !== S.ui.nickEdit.pid) S.ui.nickEdit = null;   // a nickname half-typed goes with its card
     // Nothing to draw before the league is in hand. An early caller — anything
     // landing before loadCore — used to wipe the loading
     // screen and throw in topbar reading a league that was still null.
@@ -2847,7 +2851,7 @@ function weekTurnBody(tw) {
     const right = h('div', { class: 'wtright' },
         h('div', { class: 'wteye' }, `Week ${S.week} \u00b7 next`),
         turnPreview(my),
-        todo.length ? h('div', { class: 'wtlist' }, ...todo.slice(0, 3)) : h('div', { class: 'wtlist' }, h('div', { class: 'dim' }, h('span', { class: 'chip green' }, 'set'), ' No lineup problems for next week.')));
+        todo.length ? h('div', { class: 'wtlist' }, ...todo.slice(0, 3)) : h('div', { class: 'wtlist' }, h('div', { class: 'dim' }, h('span', { class: 'chip green' }, 'set'), ' Every slot filled, and nobody on bye, out or questionable.')));
     return h('div', { class: 'wtsplit' }, left, right);
 }
 // Next week's matchup as two stacked rows — team, record and rank, projection —
@@ -4508,70 +4512,150 @@ function tradeSummary(t) {
 }
 
 // ── Team ─────────────────────────────────────────────────────────────────────
+// The week's lineup as checks, each passing or to fix with the reason, and the one fix for those a lineup can fix:
+// the best projected lineup, its flex set the late-flex way. Set best lineup's window lists them all (the user,
+// 2026-10-14: the window should "outline the checks and which approved/failed"; the flex is one of them now, not a
+// button of its own, and the byes went to Weeks ahead).
+// What you chose to keep this week, overriding a check that is a judgment call (the user, 2026-10-14: "should i be
+// able to override certain rules? Like i may want to leave someone questionable in"): a questionable starter you
+// leave in, a starter you keep from a suggested swap, the flex slots left as they are. A sure zero (an empty slot, a
+// bye, OUT) and Sleeper's IR rule are never overridden. A choice holds for the week it was made, and a questionable
+// man's only while his status is the one you kept him at. Kept in this browser, per league and week.
+const LKEEP = () => 'badgerLineupKeep-' + S.leagueId;
+function lineupKeeps() {
+    if (!S.lkeep || S.lkeep.league !== S.leagueId) { let all = {}; try { all = JSON.parse(localStorage.getItem(LKEEP()) || '{}') || {}; } catch (e) { all = {}; } S.lkeep = { league: S.leagueId, all }; }
+    const all = S.lkeep.all;
+    for (const w of Object.keys(all)) if (Number(w) < Math.max(1, S.curWeek)) delete all[w];   // the week turned
+    const k = all[S.week] = all[S.week] || { q: {}, best: {}, flex: false };
+    return { k, save: () => { try { localStorage.setItem(LKEEP(), JSON.stringify(all)); } catch (e) { /* kept for this visit */ } render(); } };
+}
+// The best lineup's men, moved as little as they can be: a man who stays keeps his slot and a newcomer takes a
+// vacated one he fits, so leaving the flex slots alone does not reshuffle the rest. Falls back to `best` as built.
+function keepSlots(cur, best) {
+    const bestSet = new Set(best.filter(p => p && p !== '0')), out = cur.map(p => (p && p !== '0' && bestSet.has(p)) ? p : '0');
+    for (const p of best) { if (!p || p === '0' || out.includes(p)) continue; const i = starterSlots().findIndex((sl, k) => out[k] === '0' && slotEligible(sl, p)); if (i < 0) return best; out[i] = p; }
+    return out;
+}
+// The week's lineup as checks, each passing, to fix, or kept by you, with the reason, and the one fix for those a
+// lineup can fix: the best projected lineup, its flex set the late-flex way. Set best lineup's window lists them
+// all (the user, 2026-10-14: the window should "outline the checks and which approved/failed"; the flex is one of
+// them now, not a button of its own, and the byes went to Weeks ahead).
+function lineupChecks(my) {
+    const slots = starterSlots(), cur = my.starters || [], wk = S.week, { k } = lineupKeeps();
+    const curStart = cur.filter(p => p && p !== '0');
+    const zero = (pid) => isBye(pid, wk) || /out|ir|pup|sus/i.test(statusOf(pid) || '');
+    const keptQ = curStart.filter(p => k.q[p] != null && k.q[p] === (statusOf(p) || ''));
+    const keptBest = curStart.filter(p => k.best[p] && !zero(p)), pinned = new Set([...keptQ, ...keptBest]);
+    const raw = bestLineup(my, wk, pid => muLocked(pid) || pinned.has(pid));
+    const lf0 = lateFlex(my, wk), flexKept = !!k.flex && !!lf0 && lf0.moves.length > 0;
+    const arranged = flexKept ? null : lateFlex(my, wk, raw), best = arranged ? arranged.starters : keepSlots(cur, raw);
+    const gain = best.reduce((t, pid) => t + (pid !== '0' ? (projOf(pid, wk) || 0) : 0), 0) - projTotal(my, wk);
+    const bestSet = new Set(best.filter(p => p && p !== '0'));
+    // Who comes in for whom. A newcomer into a slot that is empty now replaces nobody; the rest pair by position, not
+    // by slot, or a reshuffle reads as a chain of swaps. (With an empty QB slot, Ward read as "in for Tucker" and the
+    // back who really took Tucker's spot as "for the empty slot".)
+    const outs = curStart.filter(p => !bestSet.has(p)), changes = [];
+    const news = best.map((p, i) => ({ p, i })).filter(x => x.p && x.p !== '0' && !curStart.includes(x.p));
+    for (const x of news) if (!cur[x.i] || cur[x.i] === '0') x.from = null, x.done = true;
+    for (const x of news.filter(x => !x.done)) { let i = outs.findIndex(o => ppos(o) === ppos(x.p)); if (i < 0) i = outs.findIndex(o => cur.indexOf(o) === x.i); if (i < 0 && outs.length) i = 0; x.from = i >= 0 ? outs.splice(i, 1)[0] : null; }
+    for (const x of news) changes.push({ to: x.p, from: x.from, at: slots[x.i] });
+    const lf = flexKept ? null : lf0;
+    const flexMoves = changes.length ? (arranged ? arranged.moves.filter(m => curStart.includes(m.pid)) : []) : (lf ? lf.moves : []);
+    const fix = changes.length ? best : flexMoves.length ? lf.starters : null, after = fix || cur;
+    const issues = lineupIssues(my), of = (kind) => issues.filter(x => x.kind === kind);
+    const and = (list) => list.length <= 1 ? list.join('') : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+    const benchBye = (my.players || []).filter(p => !curStart.includes(p) && !(my.reserve || []).includes(p) && isBye(p, wk));
+    const st = (ok) => ok ? 'pass' : 'fix';
+    const checks = [
+        { key: 'empty', state: st(!of('empty').length), title: 'Every slot filled', why: of('empty').map(x => `${slotLabel(x.slot)} is empty`).join(' · '),
+            left: of('empty').filter(x => (after[x.i] || '0') === '0').map(x => `Nobody on your bench can fill ${slotLabel(x.slot)}: look on the wire.`) },
+        { key: 'bye', state: st(!of('bye').length), title: 'Nobody on bye', why: of('bye').length ? of('bye').map(x => `${lastNm(x.pid)} is on bye`).join(' · ') : benchBye.length ? `${and(benchBye.map(lastNm))} ${benchBye.length === 1 ? 'is' : 'are'} on bye, on your bench` : '',
+            left: of('bye').filter(x => after.includes(x.pid)).map(x => `Nobody on your bench can take ${lastNm(x.pid)}’s place.`) },
+        { key: 'out', state: st(!of('out').length), title: 'Nobody out', why: of('out').map(x => x.text).join(' · '),
+            left: of('out').filter(x => after.includes(x.pid)).map(x => `Nobody on your bench can take ${lastNm(x.pid)}’s place.`) },
+    ];
+    const qItems = [];
+    slots.forEach((slot, i) => {
+        const pid = cur[i]; if (!pid || pid === '0') return;
+        const sx = insNormStatus(statusOf(pid)); if (!sx || !INS_MAYBE.test(sx.toLowerCase())) return;
+        const kk = insKickInfo(pid); if (kk && (kk.started || kk.over)) return;   // already playing: not a decision
+        const cov = lateCover(pid, slot), when = kk ? atWhen(Date.parse(kk.t)) : 'kickoff unknown';
+        qItems.push({ pid, kept: keptQ.includes(pid), text: `${lastNm(pid)} is ${sx.toLowerCase()}, plays ${when}: ${cov ? `if he sits, ${lastNm(cov.pid)} (${atWhen(cov.ts)}) can still go in after` : 'nobody on your bench plays later, so decide before then'}.` });
+    });
+    checks.push({ key: 'q', state: !qItems.length ? 'pass' : qItems.every(x => x.kept) ? 'kept' : 'fix', title: 'No questionable starters', items: qItems,
+        left: qItems.filter(x => !x.kept && after.includes(x.pid)).map(x => `${lastNm(x.pid)} stays in until you say: leave him in, or swap him on the roster below.`) });
+    checks.push({ key: 'best', state: changes.length ? 'fix' : keptBest.length ? 'kept' : 'pass', title: 'Your best projected lineup', kept: keptBest,
+        why: changes.map(c => `${pname(c.to)} (${fmt1(projOf(c.to, wk))}) is on your bench`).join(' · '), left: [] });
+    if (lf0) {
+        const holders = slots.map((sl, i) => FLEX[sl] && cur[i] && cur[i] !== '0' ? cur[i] : null).filter(Boolean);
+        checks.push({ key: 'flex', state: !lf0.moves.length ? 'pass' : flexKept ? 'kept' : 'fix', title: 'Flex holds your latest kickoff', left: [], keepable: lf0.moves.length > 0,
+            why: lf0.moves.length ? lf0.moves.map(m => `${lastNm(m.pid)} belongs in ${slotLabel(m.to)}`).join(' · ')
+                : lf0.oneKickoff ? 'Every starter kicks off at the same time'
+                : [holders.map(p => `${lastNm(p)}, ${atWhen(lf0.when(p))}`).join(' · '), lf0.pinned ? `${pname(lf0.pinned.pid)} plays later, but every ${posLabel(lf0.pinned.sl)} slot needs one` : ''].filter(Boolean).join('. ') });
+    }
+    if (((S.league.settings || {}).reserve_slots || 0) > 0) {
+        const bad = (my.reserve || []).filter(p => !irStatusOk(p));
+        checks.push({ key: 'ir', state: st(!bad.length), title: 'IR spots hold only the injured', why: bad.map(p => `${pname(p)} is ${(statusOf(p) || 'healthy').toLowerCase()}, so Sleeper blocks adds and drops until he comes off IR`).join(' · '),
+            left: bad.map(p => `${lastNm(p)} is not part of it: activating him takes a roster spot, so someone may have to be dropped. Do that on the roster below.`) });
+    }
+    return { checks, fix, changes, flexMoves, gain, flexKept };
+}
+const checkMark = (state) => sv('svg', { class: `lcmk ${state === 'pass' ? 'ok' : state === 'kept' ? 'kp' : 'no'}`, width: 16, height: 16, viewBox: '0 0 16 16', role: 'img', 'aria-label': state === 'pass' ? 'passes' : state === 'kept' ? 'kept' : 'fails' },
+    sv('circle', { cx: 8, cy: 8, r: 8, class: 'bg' }),
+    state === 'pass' ? sv('path', { d: 'M4.6 8.3l2.4 2.4 4.4-4.8', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.9, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' })
+        : state === 'kept' ? sv('path', { d: 'M4.8 8h6.4', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.9, 'stroke-linecap': 'round' })
+        : sv('path', { d: 'M5.4 5.4l5.2 5.2M10.6 5.4l-5.2 5.2', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.9, 'stroke-linecap': 'round' }));
 function pageTeam() {
     const page = h('div', { class: 'page wide' });
     if (!S.rosters.length) { page.append(h('div', { class: 'card' }, 'Loading rosters…')); return page; }
     const my = viewedTeam();
     if (!my) { page.append(h('div', { class: 'card' }, 'You do not manage a team in this league. Rosters are on the League page.')); return page; }
     const mine = S.myRoster && my.roster_id === S.myRoster.roster_id;
-    const issues = mine ? lineupIssues(my) : [];
-    // The best men by projection, then sat the late-flex way: the doubtful and the
-    // latest kickoffs in the flex. The popup lists who comes in for whom — paired
-    // by position, not by slot, or a reshuffle reads as a chain of swaps — and
-    // then the moves made for the flex.
-    const raw = bestLineup(my, S.week, muLocked), arranged = mine ? lateFlex(my, S.week, raw) : null;
-    const best = arranged ? arranged.starters : raw;
-    const gain = best.reduce((tt, pid) => tt + ((pid !== '0') ? (projOf(pid, S.week) || 0) : 0), 0) - projTotal(my, S.week);
-    const curStart = (my.starters || []).filter(p => p && p !== '0'), bestSet = new Set(best.filter(p => p && p !== '0'));
-    const outs = curStart.filter(p => !bestSet.has(p)), changes = [];
-    for (const p of best.filter(p => p && p !== '0' && !curStart.includes(p))) {
-        let k = outs.findIndex(o => ppos(o) === ppos(p)); if (k < 0 && outs.length) k = 0;
-        changes.push({ to: p, from: k >= 0 ? outs.splice(k, 1)[0] : null, at: starterSlots()[best.indexOf(p)] });
-    }
-    const flexMoves = changes.length && arranged ? arranged.moves.filter(m => curStart.includes(m.pid)) : [];
-    const lf = mine ? lateFlex(my, S.week) : null;
-    const cal = byeCalendar(my);
-    const claims = mine ? S.pending.filter(x => x.type === 'waiver' && (x.roster_ids || []).includes(my.roster_id)) : [];
-    const offers = mine ? S.pending.filter(x => x.type === 'trade' && (x.roster_ids || []).includes(my.roster_id)) : [];
-    const pendingN = claims.length + offers.length;
+    const lc = mine ? lineupChecks(my) : null, fails = lc ? lc.checks.filter(c => c.state === 'fix').length : 0, kept = lc ? lc.checks.filter(c => c.state === 'kept').length : 0;
     const pop = S.ui.teamPop;
     const popCard = (kind) => {
-        if (kind === 'best') return h('div', { class: 'hpop', onclick: (ev) => ev.stopPropagation() },
-            h('div', { class: 'feed' }, ...(changes.length ? changes.map(ch => h('div', { class: 'it', style: 'grid-template-columns:1fr auto' }, h('div', null, h('b', null, ch.to === '0' ? 'Empty' : pname(ch.to)), ' ', h('span', { class: 'muted' }, ch.at && FLEX[ch.at] ? `in at ${slotLabel(ch.at)} for` : 'in for'), ' ', h('b', null, (!ch.from || ch.from === '0') ? 'empty slot' : pname(ch.from)), (ch.from && ch.from !== '0' && (isBye(ch.from, S.week) || statusOf(ch.from))) ? h('span', { class: 'dim' }, ` (${isBye(ch.from, S.week) ? 'bye' : statusOf(ch.from)})`) : null), h('span', { class: 'delta up' }, `+${fmt1((projOf(ch.to, S.week) || 0) - ((ch.from && ch.from !== '0') ? (projOf(ch.from, S.week) || 0) : 0))}`))) : [h('div', { class: 'empty' }, 'Every slot already has your best projected option.')])),
-            flexMoves.length ? h('div', { class: 'feed', style: 'margin-top:6px' }, h('div', { class: 'dim', style: 'font-size:11px;font-weight:800;letter-spacing:.06em;margin-bottom:2px' }, 'AND FOR THE FLEX'),
-                ...flexMoves.map(m => h('div', { class: 'it', style: 'grid-template-columns:auto 1fr auto;align-items:center;gap:9px' },
-                    slotChip(m.to, null, [m.pid]),
-                    h('div', { style: 'min-width:0' }, h('b', null, pname(m.pid)), h('div', { class: 'dim mono', style: 'font-size:11px' }, `${m.q ? `${statusOf(m.pid)} · ` : ''}${kickoffLabel((P(m.pid) || {}).team) || 'kickoff unknown'}${m.from ? ` · now ${slotLabel(m.from)}` : ''}`)),
-                    h('span', { class: 'mono dim', style: 'font-size:11px' }, `to ${slotLabel(m.to)}`)))) : null,
-            changes.length ? h('div', { style: 'display:flex;gap:6px;margin-top:8px' }, h('button', { class: 'btn p sm', onclick: () => { S.ui.teamPop = null; applyBest(best, changes, flexMoves); } }, 'Apply all')) : null,
-            h('div', { class: 'cap' }, `Sleeper's projections, this league's scoring. Byes and OUT count as zero.${arranged && starterSlots().some(sl => FLEX[sl]) ? ' The flex gets a questionable starter first, then your latest kickoff: a late scratch there can be covered from any position.' : ''}`));
-        if (kind === 'flex' && lf) return h('div', { class: 'hpop', onclick: (ev) => ev.stopPropagation() },
-            lf.moves.length ? h('div', { class: 'feed' }, ...lf.moves.map(m => h('div', { class: 'it', style: 'grid-template-columns:auto 1fr auto;align-items:center;gap:9px' },
-                slotChip(m.to, null, [m.pid]),
-                h('div', { style: 'min-width:0' }, h('b', null, pname(m.pid)), h('div', { class: 'dim mono', style: 'font-size:11px' }, `${m.q ? `${statusOf(m.pid)} · ` : ''}${kickoffLabel((P(m.pid) || {}).team) || 'kickoff unknown'}${m.from ? ` · now ${slotLabel(m.from)}` : ''}`)),
-                h('span', { class: 'mono dim', style: 'font-size:11px' }, `to ${slotLabel(m.to)}`))))
-                : h('div', { class: 'empty' }, lf.oneKickoff ? `Every starter kicks off ${kickoffLabel((P((my.starters || []).find(p => p && p !== '0')) || {}).team) || 'at the same time'}. No arrangement leaves you more room than another.`
-                    : lf.pinned ? `Your flex slots hold the latest kickoffs that can reach them. ${pname(lf.pinned.pid)} plays later, but every ${posLabel(lf.pinned.sl)} slot needs one and you start no more.`
-                    : 'Your flex slots already hold your latest kickoffs.'),
-            lf.moves.length ? h('div', { style: 'display:flex;gap:6px;margin-top:8px' }, h('button', { class: 'btn p sm', onclick: () => { S.ui.teamPop = null; act(() => setStarters(lf.starters), `Flex set — ${lf.moves.length} move${lf.moves.length === 1 ? '' : 's'}`); } }, 'Apply')) : null,
-            h('div', { class: 'cap' }, 'Same starters, same projection — only which slot each sits in. A flex slot accepts a back, receiver or tight end, so the later his game, the longer that slot stays open to all three. A questionable starter goes there first: he is the likeliest late scratch.'));
-        if (kind === 'byes') return h('div', { class: 'hpop', onclick: (ev) => ev.stopPropagation() },
-            h('div', { class: 'wk' }, ...cal.map(b => h('div', { class: b.who.length >= 3 ? 'bad' : '' }, h('div', { class: 'l' }, `WK ${b.w}`), h('div', { class: `n ${b.who.length >= 3 ? 'red' : b.who.length ? 'amber' : ''}` }, b.who.length), h('div', { class: 'who' }, b.who.join(' · ') || '—')))));
-        return null;
+        if (kind !== 'best' || !lc) return null;
+        const { k, save } = lineupKeeps();
+        const left = lc.checks.filter(c => c.state === 'fix').flatMap(c => c.left || []);
+        const link = (act, pid, label, fn) => h('button', { class: 'lnk', type: 'button', 'data-act': act, 'data-pid': pid || null, onclick: (ev) => { ev.stopPropagation(); fn(); save(); } }, label);
+        // the reason under a check, with the overrides a judgment call allows
+        const why = (c) => {
+            if (c.key === 'q' && c.items && c.items.length) return c.items.map((it, n) => [n ? ' ' : '', it.kept
+                ? ['You’re leaving ', h('b', null, lastNm(it.pid)), ` in for week ${S.week}. `, link('keep-undo', it.pid, 'undo', () => { delete k.q[it.pid]; })]
+                : [it.text, ' ', link('keep-q', it.pid, 'Leave him in', () => { k.q[it.pid] = statusOf(it.pid) || ''; })]]);
+            if (c.key === 'best' && c.kept && c.kept.length) return [c.why ? `${c.why}. ` : '', 'You’re keeping ', c.kept.map((p2, n) => [n ? ' and ' : '', h('b', null, lastNm(p2))]), ' in. ', link('keep-undo', null, 'undo', () => { k.best = {}; })];
+            if (c.key === 'flex' && c.state === 'kept') return ['You’re leaving the slots as they are. ', link('keep-undo', null, 'undo', () => { k.flex = false; })];
+            if (c.key === 'flex' && c.keepable) return [c.why, '. ', link('keep-flex', null, 'Leave the slots', () => { k.flex = true; })];
+            return c.why || null;
+        };
+        const inRow = (ch) => h('div', { class: 'lcmv' }, ch.to === '0' ? h('span') : h('img', { class: 'hs', src: headshot(ch.to), alt: '', onerror: hideBroken }),
+            h('div', { style: 'min-width:0' }, h('b', null, pname(ch.to)), ' in at ', h('b', null, slotLabel(ch.at)), ', for ', ch.from ? h('b', null, pname(ch.from)) : 'the empty slot',
+                h('div', { class: 'd' }, [(P(ch.to) || {}).team, kickoffLabel((P(ch.to) || {}).team)].filter(Boolean).join(' · '),
+                    ch.from ? [' · ', link('keep-best', ch.from, `Keep ${lastNm(ch.from)}`, () => { k.best[ch.from] = true; })] : null)),
+            h('span', { class: 'lcg' }, `+${fmt1((projOf(ch.to, S.week) || 0) - (ch.from ? projOf(ch.from, S.week) || 0 : 0))}`));
+        const flexRow = (m) => h('div', { class: 'lcmv' }, slotChip(m.to, null, [m.pid]),
+            h('div', { style: 'min-width:0' }, h('b', null, pname(m.pid)), ` to ${slotLabel(m.to)}`, h('div', { class: 'd' }, `${m.q ? `${statusOf(m.pid)} · ` : ''}${kickoffLabel((P(m.pid) || {}).team) || 'kickoff unknown'}${m.from ? ` · now ${slotLabel(m.from)}` : ''}`)), h('span'));
+        const pass = lc.checks.length - fails - kept;
+        return h('div', { class: 'hpop lcpop', role: 'dialog', 'aria-label': `Week ${S.week} lineup`, onclick: (ev) => ev.stopPropagation() },
+            h('div', { class: 'lch' }, h('b', null, `Week ${S.week} lineup`), h('span', { class: 'm' }, [`${pass} pass`, kept ? `${kept} kept` : null, `${fails} to fix`].filter(Boolean).join(' · '))),
+            ...lc.checks.map(c => { const w = why(c);
+                return h('div', { class: `lck ${c.state}`, 'data-check': c.key, 'data-state': c.state }, checkMark(c.state), h('b', null, c.title), w ? h('span', { class: 'd' }, w) : null, h('span', { class: 'v' }, c.state === 'pass' ? 'PASS' : c.state === 'kept' ? 'KEPT' : 'FIX')); }),
+            lc.fix ? h('div', { class: 'lcfh' }, 'The fix') : null,
+            ...(lc.fix ? [...lc.changes.map(inRow), ...lc.flexMoves.map(flexRow)] : []),
+            lc.fix || left.length ? h('div', { class: 'lcff' }, lc.fix ? h('button', { class: 'btn p sm', 'data-act': 'lineup-apply', onclick: () => { S.ui.teamPop = null; applyBest(lc.fix, lc.changes, lc.flexMoves); } }, 'Apply') : null,
+                left.length ? h('span', { class: 'lcnote' }, left.join(' ')) : null) : null,
+            h('div', { class: 'cap' }, 'Sleeper’s projections, this league’s scoring. Byes and OUT count as zero. The flex gets a questionable starter first, then your latest kickoff: a late scratch there can be covered from any position. What you keep holds for this week; Apply never undoes it.'));
     };
     const chipBtn = (kind, label, cls) => h('span', { style: 'position:relative' }, h('button', { class: `btn sm ${cls || ''}`, 'data-pop': kind, onclick: (ev) => { ev.stopPropagation(); S.ui.teamPop = pop === kind ? null : kind; render(); } }, label), pop === kind ? popCard(kind) : null);
     page.append(h('div', { class: 'card', onclick: () => { if (S.ui.teamPop) { S.ui.teamPop = null; render(); } } },
-        h('div', { class: 'card-h', style: 'margin-bottom:0' },
-            h('div', { style: 'display:flex;align-items:center;gap:12px' }, avatarEl(my, 'lg'), h('div', null, teamSwitcher(my), h('div', { class: 'dim', style: 'font-size:12px' }, `${record(my)} · ${ordinal(rosterRank().findIndex(r => r.roster_id === my.roster_id) + 1)} · ${fmt1(pf(my))} PF · ${waiverInfo().faab ? '$' + faabLeft(my) + ' FAAB' : 'waiver #' + my.settings.waiver_position} · proj ${fmt1(projTotal(my, S.week))}${issues.length ? '' : ''}`)),
-                issues.length ? h('span', { class: 'chip red', title: issues.map(i => i.text).join(' · ') }, `${issues.length} lineup issue${issues.length === 1 ? '' : 's'}`) : null),
+        h('div', { class: 'card-h teamhd', style: 'margin-bottom:0' },
+            h('div', { style: 'display:flex;align-items:center;gap:12px' }, avatarEl(my, 'lg'), h('div', null, teamSwitcher(my), h('div', { class: 'dim', style: 'font-size:12px' }, `${record(my)} · ${ordinal(rosterRank().findIndex(r => r.roster_id === my.roster_id) + 1)} · ${fmt1(pf(my))} PF · ${waiverInfo().faab ? '$' + faabLeft(my) + ' FAAB' : 'waiver #' + my.settings.waiver_position} · proj ${fmt1(projTotal(my, S.week))}`)),
+                null),
             h('div', { class: 'row-actions' },
-                mine ? chipBtn('best', changes.length ? `Set best lineup (+${fmt1(gain)})` : 'Lineup ✓', changes.length ? 'p' : 's') : null,
-                lf ? chipBtn('flex', lf.moves.length ? `Late flex · ${lf.moves.length}` : 'Flex ✓', lf.moves.length ? '' : 's') : null,
-                chipBtn('byes', `Byes ${cal.map(b => b.who.length).join('·')}`, 's'),
-                mine ? h('button', { class: `btn sm ${pendingN ? 'warn' : 's'}`, 'data-act': 'tx-open', title: 'Your claims and trade offers', onclick: (ev) => { ev.stopPropagation(); openTx(); } }, `In flight${pendingN ? ' · ' + pendingN : ''}`) : null,
-                h('button', { class: 'btn sm', 'data-act': 'trade-open', onclick: () => openTrade(mine ? null : my.roster_id) }, mine ? 'Propose trade' : `Trade with ${teamName(my).slice(0, 14)}`),
-                mine ? h('button', { class: 'btn sm s', onclick: () => go('players') }, 'Add player')
-                    : h('button', { class: 'btn sm s', onclick: () => goTeam(S.myRoster.roster_id) }, '← My team')))));
+                // One button for the lineup; claims, trades and adds live in Transactions (the user, 2026-10-14)
+                lc ? chipBtn('best', `${lc.fix ? `Set best lineup${lc.changes.length ? ` (+${fmt1(lc.gain)})` : ''}` : fails ? 'Lineup' : 'Lineup ✓'}${fails ? ` · ${fails} to fix` : ''}`, lc.fix ? 'p' : fails ? 'warn' : 's') : null,
+                mine ? null : h('button', { class: 'btn sm', 'data-act': 'trade-open', onclick: () => openTrade(my.roster_id) }, `Trade with ${teamName(my).slice(0, 14)}`),
+                mine ? null : h('button', { class: 'btn sm s', onclick: () => goTeam(S.myRoster.roster_id) }, '← My team')))));
     if (mine && S.seasonType === 'regular') { const wa = weeksAheadFold(my); if (wa) page.append(wa); }
     page.append(rosterCard(my, !mine));
     return page;
@@ -4604,11 +4688,11 @@ async function applyBest(best, changes, flexMoves) {
     const f = (flexMoves || []).length;
     await act(() => setStarters(best), `Lineup set — ${changes.length} change${changes.length === 1 ? '' : 's'}${f ? `, ${f} slot move${f === 1 ? '' : 's'} for the flex` : ''}`);
 }
-function playerCell(pid, week) {
+function playerCell(pid, week, o) {
     const pl = P(pid) || {};
-    const pos = ppos(pid);
+    const pos = ppos(pid), nk = o && o.nick ? nickOf(pid) : null;
     return h('div', { class: 'pl' }, h('div', { class: 'avatar sm' }, h('img', { src: headshot(pid), alt: '', onerror: (e) => { e.target.remove(); } })),
-        h('div', { style: 'min-width:0' }, nameLine(pid), h('div', { class: 'sub' }, bioText(pid))));
+        h('div', { style: 'min-width:0' }, nameLine(pid), nk ? h('div', { class: 'nick', title: `“${nk}”` }, h('q', null, nk)) : null, h('div', { class: 'sub' }, bioText(pid))));
 }
 // Team and bye ride with the name now; age and experience drop to the sub-line.
 function teamMeta(pid, noBye) {
@@ -4633,7 +4717,8 @@ function oppGameLine(pid, week) {
     const home = k.home === pl.team, us = Number(home ? k.hs : k.as), them = Number(home ? k.as : k.hs), known = isFinite(us) && isFinite(them) && (k.hs != null || k.as != null);
     const sc = known ? `${us}–${them}` : '';
     if (fin) return { txt: known ? `${us > them ? 'W' : us < them ? 'L' : 'T'} ${sc}` : 'Final', cls: 'fin', title: known ? `Final: ${pl.team} ${us}, ${k.home === pl.team ? k.away : k.home} ${them}` : null };
-    return { txt: `${half ? 'HALF' : `${quarterLabel(k)}${k.tr && k.tr !== '00:00' ? ' ' + k.tr : ''}`}${sc ? ' · ' + sc : ''}`, cls: 'live' };
+    const clock = half ? 'HALF' : `${quarterLabel(k)}${k.tr && k.tr !== '00:00' ? ' ' + k.tr : ''}`;
+    return { txt: `${clock}${sc ? ' · ' + sc : ''}`, cls: 'live', clock, sc };
 }
 function oppCell(pid, week) {
     const g = gameOf(pid, week);
@@ -4641,7 +4726,10 @@ function oppCell(pid, week) {
     const pl = P(pid) || {}, st = oppGameLine(pid, week);
     const ko = (week === S.week ? kickoffLabel(pl.team) : null) || DAY[new Date(g.date + 'T12:00:00').getDay()];
     return h('td', { class: 'mono oppc' }, h('div', null, `${g.home ? 'vs ' : '@'}${g.opp}`, oppRankEl(pid, week)),
-        st ? h('div', { class: `ogl ${st.cls}`, title: st.title || null }, st.cls === 'live' ? h('i', { class: 'oglive' }) : null, st.txt) : h('div', { class: 'ogl' }, ko));
+        // live, the clock and the score are two pieces that wrap onto their own lines in a narrow column: one line,
+        // "Q3 14:55 · 0–10", needed 117px and was cut off in the roster's 86 and the Players table's 92 (2026-10-18)
+        st && st.cls === 'live' ? h('div', { class: 'ogl live', title: st.txt }, h('span', null, h('i', { class: 'oglive' }), st.clock), st.sc ? h('b', { class: 'oglsc' }, st.sc) : null)
+            : st ? h('div', { class: `ogl ${st.cls}`, title: st.title || null }, st.txt) : h('div', { class: 'ogl' }, ko));
 }
 function statusChip(pid, week) {
     if (isBye(pid, week)) return h('span', { class: 'chip red' }, 'Bye');
@@ -4938,6 +5026,10 @@ function weeksAheadFold(my) {
         } else grid.append(h('div', { class: 'muted', style: 'font-size:10.5px;align-self:center' }, 'BEST ON THE WIRE'),
             ...weeks.map(() => h('div', { class: 'wkcell hold' }, h('span', { class: 'dim mono', style: 'font-size:10px' }, 'hold'))));
     }
+    // Your other starters' byes over the same weeks (a D/ST's or kicker's is in its own line, with the stream)
+    const sByes = weeks.map(w => ({ w, who: starterSlots().map((sl, i) => (my.starters || [])[i]).filter(pid => pid && pid !== '0' && !posns.includes(ppos(pid)) && isBye(pid, w)) }));
+    grid.append(h('div', { class: 'muted', style: 'font-size:10.5px;align-self:center' }, 'STARTERS ON BYE'),
+        ...sByes.map(b => h('div', { class: `wkcell ${b.who.length ? 'bye' : 'hold'}` }, b.who.length ? h('b', { style: 'font-size:11px' }, b.who.map(p => (P(p) || {}).last_name || pname(p)).join(', ')) : h('span', { class: 'dim mono', style: 'font-size:10px' }, '—'))));
     // ── the folded sentences ──
     const nameOf = (pid, pos) => pos === 'DEF' ? `${pid} D/ST` : ((P(pid) || {}).last_name || pname(pid));
     const listW = (ws) => ws.length === 1 ? `week ${ws[0]}` : `weeks ${ws.slice(0, -1).join(', ')} and ${ws[ws.length - 1]}`;
@@ -4961,6 +5053,8 @@ function weeksAheadFold(my) {
             soft.length ? `, with soft matchups in ${listW(soft)}` : '',
             hard.length ? `${soft.length ? ' and' : ','} tough ones in ${listW(hard)}` : '', '.');
     });
+    const byeTxt = sByes.filter(b => b.who.length).map(b => `${b.who.map(p => pname(p)).join(' and ')} in week ${b.w}`);
+    if (byeTxt.length) lines.unshift(h('div', null, h('b', null, 'Byes: '), byeTxt.join('; '), '.'));
     let open = false; try { open = localStorage.getItem('badgerWeeksAhead') === 'open'; } catch (e) { /* closed */ }
     if (S.ui.weeksOpen != null) open = S.ui.weeksOpen;
     const flip = () => { S.ui.weeksOpen = !open; try { localStorage.setItem('badgerWeeksAhead', S.ui.weeksOpen ? 'open' : 'closed'); } catch (e) { /* session only */ } render(); };
@@ -5052,7 +5146,7 @@ function rosterCard(my, ro) {
             // An empty slot's insight ("no kicker — best FA: …") lives beside the
             // chip, in the 280px player cell that is otherwise blank; in the
             // insight column it was clamped to "no kicker — best F…".
-            fx(h('td', null, empty ? h('div', { class: 'rsempty' }, h('span', { class: 'chip red' }, 'Empty slot'), (() => { const ins = INS['slot:' + i]; return ins ? h('span', { class: 'rsetxt', title: ins.text }, ins.text.replace(/^no [\w/ ]+ \u2014 /, '')) : null; })()) : playerCell(pid, S.week)), 'fx3'),
+            fx(h('td', null, empty ? h('div', { class: 'rsempty' }, h('span', { class: 'chip red' }, 'Empty slot'), (() => { const ins = INS['slot:' + i]; return ins ? h('span', { class: 'rsetxt', title: ins.text }, ins.text.replace(/^no [\w/ ]+ \u2014 /, '')) : null; })()) : playerCell(pid, S.week, { nick: true })), 'fx3'),
             ...(empty ? [fx(h('td', null), 'fx4'), h('td', { class: 'r mono red' }, '—')] : commonCells(pid)),
             ...(empty ? [h('td', { colspan: statN() })] : groupStatCells(pid, slotGroup)),
             empty ? (showIns ? h('td', { class: 'inscol' }) : null) : insightTd(pid)));
@@ -5133,7 +5227,7 @@ function rosterCard(my, ro) {
 }
 // Every row leads with the position now, so this only adds the bench note.
 function benchPlayerCell(pid, beat) {
-    const cell = playerCell(pid, S.week);
+    const cell = playerCell(pid, S.week, { nick: true });
     if (beat) { const sub = cell.querySelector('.sub'); if (sub) sub.append(h('span', { class: 'grn' }, `  ${beat}`)); }
     return cell;
 }
@@ -5397,13 +5491,21 @@ async function loadL4(end) {
     for (const k of Object.keys(S.l4)) if (!(k.endsWith(':final') || k.endsWith(`:${statsGen}`) || k.endsWith(`:${statsGen - 1}`))) delete S.l4[k];
     S.l4[key] = m;
 }
-const l4Pool = (end) => (S.l4 || {})[l4Key(end ?? l4End())] || null;
+// The pool for a window, or while a live pull's new one is being built, the newest one there is (a pull or two
+// old: loadL4 keeps the last generation until the next lands). On a Sunday every pull retires the current pool,
+// and a reader that asked for exactly that one drew "Loading…" all afternoon: the quick views never counted and
+// the roster's movement arrows went (2026-10-18). wantL4 rebuilds the exact one behind it.
+const l4Pool = (end) => {
+    const e = end ?? l4End(), m = S.l4 || {}; if (m[l4Key(e)]) return m[l4Key(e)];
+    const k = Object.keys(m).filter(x => x.startsWith(`${e}:`) && !x.endsWith(':final')).sort((a, b) => Number(b.split(':')[1]) - Number(a.split(':')[1]))[0];
+    return k ? m[k] : null;
+};
 // The last four are rebuilt whenever a stats pull lands (statsGen), even a
 // Friday stat correction. A view that reads them asks again when the pool it had
 // was retired, rather than drawing dashes until the next page load.
 function wantL4() {
     const pool = l4Pool();
-    if (!pool && S.seasonType === 'regular' && !S.l4Loading) { S.l4Loading = true; loadL4(l4End()).then(() => { S.l4Loading = false; render(); }).catch(() => { S.l4Loading = false; }); }
+    if (!(S.l4 || {})[l4Key(l4End())] && S.seasonType === 'regular' && !S.l4Loading) { S.l4Loading = true; loadL4(l4End()).then(() => { S.l4Loading = false; render(); }).catch(() => { S.l4Loading = false; }); }
     return pool;
 }
 const l4PoolNear = (end) => { const m = S.l4 || {}; return m[l4Key(end)] || m[`${end}:${statsGen - 1}`] || null; };
@@ -5703,7 +5805,7 @@ function quickRead() {
     const q = { key, under: new Map(), over: new Map(), ready: false };
     S.quick = q;
     if (S.seasonType !== 'regular' || !S.sleeperAdp || !S.seasonStats) return q;
-    const end = l4End(), useL4 = end >= 5, pool = useL4 ? l4Pool(end) : S.seasonStats;
+    const end = l4End(), useL4 = end >= 5, pool = useL4 ? (l4End() === end ? wantL4() : l4Pool(end)) : S.seasonStats;   // and builds the pool if it is missing or a pull old
     if (!pool) return q;
     const adp = S.sleeperAdp, ref = useL4 ? null : pool, n = S.rosters.length || 12;
     const rows = [];
@@ -6659,6 +6761,8 @@ function groupClaims(claims, links) {
         let g = by.get(pid); if (!g) by.set(pid, g = { pid, bid: b, bids: [], claims: [], drops: [] });
         // a lower bid on the same player is a back-up bid: it is tried when the bigger one cannot be paid
         g.claims.push(t); if (!g.bids.includes(b)) g.bids.push(b); if (!g.drops.includes(d)) g.drops.push(d);
+        // each claim is one try: this bid with this drop. A back-up is a pair of its own, never every bid with every drop
+        if (!g.pairs) g.pairs = []; if (!g.pairs.some(x => x.b === b && x.d === d)) g.pairs.push({ b, d });
     }
     const groups = [...by.values()];
     // a second choice (a link kept in this browser) holds only while both claims drop the same player
@@ -6671,7 +6775,8 @@ const claimItems = () => { const gs = claimGroups(); return gs.length ? claimSto
 const warnKey = (it) => `${it.warn}:${it.g ? it.g.pid : ''}:${it.g ? it.g.drops.join(',') : ''}:${it.g && it.g.bids ? it.g.bids.join(',') : ''}`;
 const liveWarn = (it) => !!it.warn && !txQuiet().includes(warnKey(it));
 // What your claims will do, in sentences. Pure: `groups` are your claims in the
-// order Sleeper tries them ({ pid, bid, bids, drops, secondOf }), `open` your open
+// order Sleeper tries them ({ pid, bid, bids, drops, pairs, secondOf }: `pairs` its claims,
+// each a bid and a drop; without them every bid goes with every drop), `open` your open
 // roster spots, `o.left` your FAAB. Every combination of each player being there
 // to be had, or taken by someone else, is played the way Sleeper plays a run: your
 // claims bigger bid first, then in your order; a claim it cannot pay for fails, as
@@ -6690,7 +6795,8 @@ function claimStory(groups, open, o) {
     const bidsOf = (g) => (g.bids && g.bids.length ? g.bids : [g.bid || 0]);
     const win = (g, b) => (o.faab && b > 0 ? [`If your $${b} wins `, B(g.pid)] : ['If you get ', B(g.pid)]);
     const tries = [];
-    G.forEach((g, gi) => bidsOf(g).forEach((b, bi) => g.drops.forEach((d, di) => tries.push({ gi, b, d, k: bi * 100 + di }))));
+    const pairsOf = (g) => (g.pairs && g.pairs.length ? g.pairs : bidsOf(g).flatMap(b => g.drops.map(d => ({ b, d }))));
+    G.forEach((g, gi) => pairsOf(g).forEach((x, k) => tries.push({ gi, b: x.b, d: x.d, k })));
     tries.sort((x, y) => y.b - x.b || x.gi - y.gi || x.k - y.k);
     const runs = [];
     for (let m = 0; m < (1 << n); m++) {
@@ -6698,9 +6804,11 @@ function claimStory(groups, open, o) {
         const gone = new Set(), got = new Map(), why = new Map(), had = new Map(), lost = new Map();
         for (const t of tries) {
             if (got.has(t.gi) || !((m >> t.gi) & 1)) continue;
-            if (t.b > cash) { why.set(t.gi, 'cash'); had.set(t.gi, cash); continue; }
-            if (t.d) { if (gone.has(t.d)) { why.set(t.gi, 'drop'); lost.set(t.gi, t.d); continue; } gone.add(t.d); }
-            else if (spots > 0) spots--; else { why.set(t.gi, 'room'); continue; }
+            // everything that stops this try, not only the first thing met: no money AND no open spot is told as both
+            const short = t.b > cash ? ['cash'] : [];
+            if (t.d ? gone.has(t.d) : spots <= 0) short.push(t.d ? 'drop' : 'room');
+            if (short.length) { why.set(t.gi, short); if (short[0] === 'cash') had.set(t.gi, cash); if (t.d && gone.has(t.d)) lost.set(t.gi, t.d); continue; }
+            if (t.d) gone.add(t.d); else spots--;
             cash -= t.b; got.set(t.gi, { b: t.b, d: t.d });
         }
         runs.push({ m, got, why, had, lost, spent: o.faab ? o.left - cash : 0 });
@@ -6720,10 +6828,12 @@ function claimStory(groups, open, o) {
             out.push({ say: ['If you miss ', B(g.pid), ', ', B(s.pid), o.faab ? ` is claimed for $${bidsOf(s)[0]} and ` : ' is claimed and ', B(base), ' is dropped for him instead.'] });
             return;
         }
-        const mine = runs.filter(r => (r.m >> gi) & 1), fails = mine.filter(r => !r.got.has(gi)), first = { b: bidsOf(g)[0], d: g.drops[0] || '' };
+        const mine = runs.filter(r => (r.m >> gi) & 1), fails = mine.filter(r => !r.got.has(gi)), first = { b: pairsOf(g)[0].b, d: pairsOf(g)[0].d || '' };
         if (fails.length) {
-            const count = {}; for (const r of fails) { const k = r.why.get(gi); count[k] = (count[k] || 0) + 1; }
-            const kind = Object.keys(count).sort((a, b) => count[b] - count[a])[0], rs = fails.filter(r => r.why.get(gi) === kind), lostD = kind === 'drop' ? rs[0].lost.get(gi) : null;
+            const main = (r) => { const w = r.why.get(gi); return w[w.length - 1]; };   // 'room' or 'drop' when either stops it, else 'cash'
+            const count = {}; for (const r of fails) { const k = main(r); count[k] = (count[k] || 0) + 1; }
+            const kind = Object.keys(count).sort((a, b) => count[b] - count[a])[0], rs = fails.filter(r => main(r) === kind), lostD = kind === 'drop' ? rs[0].lost.get(gi) : null;
+            const broke = kind !== 'cash' && rs.every(r => r.why.get(gi)[0] === 'cash'), have = Math.max(0, Math.min(...rs.map(r => r.had.get(gi) || 0)));
             // a claim above is a cause only by doing the thing that hurts: spending money, taking a spot, dropping the same man
             const role = (x) => (kind === 'cash' ? x.b > 0 : kind === 'room' ? !x.d : x.d === lostD);
             const C = G.slice(0, gi).filter((x, xi) => rs.every(r => r.got.has(xi) && (kind === 'drop' || role(r.got.get(xi)))));
@@ -6731,23 +6841,25 @@ function claimStory(groups, open, o) {
             const any = C.length ? [] : G.slice(0, gi).filter((x, xi) => rs.some(r => r.got.has(xi) && role(r.got.get(xi))) && !mine.every(r => r.got.has(xi))), by = C.length ? C : any;
             const ifIn = C.length ? ['If ', ...list(C), come(C)] : ['If ', ...orList(any), ' comes in'], flagIf = C.length ? `${names(C)}${hits(C)}` : `${orNames(any)} hits`;
             flush(); plain = false;
+            // when the money is short as well, the fix for a spot or a drop carries a back-up bid of what is left (`fix`)
+            const tooBroke = !broke ? [] : first.b > o.left ? [` His $${first.b} is more than your $${o.left} too.`] : by.length ? [` That leaves you $${have} too, short of his $${first.b}.`] : [' Your other claims could spend the money for him too.'];
             if (kind === 'cash') {
-                const have = Math.max(0, Math.min(...rs.map(r => r.had.get(gi) || 0)));
                 out.push({ warn: 'cash', g, cause: by, fix: have, flag: first.b > o.left ? 'more than you have' : by.length ? `fails if ${flagIf}` : 'fails if the money runs out',
                     say: first.b > o.left ? [B(g.pid), `’s $${first.b} is more than your $${o.left}, so his claim fails.`]
                         : by.length ? [...ifIn, ` you have $${have} left, so `, B(g.pid), `’s $${first.b} claim cannot be paid, and it fails.`]
                         : ['If your other claims spend your money first, ', B(g.pid), `’s $${first.b} claim cannot be paid.`] });
             } else if (kind === 'room') {
-                out.push({ warn: 'room', g, cause: by, flag: by.length ? `no room if ${flagIf}` : 'no open spot',
-                    say: C.length ? [B(g.pid), ' comes in only if ', ...(C.length === 1 ? [B(C[0].pid), ' misses'] : [C.length === 2 ? 'either of them misses' : 'one of them misses']), '. If ', ...list(C), come(C), ' there is no room, and his claim fails.']
-                        : any.length ? [...ifIn, ' there is no room for ', B(g.pid), ', and his claim fails.']
-                        : ['You have no open spot, so ', B(g.pid), '’s claim fails as it stands.'] });
+                const takes = C.length === 1 ? (open === 1 ? ', he takes your only open spot' : ', he takes your last open spot') : open === C.length ? `, they take your ${NUMW[open] || open} open spots` : ', they take the open spots that are left';
+                out.push({ warn: 'room', g, cause: by, flag: by.length ? `no open spot if ${flagIf}` : 'no open spot', fix: broke ? have : undefined, broke,
+                    say: [...(C.length ? [B(g.pid), ' comes in only if ', ...(C.length === 1 ? [B(C[0].pid), ' misses'] : [C.length === 2 ? 'either of them misses' : 'one of them misses']), '. If ', ...list(C), come(C), takes, ', so there is none left for ', B(g.pid), ', and his claim fails.']
+                        : any.length ? [...ifIn, ', that takes your last open spot, so there is none left for ', B(g.pid), ', and his claim fails.']
+                        : ['You have no open spot, so ', B(g.pid), '’s claim fails as it stands.']), ...tooBroke] });
             } else {
                 const d = lostD;
-                out.push({ warn: 'drop', g, cause: by, flag: by.length ? `fails if ${flagIf}` : `${nm(d)} is already gone`,
-                    say: by.length ? (d === (g.drops[0] || '') ? [B(g.pid), ' drops ', B(d), ' too. ', ...ifIn, ', ', B(d), ' is already gone and ', B(g.pid), '’s claim fails.']
+                out.push({ warn: 'drop', g, cause: by, flag: by.length ? `fails if ${flagIf}` : `${nm(d)} is already gone`, fix: broke ? have : undefined, broke,
+                    say: [...(by.length ? (d === (g.drops[0] || '') ? [B(g.pid), ' drops ', B(d), ' too. ', ...ifIn, ', ', B(d), ' is already gone and ', B(g.pid), '’s claim fails.']
                         : [B(g.pid), ' drops ', B(d), ' too when there is no open spot. ', ...ifIn, ', ', B(d), ' is already gone and his claim fails.'])
-                        : [B(d), ' is no longer yours to drop, so ', B(g.pid), '’s claim fails.'] });
+                        : [B(d), ' is no longer yours to drop, so ', B(g.pid), '’s claim fails.']), ...tooBroke] });
             }
             return;
         }
@@ -6762,9 +6874,16 @@ function claimStory(groups, open, o) {
         }
         flush(); plain = false;
         const alt = mine.filter(r => { const x = r.got.get(gi); return x.b !== first.b || x.d !== first.d; }), C = above(alt, gi), ax = alt[0].got.get(gi);
-        if (ax.b !== first.b && ax.d === first.d) out.push({ say: [...(C.length ? ['If ', ...list(C), come(C), ', '] : ['If the money runs short, ']), B(g.pid), ' is claimed at ', { am: `$${ax.b}` }, ax.d ? [' and ', B(ax.d), ' is dropped for him'] : ' and goes into an open spot', '. ',
+        // who brings the other way about: the claims above that come in every time it happens ("Perine and Tracy both"), else any
+        // claim above that can, by taking the open spot or spending the money ("Perine or Tracy")
+        const spotOrCash = ax.d !== first.d && ax.b !== first.b ? (x) => !x.d || x.b > 0 : ax.d !== first.d ? (x) => !x.d : (x) => x.b > 0;
+        const any = C.length ? [] : G.slice(0, gi).filter((x, xi) => alt.some(r => r.got.has(xi) && spotOrCash(r.got.get(xi))) && !mine.every(r => r.got.has(xi)));
+        const ifC = C.length ? ['If ', ...list(C), come(C), ', '] : any.length ? ['If ', ...orList(any), ' comes in, '] : null;
+        if (ax.b !== first.b && ax.d === first.d) out.push({ say: [...(ifC || ['If the money runs short, ']), B(g.pid), ' is claimed at ', { am: `$${ax.b}` }, ax.d ? [' and ', B(ax.d), ' is dropped for him'] : ' and goes into an open spot', '. ',
             ...(C.length === 1 ? ['If you miss ', B(C[0].pid), ', ', B(g.pid), ` is claimed at $${first.b}.`] : [`Otherwise he is claimed at $${first.b}.`])].flat() });
-        else if (!first.d && ax.d) out.push({ say: [B(g.pid), ' takes an open spot if one is left. If ', ...list(C), come(C), ', ', B(ax.d), ' is dropped for him.'] });
+        else if (ax.b !== first.b && ax.d !== first.d) out.push({ say: [...(ifC || ['If the money and the open spots run short, ']), B(g.pid), ' is claimed at ', { am: `$${ax.b}` }, ax.d ? [' and ', B(ax.d), ' is dropped for him'] : ' and goes into an open spot', '. ',
+            ...(C.length === 1 ? ['If you miss ', B(C[0].pid), ', ', B(g.pid), first.d ? [` is claimed at $${first.b} and `, B(first.d), ' is dropped for him.'] : ` goes into an open spot at $${first.b}.`] : [`Otherwise he is claimed at $${first.b}.`])].flat() });
+        else if (!first.d && ax.d) out.push({ say: [B(g.pid), ' takes an open spot if one is left. ', ...(ifC || ['If none is, ']), B(ax.d), ' is dropped for him.'] });
         else if (first.d && ax.d) out.push({ say: [...win(g, first.b), ', ', B(first.d), ' is dropped for him. If ', B(first.d), ' has already gone, ', B(ax.d), ' is dropped instead.'] });
         else out.push({ say: [B(g.pid), ' comes in either way. How depends on the claims above him.'] });
     });
@@ -6833,18 +6952,18 @@ async function keepClaimOrder(wanted) {
 // then is what is no longer wanted withdrawn: if Sleeper refuses a new one, the
 // claims you had still stand. `all` is every group, for the order.
 async function applyGroup(g, want) {
-    const my = S.myRoster, bids = want.bids || [want.bid], had = g.bids || [g.bid], keep = [], line = []; let sent = 0;
+    const my = S.myRoster, pairs = want.pairs, keep = [], slot = []; let sent = 0;
     const dropOf = (t) => Object.keys(t.drops || {})[0] || '', bidOf = (t) => (t.settings || {}).waiver_bid || 0;
     try {
-        for (let bi = 0; bi < bids.length; bi++) for (const drop of want.drops) {
-            // the claim already filed for this drop at this rank of bid is kept, its bid moved if it changed
-            const have = g.claims.find(t => !keep.includes(t) && dropOf(t) === drop && had.indexOf(bidOf(t)) === bi) || g.claims.find(t => !keep.includes(t) && dropOf(t) === drop && bidOf(t) === bids[bi]);
-            if (have) { keep.push(have); if (bidOf(have) !== bids[bi]) { Object.assign(have, await updateClaim(have, bids[bi]) || {}); sent++; } line.push(have); }
-            else { line.push(await submitClaim({ [g.pid]: my.roster_id }, drop ? { [drop]: my.roster_id } : {}, bids[bi])); sent++; }
-        }
+        // the claim already filed for this drop at this bid stays as it is; one for this drop at another bid has its bid moved;
+        // Sleeper cannot change a filed claim's drop, so a new drop is a new claim
+        pairs.forEach((x, i) => { const t = g.claims.find(c => !keep.includes(c) && dropOf(c) === x.d && bidOf(c) === x.b); if (t) { keep.push(t); slot[i] = t; } });
+        for (let i = 0; i < pairs.length; i++) { if (slot[i]) continue; const t = g.claims.find(c => !keep.includes(c) && dropOf(c) === pairs[i].d && !pairs.some(x => x.d === dropOf(c) && x.b === bidOf(c)));
+            if (t) { keep.push(t); Object.assign(t, await updateClaim(t, pairs[i].b) || {}); sent++; slot[i] = t; } }
+        for (let i = 0; i < pairs.length; i++) if (!slot[i]) { slot[i] = await submitClaim({ [g.pid]: my.roster_id }, pairs[i].d ? { [pairs[i].d]: my.roster_id } : {}, pairs[i].b); sent++; }
         for (const t of g.claims) if (!keep.includes(t)) { await cancelClaim(t); sent++; }
     } catch (e) { throw new Error(`${e.message || e} ${sent ? 'Part of your change went through: the list shows where things stand.' : 'Your claims stand as they were.'}`); }
-    return line;
+    return slot;
 }
 // blocks of claims ({ ts }) in your order of players; Sleeper still takes the bigger
 // bid first, and a back-up bid sits with its player among the claims at its bid
@@ -6870,34 +6989,52 @@ async function tidyOrder() {
     return w.length;
 }
 function filePick(pk) {
-    const tx = S.ui.tx, my = S.myRoster, drops = editDrops(pk), bids = editBids(pk);
+    const tx = S.ui.tx, my = S.myRoster, drops = editDrops(pk);
     return txWrite(async () => {
-        if (pk.waiv) { let first = null; for (const b of bids) for (const d of drops) { const t = await submitClaim({ [pk.pid]: my.roster_id }, d ? { [d]: my.roster_id } : {}, b); first = first || t; }
+        if (pk.waiv) { let first = null; for (const x of editPairs(pk)) { const t = await submitClaim({ [pk.pid]: my.roster_id }, x.d ? { [x.d]: my.roster_id } : {}, x.b); first = first || t; }
             Object.assign(tx, { pick: null, q: '', part: 'claims', justFiled: first ? first.transaction_id : null }); }
         else { await addDrop({ [pk.pid]: my.roster_id }, drops[0] ? { [drops[0]]: my.roster_id } : {}); Object.assign(tx, { pick: null, q: '' }); }
     }, pk.waiv ? `Claim filed · ${pname(pk.pid)}` : `${pname(pk.pid)} added`);
 }
 function openEdit(g, second, more) {
-    const tx = S.ui.tx;
+    const tx = S.ui.tx, r = pairRules(g);
     tx.pick = null;
-    tx.edit = Object.assign({ pid: g.pid, bid: g.bid, backs: (g.bids || [g.bid]).slice(1), drops: g.drops.slice(), second: second ? second.pid : null, cond: g.drops.length > 1 || (g.bids || []).length > 1 || !!second, more: false, adding: false }, more || {});
+    tx.edit = Object.assign({ pid: g.pid, bid: r.bid, backs: r.backs, drops: r.drops, dbids: r.dbids, second: second ? second.pid : null, cond: r.drops.length > 1 || r.backs.length > 0 || !!second, more: false, adding: false }, more || {});
     render();
+}
+// A group's claims as the editor's rules: the first pair is the claim; a pair with another drop is "no spot is open (or the
+// last drop has gone) → drop him, and bid this"; a pair with the same drop and less money is "I can't pay → bid this".
+function pairRules(g) {
+    const ps = g.pairs && g.pairs.length ? g.pairs : (g.bids || [g.bid]).flatMap(b => g.drops.map(d => ({ b, d }))), top = ps[0] || { b: g.bid || 0, d: '' };
+    const r = { bid: top.b, drops: [top.d], dbids: [], backs: [] };
+    for (const x of ps.slice(1)) { if (x.d === top.d) r.backs.push(x.b); else { r.drops.push(x.d); r.dbids.push(x.b === top.b ? null : x.b); } }
+    return r;
+}
+// …and back: the claims the rules file, biggest bid first, each rule's own bid with its own drop. A back-up drop's bid is
+// the claim's own unless you set one (never above it: Sleeper would try it first). A drop not picked yet files nothing.
+function editPairs(ed) {
+    const out = [], add = (b, d) => { if (!out.some(x => x.b === b && x.d === d)) out.push({ b, d }); }, d0 = ed.drops[0] || '';
+    add(ed.bid, d0);
+    ed.drops.slice(1).forEach((d, i) => { if (d) add(Math.min(ed.bid, ((ed.dbids || [])[i] ?? ed.bid)), d); });
+    (ed.backs || []).forEach(b => { if (b != null && b < ed.bid) add(b, d0); });
+    return out.map((x, i) => [x, i]).sort((a, b) => b[0].b - a[0].b || a[1] - b[1]).map(x => x[0]);
 }
 const editDrops = (ed) => [...new Set(ed.drops)].filter((d, i) => i === 0 || d);
 // the bids a claim will try, biggest first: its bid, then each back-up bid below it
-const editBids = (ed) => [ed.bid, ...(ed.backs || []).filter(b => b != null && b < ed.bid)].filter((b, i, a) => a.indexOf(b) === i).sort((a, b) => b - a);
+const editBids = (ed) => [...new Set(editPairs(ed).map(x => x.b))];
 // a rule added but not filled in: a back-up drop or a second choice with nobody picked yet
 const editEmpty = (ed) => !!ed && (ed.drops.slice(1).some(d => !d) || ed.second === '');
-const claimDirty = (g, second, ed) => ed.bid !== g.bid || editBids(ed).join() !== (g.bids || [g.bid]).join() || editDrops(ed).join() !== g.drops.join() || (ed.second || null) !== (second ? second.pid : null);
+const pairsKey = (ps) => (ps || []).map(x => `${x.b}|${x.d}`).sort().join(',');   // the same claims, whatever order Sleeper lists them in
+const claimDirty = (g, second, ed) => pairsKey(editPairs(ed)) !== pairsKey(g.pairs) || (ed.second || null) !== (second ? second.pid : null);
 function saveEdit(g, second) {
-    const tx = S.ui.tx, ed = tx.edit, groups = claimGroups(), drops = editDrops(ed), bids = editBids(ed), other = ed.second ? groups.find(x => x.pid === ed.second) : null;
+    const tx = S.ui.tx, ed = tx.edit, groups = claimGroups(), drops = editDrops(ed), other = ed.second ? groups.find(x => x.pid === ed.second) : null;
     if (editEmpty(ed)) return toast('Pick a player for the condition you added, or remove it.', 'err');
     if (other && !drops[0]) return toast('Pick who both claims drop. Sleeper only stops at one when they drop the same player.', 'err');
     if (other && other.bid > ed.bid) return toast(`Sleeper tries the bigger bid first, so ${lastNm(other.pid)} at $${other.bid} would be tried before ${lastNm(g.pid)}. Lower his bid, or raise this one.`, 'err');
     return txWrite(async () => {
-        const mine = await applyGroup(g, { bids, drops });
+        const mine = await applyGroup(g, { pairs: editPairs(ed) });
         // a second choice takes this claim's drop, and is tried straight after it
-        const his = other ? (other.drops.join() !== drops[0] ? await applyGroup(other, { bids: other.bids || [other.bid], drops: [drops[0]] }) : other.claims) : null;
+        const his = other ? (other.drops.join() !== drops[0] ? await applyGroup(other, { pairs: (other.bids || [other.bid]).map(b => ({ b, d: drops[0] })) }) : other.claims) : null;
         const blocks = [];
         for (const x of groups) { if (other && x.pid === other.pid) continue; blocks.push({ ts: x.pid === g.pid ? mine : x.claims }); if (x.pid === g.pid && other) blocks.push({ ts: his }); }
         await orderBlocks(blocks);
@@ -6963,14 +7100,21 @@ function dropField(o, pid) {
             : h('button', { class: 'lnk', type: 'button', 'data-act': 'drop-more', 'aria-expanded': 'false', onclick: () => { o.more = true; render(); } }, 'someone else', foldCaret(false))));
 }
 // a condition under its claim; × takes it out (in the claim's Edit, so Save confirms it)
-const ifLine = (cond, then, rm) => h('div', { class: 'txif' }, h('span', { class: 'ifk' }, 'IF'), h('span', null, cond), h('span', { class: 'ifa', 'aria-hidden': 'true' }, '→'), h('span', { class: 'ift' }, then),
+// the condition and what it does wrap together; the × stays at the line's top right
+const ifLine = (cond, then, rm) => h('div', { class: 'txif' }, h('span', { class: 'ifk' }, 'IF'), h('span', { class: 'ifb' }, h('span', null, cond), h('span', { class: 'ifa', 'aria-hidden': 'true' }, '→'), h('span', { class: 'ift' }, then)),
     rm ? h('button', { class: 'txifx', type: 'button', 'data-act': 'if-remove', title: 'Take this condition out', 'aria-label': 'Take this condition out', onclick: rm }, '×') : null);
 const ruleTx = (cond, then, rm) => h('div', { class: 'txrule' }, h('div', null, h('span', { class: 'ifk' }, 'IF'), h('span', { class: 'ifc' }, cond), rm ? h('button', { class: 'lnk', type: 'button', 'data-act': 'rule-remove', onclick: rm }, 'remove') : null),
     h('div', null, h('span', { class: 'thk' }, 'THEN'), then));
 // the rules on a claim, and the ones that can still be added to it
 function rulesTx(o, groups) {
     const kids = [ruleTx('I win him', ['drop ', dropSel(o, 0)])];
-    for (let i = 1; i < o.drops.length; i++) kids.push(ruleTx(o.drops[i - 1] ? `${lastNm(o.drops[i - 1])} has already gone` : 'no spot is open by then', ['drop ', dropSel(o, i), ' instead'], () => { o.drops.splice(i, 1); render(); }));
+    const faab = waiverInfo().faab && o.waiv !== false;
+    for (let i = 1; i < o.drops.length; i++) { const b = Math.min(o.bid, ((o.dbids || [])[i - 1] ?? o.bid));
+        // "IF no spot is open THEN drop [him] and bid [this]": one claim, its own drop and its own bid
+        kids.push(ruleTx(o.drops[i - 1] && o.drops[i - 1] === o.drops[i] ? `I can’t pay $${o.bid} by then` : o.drops[i - 1] ? `${lastNm(o.drops[i - 1])} has already gone` : 'no spot is open by then',
+            ['drop ', dropSel(o, i), faab ? h('span', { class: 'andbid' }, 'and bid ', h('select', { class: 'sel txsel', 'data-act': 'dropbid-sel', 'aria-label': 'What this claim bids', onchange: (e) => { const v = Number(e.target.value); o.dbids = o.dbids || []; o.dbids[i - 1] = v === o.bid ? null : v; render(); } },
+                ...Array.from({ length: Math.max(0, o.bid) + 1 }, (_, v) => o.bid - v).map(v => h('option', { value: v, selected: v === b }, `$${v}`)))) : null],
+            () => { o.drops.splice(i, 1); if (o.dbids) o.dbids.splice(i - 1, 1); render(); })); }
     (o.backs || []).forEach((b, i) => {
         const prev = i ? o.backs[i - 1] : o.bid, max = Math.max(0, prev - 1);
         kids.push(ruleTx(b === 0 ? 'I’m out of FAAB by then' : `I can’t pay $${prev} by then`, ['bid ', h('select', { class: 'sel txsel', 'data-act': 'backbid-sel', 'aria-label': 'Your back-up bid', onchange: (e) => { o.backs[i] = Number(e.target.value); render(); } },
@@ -6989,7 +7133,7 @@ function condMenu(o, groups) {
     const add = (label, fn, off) => items.push(h('button', { class: 'txmi', type: 'button', disabled: !!off, title: off || null, onclick: () => { fn(); o.cond = true; o.adding = false; render(); } }, ...label));
     const IF = (t) => [h('span', { class: 'ifk' }, 'IF'), ` ${t} `, h('span', { class: 'thk' }, 'THEN')];
     // the player is chosen by you: the new rule opens with nobody in it
-    add([...IF(last ? `${lastNm(last)} has already gone` : 'no spot is open by then'), last ? ' drop someone else' : ' drop someone'], () => { o.drops.push(''); });
+    add([...IF(last ? `${lastNm(last)} has already gone` : 'no spot is open by then'), last ? ' drop someone else' : ' drop someone', waiverInfo().faab && o.waiv !== false ? ' and bid' : ''], () => { o.drops.push(''); (o.dbids = o.dbids || []).push(null); });
     if (waiverInfo().faab && o.waiv !== false) { const lowest = (o.backs || []).length ? o.backs[o.backs.length - 1] : o.bid;
         add([...IF(lowest > 0 && !(o.backs || []).length ? 'I’m out of FAAB by then' : `I can’t pay $${lowest} by then`), ' bid less'], () => { o.backs = [...(o.backs || []), 0]; }, lowest > 0 ? null : 'There is nothing below a $0 bid'); }
     if (groups && o.second == null) { const k = groups.filter(x => x.pid !== o.pid && !x.secondOf).length;
@@ -7004,9 +7148,14 @@ function claimRowTx(g, n, groups, items, move) {
     const it = !ed ? (items || []).find(x => x.g && x.g.pid === g.pid && liveWarn(x)) : null;
     const dropEl = (d) => (d ? [h('span', { class: 'dir out' }, 'DROP'), ' ', h('b', null, pname(d))] : 'no drop · uses an open spot');
     // the fix, inside the flag: a back-up bid is filed at once; a drop is yours to choose
+    const R = pairRules(g), ps = g.pairs || [];
+    // a back-up bid for every drop the claim already has, so the money case is covered whichever drop is in play
+    const withBid = (b) => [...ps, ...[...new Set(ps.map(x => x.d))].map(d => ({ b, d }))].filter((x, i, a) => a.findIndex(y => y.b === x.b && y.d === x.d) === i).map((x, i) => [x, i]).sort((a, c) => c[0].b - a[0].b || a[1] - c[1]).map(x => x[0]);
     const fix = !it ? null : it.warn === 'cash'
-        ? h('button', { class: 'btn xs p', type: 'button', 'data-act': 'flag-bid', 'data-txn': id, disabled: !!tx.busy, onclick: () => txWrite(() => saveClaimGroup(g, { bids: [...(g.bids || [g.bid]), it.fix].filter((v, i, a) => a.indexOf(v) === i).sort((a, b) => b - a), drops: g.drops }, groups), `${lastNm(g.pid)}: a $${it.fix} back-up bid is filed`) }, `Bid $${it.fix} then`)
-        : h('button', { class: 'btn xs p', type: 'button', 'data-act': 'flag-choose', 'data-txn': id, onclick: () => openEdit(g, second, { cond: true, drops: [...g.drops, ''] }) }, it.warn === 'room' ? 'Choose a drop for that case' : 'Choose a back-up drop');
+        ? h('button', { class: 'btn xs p', type: 'button', 'data-act': 'flag-bid', 'data-txn': id, disabled: !!tx.busy, onclick: () => txWrite(() => saveClaimGroup(g, { pairs: withBid(it.fix) }, groups), `${lastNm(g.pid)}: a $${it.fix} back-up bid is filed`) }, `Bid $${it.fix} then`)
+        // no spot (or the drop gone) and the money spent too: the drop is yours to pick, the back-up bid comes with it, both one condition's worth
+        : h('button', { class: 'btn xs p', type: 'button', 'data-act': 'flag-choose', 'data-txn': id, onclick: () => openEdit(g, second, { cond: true, drops: [...R.drops, ''], dbids: [...R.dbids, it.broke ? it.fix : null] }) },
+            it.warn === 'room' ? (it.broke ? `Choose a drop and bid $${it.fix}` : 'Choose a drop for that case') : it.broke ? `Choose a back-up drop and bid $${it.fix}` : 'Choose a back-up drop');
     const row = h('div', { class: `txcl${ed ? ' open' : ''}${fresh ? ' txfresh' : ''}${it ? ' wr' : ''}`, 'data-claim': id, 'data-pid': g.pid, 'data-warn': it ? it.warn : null },
         h('span', { class: 'ordc' }, move && move.up ? h('button', { class: 'txord', type: 'button', 'data-act': 'claim-up', 'data-txn': id, title: `Try ${lastNm(g.pid)} earlier`, 'aria-label': `Try ${lastNm(g.pid)} earlier`, disabled: !!tx.busy, onclick: move.up }, '▲') : null,
             h('span', { class: 'ord', title: `Tried ${ordinal(n)}` }, n),
@@ -7019,8 +7168,12 @@ function claimRowTx(g, n, groups, items, move) {
             onclick: () => (ed ? (dirty ? saveEdit(g, second) : (tx.edit = null, render())) : openEdit(g, second)) }, ed ? (dirty || empty ? (tx.busy ? 'Saving…' : 'Save') : 'Done') : 'Edit'));
     if (!ed) {
         const out = (more) => () => openEdit(g, second, Object.assign({ cond: true }, more));
-        const ifs = g.drops.slice(1).map((d, i) => ifLine(g.drops[i] ? `${lastNm(g.drops[i])} has already gone` : 'no spot is open', dropEl(d), out({ drops: g.drops.filter((x, j) => j !== i + 1) })));
-        (g.bids || []).slice(1).forEach((b, i) => ifs.push(ifLine(b === 0 ? 'I’m out of FAAB by then' : `I can’t pay $${g.bids[i]} by then`, [h('span', { class: 'thk' }, 'BID'), ' ', h('b', { class: 'am' }, `$${b}`), ' instead'], out({ backs: g.bids.slice(1).filter((x, j) => j !== i) }))));
+        // each back-up is one claim, said the way its rule reads: "IF no spot is open → DROP Vidal and BID $0"
+        const bidEl = (b) => [h('span', { class: 'thk' }, 'BID'), ' ', h('b', { class: 'am' }, `$${b}`)];
+        const ifs = R.drops.slice(1).map((d, i) => { const b = R.dbids[i] ?? R.bid;
+            return ifLine(R.drops[i] && R.drops[i] === d ? `I can’t pay $${R.bid} by then` : R.drops[i] ? `${lastNm(R.drops[i])} has already gone` : 'no spot is open', [dropEl(d), b !== R.bid && wi.faab ? [' and ', ...bidEl(b)] : null],
+                out({ drops: R.drops.filter((x, j) => j !== i + 1), dbids: R.dbids.filter((x, j) => j !== i) })); });
+        R.backs.forEach((b, i) => ifs.push(ifLine(b === 0 && !i ? 'I’m out of FAAB by then' : `I can’t pay $${i ? R.backs[i - 1] : R.bid} by then`, [...bidEl(b), ' instead'], out({ backs: R.backs.filter((x, j) => j !== i) }))));
         if (second) ifs.push(ifLine('I don’t get him', [h('span', { class: 'dir in' }, 'ADD'), ' ', h('b', null, pname(second.pid)), wi.faab ? ` for $${second.bid}` : '', ' instead, same drop'], out({ second: null })));
         return [row, ...ifs];
     }
@@ -7074,12 +7227,13 @@ function pickPanel(pk) {
     kids.push(pk.cond ? rulesTx(pk, null) : dropField(pk, pk.pid));
     // what this claim would run into among the ones already filed, said before it is filed
     if (pk.waiv && !editEmpty(pk)) {
-        const me = { pid: pk.pid, bid: pk.bid, bids: editBids(pk), drops: editDrops(pk), secondOf: null };
+        const me = { pid: pk.pid, bid: pk.bid, bids: editBids(pk), drops: editDrops(pk), pairs: editPairs(pk), secondOf: null };
         const it = claimStory([...groups.filter(g => g.pid !== pk.pid), me], open, { faab: !!wi.faab, left: faabLeft(S.myRoster), name: lastNm }).find(x => x.warn && x.g === me);
         if (it) kids.push(h('div', { class: 'txsugl' }, h('span', { class: 'wf' }, warnIcon()), it.say.map(p => (typeof p === 'string' ? p : p.b != null ? h('b', null, p.b) : p.am)),
             h('div', { class: 'txsug' }, it.warn === 'cash'
                 ? h('button', { class: 'btn sm s', type: 'button', 'data-act': 'pick-backbid', onclick: () => { pk.backs = [...(pk.backs || []), it.fix]; pk.cond = true; render(); } }, `Also bid $${it.fix} for that case`)
-                : h('button', { class: 'btn sm s', type: 'button', 'data-act': 'pick-choose', onclick: () => { pk.drops.push(''); pk.cond = true; render(); } }, it.warn === 'room' ? 'Choose a drop for that case' : 'Choose a back-up drop'))));
+                : h('button', { class: 'btn sm s', type: 'button', 'data-act': 'pick-choose', onclick: () => { pk.drops.push(''); (pk.dbids = pk.dbids || []).push(it.broke ? it.fix : null); pk.cond = true; render(); } },
+                    `${it.warn === 'room' ? 'Choose a drop' : 'Choose a back-up drop'}${it.broke ? ` and bid $${it.fix}` : ''} for that case`))));
     }
     const needs = !pk.drops[0] && open <= 0, empty = editEmpty(pk), bids = editBids(pk);
     kids.push(h('div', { class: 'txedf' }, h('button', { class: 'btn p', type: 'button', 'data-act': 'composer-submit', disabled: needs || empty || !!tx.busy, title: needs ? 'Your roster is full: pick who is dropped' : empty ? 'Pick a player for the condition you added first' : null, onclick: () => filePick(pk) },
@@ -8080,9 +8234,13 @@ function scorersCard(started) {
 // has just kicked off is expected to have about nothing yet, so he sits on the
 // line instead of at −19. Halfway through he is held to half of it; at the
 // final whistle, to all of it. Players projected under 6 stay out, or a backup
-// 0.4 under would top the list.
+// 0.4 under would top the list. A D/ST waits for its final whistle: its points-
+// and yards-allowed bonus counts in full from kickoff while the pace grows with
+// the clock, so mid-game every defence read as a big beat (2026-10-18: PIT 12.75
+// against "2.4", the user asking why the D/ST projections were all so low).
 function overUnderCard(started) {
-    const all = started.filter(x => x.proj >= 6 && x.played > 0)
+    const liveDst = started.filter(x => ppos(x.pid) === 'DEF' && x.played > 0 && x.played < 1).length;
+    const all = started.filter(x => x.proj >= 6 && x.played > 0 && !(ppos(x.pid) === 'DEF' && x.played < 1))
         .map(x => { const exp = x.proj * x.played; return { ...x, exp, gap: x.pts - exp }; })
         .filter(x => Math.abs(x.gap) >= 0.5);
     const head = s6Head('Over / under performers', 'against his projection so far');
@@ -8104,7 +8262,7 @@ function overUnderCard(started) {
                 h('span', { class: `oubar ${isOver ? 'up' : 'dn'}`, style: `${isOver ? 'left' : 'right'}:50%;width:${w}%` }),
                 h('span', { class: `ouval mono ${isOver ? 'up' : 'dn'}`, style: `${isOver ? 'left' : 'right'}:calc(${50 + w}% + 5px)` }, `${isOver ? '+' : '−'}${fmt1(Math.abs(x.gap))}`)),
             h('span', { class: `ouact mono ${isOver ? 'up' : 'dn'}` }, fmtS(x.pts), live ? h('i', { class: 'oulive', title: 'still playing' }) : null),
-            h('span', { class: 'ouproj mono' }, fmt1(x.exp)));
+            h('span', { class: 'ouproj mono' }, fmt1(x.exp), live ? h('small', null, `of ${fmt1(x.proj)}`) : null));
     };
     const chip = (k, label, n) => h('span', { class: k === f ? 'on' : '', onclick: (e) => { e.stopPropagation(); S.ui.ouFilter = k; render(); } }, label, h('i', null, ` ${n}`));
     const rows = [];
@@ -8113,9 +8271,10 @@ function overUnderCard(started) {
     return h('div', { class: 'card s6feed' }, head,
         h('div', { class: 'seg ouseg' }, chip('both', 'Both', all.length), chip('over', 'Over', over.length), chip('under', 'Under', under.length)),
         h('div', { class: 'ouaxis' }, h('span'), h('span'), s6Ticks([[0, 'under'], [50, 'on pace'], [100, 'over']]),
-            h('span', { class: 's6colh' }, 'ACT'), h('span', { class: 's6colh' }, 'PROJ')),
+            h('span', { class: 's6colh' }, 'ACT'), h('span', { class: 's6colh', title: 'His projection for the share of his game played so far; under it, his projection for the whole game' }, 'BY NOW')),
         rows.length ? h('div', { class: 's6list', 'data-keep': 'sixou' }, ...rows)
-            : h('div', { class: 'empty' }, f === 'over' ? 'Nobody is beating his projection yet.' : 'Nobody is missing his projection.'));
+            : h('div', { class: 'empty' }, f === 'over' ? 'Nobody is beating his projection yet.' : 'Nobody is missing his projection.'),
+        liveDst ? h('div', { class: 'cap ounote' }, `${liveDst === 1 ? 'One D/ST joins' : `${liveDst} D/STs join`} when ${liveDst === 1 ? 'its game ends' : 'their games end'}: points and yards allowed only settle at the final whistle.`) : null);
 }
 function allSixPage() {
     const page = h('div', { class: 'page allsix' });
@@ -8240,8 +8399,8 @@ async function loadGameBox(g, nPlays) {
 }
 function gcChip(pid, pts, oppR) {
     const o = gcOwner(pid, oppR), ln = ppos(pid) === 'DEF' ? `${pid} D/ST` : (P(pid) || {}).last_name || pname(pid);
-    return h('span', { class: `gcchip ${o.cls} ${pts < 0 ? 'neg' : ''}`, title: `${pname(pid)} · ${o.cls === 'fa' ? 'available in your league' : o.label === 'YOURS' ? 'your player' : o.label === 'THEIRS' ? `${teamName(o.R)} (your opponent)` : o.label}`, onclick: (e) => { e.stopPropagation(); S.ui.sel = pid; render(); } },
-        ln, ' ', h('b', null, `${pts > 0 ? '+' : pts < 0 ? '−' : ''}${fmtS(Math.abs(pts))}`), ' ', h('i', null, o.cls === 'oth' ? o.label.slice(0, 14) : o.label));
+    return h('span', { class: `gcchip ${o.cls} ${pts < 0 ? 'neg' : ''}`, title: `${pname(pid)} · ${o.cls === 'fa' ? 'available in your league' : o.label === 'YOURS' ? 'your player' : o.label === 'THEIRS' ? `${teamName(o.R)} (your opponent)` : o.label}`, role: 'button', tabindex: '0', onclick: (e) => { e.stopPropagation(); S.ui.sel = pid; render(); }, onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); S.ui.sel = pid; render(); } } },
+        h('img', { class: 'gcchf', src: ppos(pid) === 'DEF' ? teamLogo(pid) : headshot(pid), alt: '', onerror: hideBroken }), ln, ' ', h('b', null, `${pts > 0 ? '+' : pts < 0 ? '−' : ''}${fmtS(Math.abs(pts))}`));
 }
 function gcPickDefault(games) {
     const stake = (g) => { const s = gcStake(g); return s.mine.length * 2 + s.opps.length; };
@@ -8305,7 +8464,7 @@ function gameCenterPage() {
         fav ? h('span', null, `Line: ${fav[0]} ${fav[1] > 0 ? '+' : ''}${fav[1]}`) : null);
     // ── the field, while it is live
     const lastPlay = plays.length ? plays[plays.length - 1].metadata : null;
-    let field = null;
+    let field = null, nowTxt = null;
     if (g.live && lastPlay) {
         const pos = g.pos || lastPlay.possession, def = pos === g.home ? g.away : g.home;
         const ylt = g.ylt || lastPlay.yard_line_territory_end, yl = g.yl !== '' && g.yl != null ? Number(g.yl) : lastPlay.yard_line_end;
@@ -8315,6 +8474,8 @@ function gameCenterPage() {
             const drives0 = gcDrives(plays), lastD = drives0[drives0.length - 1], curD = lastD && lastD.pos === pos && lastD.result === 'In progress' ? lastD : null;
             const startYds = curD ? (curD.plays[0].metadata.yard_line_territory === pos ? curD.plays[0].metadata.yard_line : 100 - curD.plays[0].metadata.yard_line) : ownYds;
             const goal = dist != null && (100 - ownYds) <= dist;
+            const nowDd = g.dd || (down && dist != null ? `${['', '1st', '2nd', '3rd', '4th'][down]} & ${goal ? 'Goal' : dist}` : '');
+            nowTxt = { pos, txt: `${pos} ball${nowDd ? `, ${nowDd}` : ''} at ${ylt} ${yl}`, fresh: !curD };
             field = h('div', { class: 'gcfield-wrap' },
                 h('div', { class: 'gcfield' }, h('span', { class: 'ez l' }, pos), h('span', { class: 'ez r' }, def),
                     h('span', { class: 'drv', style: `left:${Math.min(X(startYds), X(ownYds))}%;width:${Math.abs(X(ownYds) - X(startYds))}%` }),
@@ -8324,59 +8485,113 @@ function gameCenterPage() {
                     curD ? h('span', null, `drive: ${curD.n} plays · ${curD.yds} yds`) : null, (g.rz || (ylt === def && yl <= 20)) ? h('span', { class: 'rz' }, 'RED ZONE') : null));
         }
     }
-    // ── in this game
-    const mm = myMatchup(S.week);
-    const ptsOf = (pid, m) => ((m && m.players_points) || {})[pid];
-    const boxPts = {}; if (box) for (const r of box.list) { const pid = String(r.player_id); if (GC_POS.has(ppos(pid))) { const v = scoreStats(r.stats || {}); if (v != null) boxPts[pid] = v; } }
-    const statLn = (pid) => (gameStatAtoms(pid) || []).join(' · ');
-    const prow = (pid, pts, sub, extra) => h('div', { class: 'gcpr', onclick: () => { S.ui.sel = pid; render(); } },
-        h('div', { class: 'avatar sm' }, h('img', { src: headshot(pid), alt: '', onerror: (e) => e.target.remove() })),
-        h('div', { class: 'n' }, h('div', null, pname(pid), extra), h('small', { class: 'mono' }, sub)),
-        h('div', { class: 'v mono' }, pts == null ? '—' : fmtS(pts), projOf(pid, S.week) != null ? h('small', null, `${fmt1(projOf(pid, S.week))} proj`) : null));
-    const skCard = (cls, title, who, rows, empty) => h('div', { class: `gcsk ${cls}` }, h('h5', null, h('span', null, title), who ? h('span', { class: 'who' }, who) : null), ...(rows.length ? rows : [h('div', { class: 'gcnone' }, empty)]));
-    const boxRows = Object.entries(boxPts).map(([pid, pts]) => ({ pid, pts, o: gcOwner(pid, oppR) })).sort((a, b) => b.pts - a.pts);
-    const stake = h('div', { class: 'gcstake' },
-        skCard('me', 'Yours', S.myRoster ? teamName(S.myRoster) : '', myStarters.map(pid => prow(pid, started2 ? (ptsOf(pid, mm && mm.mine) ?? boxPts[pid]) : null, `${ppos(pid)}${statLn(pid) ? ' · ' + statLn(pid) : ''}`)), 'No starters in this game'),
-        skCard('opp', 'Theirs', oppR ? teamName(oppR) : '', oppStarters.map(pid => prow(pid, started2 ? (ptsOf(pid, mm && mm.opp) ?? boxPts[pid]) : null, `${ppos(pid)}${statLn(pid) ? ' · ' + statLn(pid) : ''}`)), oppR ? 'No starters in this game' : 'No opponent this week'),
-        skCard('fa', 'Available in your league', '', boxRows.filter(r => r.o.cls === 'fa' && r.pts >= 3).slice(0, 3).map(r => prow(r.pid, r.pts, `${ppos(r.pid)} ${(P(r.pid) || {}).team || ''}${statLn(r.pid) ? ' · ' + statLn(r.pid) : ''}`,
-            h('span', { class: 'gcadd', onclick: (e) => { e.stopPropagation(); openComposer(r.pid, onWaiversNow(r.pid)); go('players'); } }, onWaiversNow(r.pid) ? '+ Claim' : '+ Add'))), started2 ? 'No free agent has scored 3 yet' : 'Nobody has played yet'),
-        skCard('', 'Around the league', 'other managers', boxRows.filter(r => r.o.cls === 'oth').slice(0, 3).map(r => prow(r.pid, r.pts, `${r.o.label} · ${ppos(r.pid)}`)), started2 ? 'Nothing yet' : 'Nobody has played yet'));
-    // ── plays, by drive
-    const filter = S.ui.gcFilter || 'fantasy';
-    const matchupSet = new Set([...myStarters, ...oppStarters]);
-    const keepPlay = (p, fx) => filter === 'all' ? true : filter === 'mine' ? fx.some(x => matchupSet.has(x.pid)) : fx.length > 0 || p.metadata.is_scoring_play || /INTERCEPTED|FUMBLES/i.test(p.metadata.description || '');
+    // ── play by play, under the score: one drive at a time, newest play first, six of them with the rest of the
+    // drive one press away and the other drives a step either side (the user, 2026-10-20: play by play "closer to
+    // the top score/field widget", "a reasonable limit to how many recent plays it shows, with the option to go to
+    // previous drives").
     const drives = gcDrives(plays);
-    if (!S.ui.gcOpen || S.ui.gcOpenFor !== g.gid) {
-        S.ui.gcOpenFor = g.gid; S.ui.gcOpen = new Set();
-        drives.forEach((d, i) => { if (['Touchdown', 'Field goal'].includes(d.result) || Object.keys(d.fx).some(pid => matchupSet.has(pid)) || (g.live && i === drives.length - 1)) S.ui.gcOpen.add(d.key); });
-    }
+    if (S.ui.gcDrvFor !== g.gid) { S.ui.gcDrvFor = g.gid; S.ui.gcDrv = null; S.ui.gcMore = false; S.ui.gcList = false; }
+    const di = S.ui.gcDrv == null || S.ui.gcDrv >= drives.length ? drives.length - 1 : S.ui.gcDrv, d = drives[di];
     const resTag = (d) => d.result === 'Touchdown' ? ['td', 'TD'] : d.result === 'Field goal' ? ['fg', 'FG'] : /^Interception/.test(d.result) ? ['to', 'INT'] : /^Fumble/.test(d.result) ? ['to', 'FUM'] : d.result === 'Safety' ? ['to', 'SAFETY'] : d.result === 'Turnover on downs' ? ['to', 'DOWNS'] : d.result === 'In progress' ? ['live', 'LIVE'] : /^End/.test(d.result) ? ['end', 'END'] : ['punt', d.result === 'Missed field goal' ? 'MISS' : 'PUNT'];
     const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
-    const driveEls = drives.slice().reverse().map((d) => {
-        const open = S.ui.gcOpen.has(d.key);
-        const fx = Object.entries(d.fx).filter(([, v]) => Math.abs(v) >= 0.5).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 4);
-        const [rc, rl] = resTag(d);
-        const quiet = !fx.length && !['td', 'fg', 'to', 'live'].includes(rc);
-        if (filter === 'mine' && !Object.keys(d.fx).some(pid => matchupSet.has(pid))) return null;
-        const el = h('div', { class: `gcdrive ${quiet ? 'quiet' : ''}` },
-            h('div', { class: 'gcdh', onclick: () => { if (open) S.ui.gcOpen.delete(d.key); else S.ui.gcOpen.add(d.key); render(); } },
-                h('img', { class: 'gclogo', src: teamLogo(d.pos), alt: '' }),
-                h('div', null, h('div', { class: 'res' }, h('span', { class: `gcrc ${rc}` }, rl), `${d.pos} ${d.result === 'In progress' ? 'drive in progress' : d.result}`),
-                    h('div', { class: 'sum mono' }, `${playQuarter(d.q)} ${d.start} · ${d.n} play${d.n === 1 ? '' : 's'} · ${d.yds} yds · ${mmss(d.dur)} · from ${d.startYl}`)),
-                foldCaret(open, 'chev'),
-                fx.length ? h('div', { class: 'fx' }, ...fx.map(([pid, v]) => gcChip(pid, v, oppR))) : null));
-        if (open) for (const p of d.plays.concat(d.after).slice().reverse()) {
-            const m = p.metadata, pfx = gcPlayFx(p);
-            if (!keepPlay(p, pfx) && !(filter !== 'all' && /extra_point/.test(m.play_type) && pfx.length)) continue;
-            const goal = m.yards_to_end_zone != null && m.distance != null && m.yards_to_end_zone <= m.distance;
-            const dd = m.down ? `${['', '1st', '2nd', '3rd', '4th'][m.down]} & ${goal ? 'Goal' : m.distance} · ${m.yard_line_territory || ''} ${m.yard_line ?? ''}` : /extra_point/.test(m.play_type) ? 'PAT' : '';
-            el.append(h('div', { class: `gcplay ${m.is_scoring_play ? 'sc' : ''} ${/INTERCEPTED|FUMBLES/i.test(m.description || '') ? 'bad' : ''}` },
-                h('span', { class: 'cl mono' }, `${playQuarter(m.quarter_name)} ${m.time_remaining_minutes ?? ''}:${String(m.time_remaining_seconds ?? 0).padStart(2, '0')}`), h('span', { class: 'dd mono' }, dd), h('span', { class: 'ds' }, m.description || m.fantasy_description || ''),
-                pfx.length ? h('div', { class: 'fx' }, ...pfx.map(x => gcChip(x.pid, x.pts, oppR))) : null));
-        }
-        return el;
-    }).filter(Boolean);
-    const playsCol = h('div', null, ...(driveEls.length ? driveEls : [h('div', { class: 'card' }, h('div', { class: 'empty' }, started2 ? (filter === 'mine' ? 'No plays involving your matchup yet.' : 'No plays yet.') : `No plays yet — kicks off ${day(g.t)} ${kick(g.t)}.`))]));
+    // the newest drive is held as null, so a new drive replaces it on screen as it starts
+    const tap = (fn, focus) => ({ role: 'button', tabindex: '0', 'data-focus': focus, onclick: fn, onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(e); } } });
+    const goDrv = (n) => { S.ui.gcDrv = n >= drives.length - 1 ? null : n; S.ui.gcMore = false; S.ui.gcList = false; render(); };
+    const drvName = (x) => `${x.pos} ${x.result === 'In progress' ? 'drive in progress' : x.result}`;
+    const playRow = (p) => {
+        const m = p.metadata, pfx = gcPlayFx(p);
+        const goal = m.yards_to_end_zone != null && m.distance != null && m.yards_to_end_zone <= m.distance;
+        const dd = m.down ? `${['', '1st', '2nd', '3rd', '4th'][m.down]} & ${goal ? 'Goal' : m.distance} · ${m.yard_line_territory || ''} ${m.yard_line ?? ''}` : /extra_point/.test(m.play_type) ? 'PAT' : '';
+        return h('div', { class: `gcplay ${m.is_scoring_play ? 'sc' : ''} ${/INTERCEPTED|FUMBLES/i.test(m.description || '') ? 'bad' : ''}` },
+            h('span', { class: 'cl mono' }, `${playQuarter(m.quarter_name)} ${m.time_remaining_minutes ?? ''}:${String(m.time_remaining_seconds ?? 0).padStart(2, '0')}`), h('span', { class: 'dd mono' }, dd),
+            h('span', { class: 'ds' }, m.description || ''), pfx.length ? h('div', { class: 'fx' }, ...pfx.map(x => gcChip(x.pid, x.pts, oppR))) : null);
+    };
+    let pbp;
+    if (!d) pbp = h('div', { class: 'card gcpbp' }, h('div', { class: 'gcpbh' }, h('h3', null, 'Play by play')), h('div', { class: 'gcnone' }, started2 ? 'No plays yet.' : `No plays yet: it kicks off ${day(g.t)} ${kick(g.t)}.`));
+    else {
+        const all = d.plays.concat(d.after).sort((a, b) => (b.metadata.sequence || 0) - (a.metadata.sequence || 0)), shown = S.ui.gcMore ? all : all.slice(0, 6), [rc, rl] = resTag(d);
+        pbp = h('div', { class: 'card gcpbp' },
+            h('div', { class: 'gcpbh' }, h('h3', null, 'Play by play'), h('span', { class: 'shm' }, `newest first · drive ${di + 1} of ${drives.length}`),
+                h('span', { class: 'gcnav' },
+                    h('button', { class: 'btn sm', type: 'button', 'data-act': 'gc-prev', disabled: di <= 0, onclick: () => goDrv(di - 1) }, '‹ Previous drive'),
+                    h('button', { class: 'btn sm', type: 'button', 'data-act': 'gc-next', disabled: di >= drives.length - 1, onclick: () => goDrv(di + 1) }, 'Next drive ›'),
+                    h('button', { class: 'btn sm s', type: 'button', 'data-act': 'gc-drives', 'aria-expanded': String(!!S.ui.gcList), onclick: () => { S.ui.gcList = !S.ui.gcList; render(); } }, `All ${drives.length} drives `, foldCaret(!!S.ui.gcList)))),
+            S.ui.gcList ? h('div', { class: 'gcdlist' }, ...drives.map((x, n) => n).reverse().map((n) => {
+                const x = drives[n], [c2, l2] = resTag(x), top = Object.entries(x.fx).filter(([, v]) => Math.abs(v) >= 0.5).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 3);
+                return h('div', { class: `gcdl ${n === di ? 'on' : ''}`, 'data-drive': n, ...tap(() => goDrv(n), `gcdl:${n}`) }, h('img', { class: 'gclogo', src: teamLogo(x.pos), alt: '' }), h('span', { class: `gcrc ${c2}` }, l2),
+                    h('b', null, drvName(x)), h('span', { class: 'shm' }, `${playQuarter(x.q)} ${x.start} · ${x.n} play${x.n === 1 ? '' : 's'} · ${x.yds} yds`), h('span', { class: 'fx' }, ...top.map(([pid, v]) => gcChip(pid, v, oppR)))); })) : null,
+            nowTxt && di === drives.length - 1 ? h('div', { class: 'gcnow' }, h('img', { class: 'gclogo', src: teamLogo(nowTxt.pos), alt: '' }), h('span', { class: 'gcrc live' }, 'LIVE'), h('b', null, nowTxt.txt),
+                nowTxt.fresh && d.pos !== nowTxt.pos ? h('span', { class: 'shm' }, `drive starting after ${d.result === 'In progress' ? `the ${d.pos} drive` : `a ${d.pos} ${d.result.toLowerCase()}`}`) : null) : null,
+            h('div', { class: 'gcdh' }, h('img', { class: 'gclogo', src: teamLogo(d.pos), alt: '' }),
+                h('div', null, h('div', { class: 'res' }, h('span', { class: `gcrc ${rc}` }, rl), drvName(d)), h('div', { class: 'sum mono' }, `${playQuarter(d.q)} ${d.start} · ${d.n} play${d.n === 1 ? '' : 's'} · ${d.yds} yds · ${mmss(d.dur)} · from ${d.startYl}`))),
+            ...shown.map(playRow),
+            all.length > shown.length ? h('div', { class: 'gcmore' }, `${all.length - shown.length} earlier play${all.length - shown.length === 1 ? '' : 's'} in this drive · `,
+                h('button', { class: 'lnk', type: 'button', 'data-act': 'gc-more', onclick: () => { S.ui.gcMore = true; render(); } }, 'show')) : null);
+    }
+    // ── the players, a column a team and a group a position. Points draws each one's projection on his bar (the
+    // fill scored, the outline his projection for the game, the tick that projection's share for the game played);
+    // Box score is the stat columns, every position on one grid so the columns line up group to group. Whose he is
+    // shows as that fantasy team's picture (the user, 2026-10-20).
+    const plMode = S.ui.gcPl === 'box' ? 'box' : 'pts';
+    const skill = box ? box.list.filter(r => GC_POS.has(ppos(String(r.player_id)))).map(r => { const pid = String(r.player_id), st = r.stats || {}; return { pid, st, pts: scoreStats(st) || 0, team: r.team || (P(pid) || {}).team, pos: ppos(pid) }; })
+        .filter(r => r.pts || r.st.pass_att || r.st.rush_att || r.st.rec_tgt || r.st.fga || r.st.xpa) : [];
+    const playedOf = (pid) => g.over ? 1 : started2 ? Math.max(0, Math.min(1, 1 - gameFracLeft(pid))) : 0;
+    const barMax = Math.max(12, ...skill.map(r => Math.max(r.pts, projOf(r.pid, S.week) || 0)));
+    const ownCell = (pid, compact) => { const o = gcOwner(pid, oppR);
+        if (o.cls === 'fa') return h('span', { class: 'gcown fa', title: 'Available in your league' }, h('span', { class: 'fa2' }, 'FA'),
+            compact ? null : h('button', { class: 'btn xs warn', type: 'button', onclick: (ev) => { ev.stopPropagation(); openComposer(pid, onWaiversNow(pid)); } }, onWaiversNow(pid) ? '+ Claim' : '+ Add'));
+        return h('span', { class: `gcown ${o.cls}`, title: `${teamName(o.R)}${o.cls === 'me' ? ' (yours)' : o.cls === 'opp' ? ' (your opponent this week)' : ''}` }, avatarEl(o.R, 'xs')); };
+    const W = (v) => `${Math.min(100, Math.max(0, v) / barMax * 100)}%`;
+    const ptsRow = (r) => { const pj = projOf(r.pid, S.week), pace = pj != null ? pj * playedOf(r.pid) : null;
+        return h('div', { class: 'gcpl', 'data-pid': r.pid, ...tap(() => { S.ui.sel = r.pid; render(); }) },
+            h('img', { class: 'gcface', src: headshot(r.pid), alt: '', onerror: hideBroken }),
+            h('div', { class: 'n' }, h('b', null, pname(r.pid)), h('small', { class: 'mono' }, ...(gameStatAtoms(r.pid, r.st) || []).flatMap((a, i) => [i ? ' · ' : null, h('span', null, a)]))),
+            ownCell(r.pid),
+            h('div', { class: 'gcpv', title: pj != null ? `${fmt1(r.pts)} scored · ${fmt1(pj)} projected for the game · ${fmt1(pace)} by now` : `${fmt1(r.pts)} scored · no projection` },
+                h('span', { class: 'gcpbar' }, pj != null ? h('i', { class: 'pj', style: `width:${W(pj)}` }) : null, h('i', { class: 'ac', style: `width:${W(r.pts)}` }), pace != null ? h('i', { class: 'pc', style: `left:${W(pace)}` }) : null),
+                h('span', { class: 'nums mono' }, h('b', null, fmtS(r.pts)), pj != null ? ` / ${fmt1(pj)}` : '')));
+    };
+    const BOXC = { QB: [['C/ATT', 'catt'], ['PASS YD', 'passYd'], ['TD-INT', 'tdint'], ['CAR', 'car'], ['RUSH YD', 'rushYd']], RB: [['CAR', 'car'], ['RUSH YD', 'rushYd'], ['REC/TGT', 'rec'], ['REC YD', 'recYd'], ['TD', 'td']],
+        WR: [['REC/TGT', 'rec'], ['REC YD', 'recYd'], ['TD', 'td']], TE: [['REC/TGT', 'rec'], ['REC YD', 'recYd'], ['TD', 'td']], K: [['FG', 'fg'], ['XP', 'xp']] };
+    const bv = { catt: s => s.pass_att ? `${s.pass_cmp || 0}/${s.pass_att}` : null, passYd: s => s.pass_att ? (s.pass_yd || 0) : null, tdint: s => s.pass_att ? `${s.pass_td || 0}-${s.pass_int || 0}` : null,
+        car: s => s.rush_att || null, rushYd: s => s.rush_att ? (s.rush_yd || 0) : null, rec: s => (s.rec_tgt || s.rec) ? `${s.rec || 0}/${Math.max(s.rec_tgt || 0, s.rec || 0)}` : null, recYd: s => (s.rec_tgt || s.rec) ? (s.rec_yd || 0) : null,
+        td: s => ((s.rush_td || 0) + (s.rec_td || 0)) || null, fg: s => s.fga ? `${s.fgm || 0}/${s.fga}` : null, xp: s => s.xpa ? `${s.xpm || 0}/${s.xpa}` : null };
+    const bnum = (v) => v == null ? -1 : Number(String(v).split(/[/-]/)[0]) || 0;
+    // two players with one short name (B. Robinson and B. Robinson) take as much of the first name as tells them apart
+    const SLOTS = 5, byShort = {}; for (const r of skill) (byShort[shortName(r.pid)] = byShort[shortName(r.pid)] || []).push(r.pid);
+    const boxName = (pid) => { const same = byShort[shortName(pid)] || []; if (same.length < 2) return shortName(pid);
+        const nm = (x) => P(x) || {}, f = nm(pid).first_name || '';
+        for (let k = 2; k <= f.length; k++) if (same.every(o => o === pid || (nm(o).first_name || '').slice(0, k) !== f.slice(0, k))) return `${f.slice(0, k)}. ${nm(pid).last_name || ''}`;
+        return pname(pid); };
+    // a header sorts its own position, both teams' columns at once
+    const boxGroup = (ps, grp) => { const cols = BOXC[ps], pad = SLOTS - cols.length, srt = S.ui.gcSort && S.ui.gcSort.ps === ps ? S.ui.gcSort : null;
+        const rows = srt ? grp.slice().sort((a, b) => ((srt.k === 'pts' ? b.pts - a.pts : bnum(bv[srt.k](b.st)) - bnum(bv[srt.k](a.st)))) * srt.dir) : grp;
+        const th = (t, k2) => h('th', { class: `r srt ${srt && srt.k === k2 ? 'on' : ''}`, title: `Sort by ${t}`, 'aria-sort': srt && srt.k === k2 ? (srt.dir > 0 ? 'descending' : 'ascending') : null,
+            ...tap(() => { S.ui.gcSort = srt && srt.k === k2 ? { ps, k: k2, dir: -srt.dir } : { ps, k: k2, dir: 1 }; render(); }, `gcsort:${ps}:${k2}`) }, t);
+        return h('table', { class: 'gcbx' }, h('colgroup', null, h('col'), h('col', { style: 'width:26px' }), ...Array.from({ length: SLOTS }, () => h('col', { style: 'width:54px' })), h('col', { style: 'width:54px' })),
+            h('thead', null, h('tr', null, h('th', null, h('span', { class: `pos txt ${ps}` }, posLabel(ps))), h('th'), ...Array.from({ length: pad }, () => h('th')), ...cols.map(([t, k2]) => th(t, k2)), th('FPTS', 'pts'))),
+            h('tbody', null, ...rows.map(r => h('tr', { 'data-pid': r.pid, ...tap(() => { S.ui.sel = r.pid; render(); }) },
+                h('td', null, h('div', { class: 'bn' }, h('img', { class: 'gcface xs', src: headshot(r.pid), alt: '', onerror: hideBroken }), h('b', { title: pname(r.pid) }, boxName(r.pid)))),
+                h('td', { class: 'owc' }, ownCell(r.pid, true)), ...Array.from({ length: pad }, () => h('td')),
+                ...cols.map(([, k2]) => { const v = bv[k2](r.st); return h('td', { class: `r mono ${v == null ? 'z' : ''}` }, v == null ? '—' : String(v)); }),
+                h('td', { class: 'r mono fpt' }, fmtS(r.pts))))));
+    };
+    const ORDER = ['QB', 'RB', 'WR', 'TE', 'K'];
+    const teamCol = (tm) => { const rows = skill.filter(r => r.team === tm);
+        return h('div', { class: 'gctc', 'data-team': tm }, h('div', { class: 'gctch' }, h('img', { class: 'gclogo', src: teamLogo(tm), alt: '' }), h('b', null, teamNick(tm)), h('span', { class: 'shm' }, rows.length ? `${rows.length} player${rows.length === 1 ? '' : 's'} with a stat` : '')),
+            ...(rows.length ? ORDER.flatMap(ps => { const grp = rows.filter(r => r.pos === ps).sort((a, b) => b.pts - a.pts); if (!grp.length) return [];
+                return plMode === 'box' ? [boxGroup(ps, grp)] : [h('div', { class: 'gcpg' }, h('span', { class: `pos txt ${ps}` }, posLabel(ps))), ...grp.map(ptsRow)]; })
+                : [h('div', { class: 'gcnone' }, started2 ? 'Nobody has a stat yet.' : `It kicks off ${day(g.t)} ${kick(g.t)}.`)]));
+    };
+    const plBtn = (k2, t) => h('span', { class: plMode === k2 ? 'on' : '', 'data-pl': k2, ...tap(() => { S.ui.gcPl = k2; render(); }, `gcpl:${k2}`), role: 'tab', 'aria-selected': String(plMode === k2) }, t);
+    const players = h('div', { class: 'card gcplayers' },
+        h('div', { class: 'gcplh' }, h('h3', null, 'Players'), h('div', { class: 'tabs gcplsw', role: 'tablist', 'aria-label': 'Players view' }, plBtn('pts', 'Points'), plBtn('box', 'Box score')),
+            h('span', { class: 'gclegend' },
+                plMode === 'pts' ? [h('span', null, h('i', { class: 'lk ac' }), 'scored'), h('span', null, h('i', { class: 'lk pj' }), 'projected for the game'), h('span', null, h('i', { class: 'lk pc' }), started2 && !g.over ? 'projected by now' : 'where the projection ends')]
+                    : h('span', null, 'each position its own columns · a header sorts'),
+                S.myRoster ? h('span', { class: 'gcown me' }, avatarEl(S.myRoster, 'xs'), 'yours') : null, oppR ? h('span', { class: 'gcown opp' }, avatarEl(oppR, 'xs'), 'your opponent') : null,
+                h('span', null, 'any other picture: the team that has him · FA: free agent'))),
+        h('div', { class: 'gcteams' }, teamCol(g.away), teamCol(g.home)));
     // ── scoring summary and team stats
     const scoring = plays.map((p, i) => ({ p, i })).filter(({ p }) => p.metadata.is_scoring_play && !/extra_point|two_point/.test(p.metadata.play_type));
     const scoringCard = h('div', { class: 'card gcside-card' }, h('h3', null, 'Scoring', h('small', { class: 'mono' }, `${scoring.length} score${scoring.length === 1 ? '' : 's'}`)),
@@ -8395,27 +8610,7 @@ function gameCenterPage() {
             ['Turnovers', s => (s.pass_int || 0) + (s.fum_lost || 0)], ['Sacks taken', s => s.pass_sack || 0], ['Penalties', s => s.penalty || 0, s => `${s.penalty || 0}-${s.penalty_yd || 0}`], ['Yards / play', s => s.off_yd_per_play || 0]]
             .map(([lab, val, fmt]) => { const va = val(ta), vh = val(th2), tot = (va + vh) || 1;
                 return h('div', { class: 'gctsr' }, h('span', { class: 'l mono' }, fmt ? fmt(ta) : va), h('div', null, h('div', { class: 'lab' }, lab), h('div', { class: 'bars' }, h('span', { class: 'a' }, h('i', { style: `width:${va / tot * 100}%` })), h('span', { class: 'h' }, h('i', { style: `width:${vh / tot * 100}%` })))), h('span', { class: 'r mono' }, fmt ? fmt(th2) : vh)); })) : null;
-    // ── box score
-    const skill = box ? box.list.filter(r => GC_POS.has(ppos(String(r.player_id)))).map(r => ({ pid: String(r.player_id), st: r.stats || {}, pts: scoreStats(r.stats || {}) || 0, team: (P(String(r.player_id)) || {}).team }))
-        .filter(r => r.pts || r.st.pass_att || r.st.rush_att || r.st.rec_tgt || r.st.fga || r.st.xpa)
-        .sort((a, b) => (a.team === g.away ? 0 : 1) - (b.team === g.away ? 0 : 1) || b.pts - a.pts) : [];
-    const dash = (v, show) => show ? v : '—';
-    const boxCard = skill.length ? h('div', { class: 'card gcboxcard' }, h('h3', null, 'Box score', h('small', { class: 'mono' }, 'fantasy points in this league’s scoring')),
-        h('div', { class: 'scroll-x' }, h('table', { class: 'gcbox' },
-            h('tr', null, ...['Player', 'C/ATT', 'PASS YDS', 'TD-INT', 'CAR', 'RUSH YDS', 'REC/TGT', 'REC YDS', 'TD', 'FG', 'FPTS'].map((x, i) => h('th', { class: i ? 'r' : '' }, x))),
-            ...skill.map(r => { const s = r.st, o = gcOwner(r.pid, oppR);
-                return h('tr', { onclick: () => { S.ui.sel = r.pid; render(); } },
-                    h('td', null, h('img', { class: 'gclogo xs', src: teamLogo(r.team), alt: '' }), pname(r.pid), h('span', { class: 'posl' }, ppos(r.pid)), h('span', { class: `own ${o.cls}` }, o.cls === 'oth' ? o.label.slice(0, 16) : o.label)),
-                    h('td', { class: 'r mono' }, dash(`${s.pass_cmp || 0}/${s.pass_att}`, s.pass_att)), h('td', { class: 'r mono' }, dash(s.pass_yd || 0, s.pass_att)), h('td', { class: 'r mono' }, dash(`${s.pass_td || 0}-${s.pass_int || 0}`, s.pass_att)),
-                    h('td', { class: 'r mono' }, dash(s.rush_att, s.rush_att)), h('td', { class: 'r mono' }, dash(s.rush_yd || 0, s.rush_att)),
-                    h('td', { class: 'r mono' }, dash(`${s.rec || 0}/${s.rec_tgt}`, s.rec_tgt)), h('td', { class: 'r mono' }, dash(s.rec_yd || 0, s.rec_tgt)),
-                    h('td', { class: 'r mono' }, dash((s.rush_td || 0) + (s.rec_td || 0), (s.rush_td || 0) + (s.rec_td || 0))), h('td', { class: 'r mono' }, dash(`${s.fgm || 0}/${s.fga}`, s.fga)),
-                    h('td', { class: 'r mono fp' }, fmtS(r.pts)));
-            })))) : null;
-    const seg = h('div', { class: 'tabs gcseg' }, ...[['fantasy', 'Fantasy plays'], ['mine', 'Your matchup'], ['all', 'All plays']].map(([k, t]) => h('span', { class: filter === k ? 'on' : '', onclick: () => { S.ui.gcFilter = k; render(); } }, t)));
-    const main = h('div', { class: 'gcmain' }, bug, meta, field, stake,
-        h('div', { class: 'gchead' }, h('h3', null, 'Plays', h('small', { class: 'mono' }, plays.length ? `${drives.length} drives · newest first` : '')), seg),
-        h('div', { class: 'gcbody' }, playsCol, h('div', null, scoringCard, teamCard)), boxCard);
+    const main = h('div', { class: 'gcmain' }, bug, meta, field, pbp, players, h('div', { class: 'gcbody2' }, scoringCard, teamCard));
     page.append(h('div', { class: 'card gcframe' }, rail, main));
     return page;
 }
@@ -10067,6 +10262,52 @@ function cardStrip(pid) {
 }
 // Where a story came from: a link out when Sleeper carries one.
 const newsSource = (n) => { const u = (n.metadata || {}).url; return u ? h('a', { class: 'srclink', href: u, target: '_blank', rel: 'noopener noreferrer', title: 'Read it at the source' }, sourceLabel(n), ' ↗') : h('span', null, sourceLabel(n)); };
+// The card's nickname, under his name. Yours you can name, rename or clear; another team's is theirs, said as theirs.
+function cardNick(pid, owner) {
+    if (!owner) return null;
+    const mine = !!S.myRoster && owner.roster_id === S.myRoster.roster_id, nk = nickOf(pid), ed = S.ui.nickEdit && S.ui.nickEdit.pid === pid ? S.ui.nickEdit : null;
+    if (mine && ed) return nickEditor(pid, ed, nk);
+    if (!mine) { const tn = String(teamName(owner)).trim(); return nk ? h('div', { class: 'cnick' }, h('q', { class: 'nkq' }, nk), h('span', { class: 'whose' }, `${tn}${/s$/i.test(tn) ? '’' : '’s'} name for him`)) : null; }
+    const open = () => { S.ui.nickEdit = { pid, v: nk || '', busy: false }; render(); };
+    return h('div', { class: 'cnick' }, nk ? h('q', { class: 'nkq mine' }, nk) : null,
+        h('button', { class: 'lnk', type: 'button', 'data-act': 'nick-edit', 'data-focus': `nick-edit:${pid}`, onclick: open },
+            nk ? [sv('svg', { class: 'pen', viewBox: '0 0 16 16', 'aria-hidden': 'true' }, sv('path', { d: 'M3 11.5V13h1.5l7-7L10 4.5l-7 7Zm9.7-6.3a.7.7 0 0 0 0-1l-.9-.9a.7.7 0 0 0-1 0l-.7.7 1.9 1.9.7-.7Z' })), 'Edit nickname'] : '+ Add a nickname'));
+}
+function nickEditor(pid, ed, nk) {
+    const cnt = h('span', { class: 'nkc mono' }, `${ed.v.length}/30`);
+    const close = () => { S.ui.nickEdit = null; render(); };
+    const inp = h('input', { class: 'nkin', id: `nick-${pid}`, maxlength: '30', value: ed.v, placeholder: 'Up to 30 characters', autocomplete: 'off', 'data-focus': `nick:${pid}`, disabled: ed.busy,
+        oninput: (e) => { ed.v = e.target.value; cnt.textContent = `${ed.v.length}/30`; },
+        onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); saveNickname(pid, ed.v); } else if (e.key === 'Escape') { e.stopPropagation(); close(); } } });
+    if (!ed.focused) { ed.focused = true; setTimeout(() => { if (inp.isConnected) { inp.focus(); inp.select(); } }, 0); }
+    return h('div', { class: 'nked' }, h('label', { class: 'nkl', for: `nick-${pid}` }, 'Nickname'), h('div', { class: 'nkrow' }, inp, cnt),
+        h('div', { class: 'nkact' },
+            h('button', { class: 'btn p sm', type: 'button', 'data-act': 'nick-save', disabled: ed.busy, onclick: () => saveNickname(pid, ed.v) }, ed.busy ? 'Saving…' : 'Save'),
+            h('button', { class: 'btn s sm', type: 'button', 'data-act': 'nick-cancel', disabled: ed.busy, onclick: close }, 'Cancel'),
+            nk ? h('button', { class: 'lnk red', type: 'button', 'data-act': 'nick-clear', disabled: ed.busy, onclick: () => saveNickname(pid, '') }, 'Remove nickname') : null),
+        h('div', { class: 'nknote' }, 'Sleeper posts a new nickname in league chat. Removing one posts nothing.'));
+}
+// Sleeper keeps a team's nicknames with the rest of its team settings (record, streak, notification choices), and
+// its save REPLACES the whole set: a key sent alone wipes the others (seen in the test league). So the team's set is
+// read fresh, one name changed, and all of it sent back; if the read fails, nothing is sent.
+async function saveNickname(pid, v) {
+    const ed = S.ui.nickEdit, my = S.myRoster; if (!ed || ed.busy || !my) return;
+    const val = String(v || '').replace(/\s+/g, ' ').trim().slice(0, 30), was = nickOf(pid) || '';
+    if (val === was) { S.ui.nickEdit = null; render(); return; }
+    ed.busy = true; render();
+    try {
+        const fresh = (await rest(`${API}/league/${S.leagueId}/rosters`)).find(r => r.roster_id === my.roster_id);
+        if (!fresh) throw new Error('Sleeper did not send your team back, so the nickname was not changed.');
+        const md = Object.assign({}, fresh.metadata || {}, { [`p_nick_${pid}`]: val }), keys = Object.keys(md);
+        const d = await gql('roster_update_metadata', `mutation roster_update_metadata($k_metadata: [String], $v_metadata: [String]) { roster_update_metadata(league_id: "${S.leagueId}", roster_id: ${my.roster_id}, k_metadata: $k_metadata, v_metadata: $v_metadata){ roster_id metadata } }`,
+            { k_metadata: keys, v_metadata: keys.map(k => (md[k] == null ? '' : String(md[k]))) });
+        const back = (d && d.roster_update_metadata && d.roster_update_metadata.metadata) || md;
+        for (const R of new Set([my, S.rosters.find(r => r.roster_id === my.roster_id)])) if (R) R.metadata = back;
+        S.ui.nickEdit = null;
+        toast(val ? `Nickname saved: “${val}”` : 'Nickname removed', 'ok');
+    } catch (e) { ed.busy = false; toast(String(e.message || e), 'err'); }
+    render();
+}
 const newsAge = (n) => { const a = ago(n.published); return a === 'now' ? 'just now' : `${a} ago`; };
 // The newest story leads Overview: it is the freshest thing known about him.
 // The ones before it are a tab away.
@@ -10118,7 +10359,7 @@ function playerModal(pid) {
     // card that grew and shrank with each tab moved the tabs out from under
     // the mouse.
     return h('div', { class: 'modal-bg', onclick: () => { S.ui.sel = null; S.ui.dropAsk = null; render(); } }, h('div', { class: 'modal pmodal', onclick: (e) => e.stopPropagation() },
-        h('div', { class: 'phead' }, h('div', { style: 'display:flex;align-items:center;gap:12px;margin-bottom:10px' }, h('div', { class: 'avatar lg' }, h('img', { src: headshot(pid), alt: '', onerror: (e) => e.target.remove() })), h('div', null, h('h3', null, pname(pid), ' ', h('span', { class: `pos txt ${pl.position}` }, posLabel(pl.position)), ' ', starEl(pid)), h('div', { class: 'dim', style: 'font-size:12px' }, `${pl.team || 'FA'}${pl.number ? ' #' + pl.number : ''}${pl.age ? ' · Age ' + pl.age : ''}${pl.years_exp != null ? ' · ' + (pl.years_exp === 0 ? 'rookie' : pl.years_exp + ' yrs') : ''}${pl.depth_chart_order ? ' · ' + pl.depth_chart_position + pl.depth_chart_order : ''}`)),
+        h('div', { class: 'phead' }, h('div', { style: 'display:flex;align-items:center;gap:12px;margin-bottom:10px' }, h('div', { class: 'avatar lg' }, h('img', { src: headshot(pid), alt: '', onerror: (e) => e.target.remove() })), h('div', null, h('h3', null, pname(pid), ' ', h('span', { class: `pos txt ${pl.position}` }, posLabel(pl.position)), ' ', starEl(pid)), cardNick(pid, owner), h('div', { class: 'dim', style: 'font-size:12px' }, `${pl.team || 'FA'}${pl.number ? ' #' + pl.number : ''}${pl.age ? ' · Age ' + pl.age : ''}${pl.years_exp != null ? ' · ' + (pl.years_exp === 0 ? 'rookie' : pl.years_exp + ' yrs') : ''}${pl.depth_chart_order ? ' · ' + pl.depth_chart_position + pl.depth_chart_order : ''}`)),
             strip ? null : (() => {
                 // Once his game has kicked off, the headline is what he scored and
                 // the projection steps down to the label. Before, it is the forecast.

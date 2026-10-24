@@ -7,6 +7,21 @@
 // say adds none and rides under the latest one.
 globalThis.BADGER_NOTES = [
     {
+        v: '2026.10.24', when: 'October 24, 2026', title: 'NFL games, rebuilt, and player nicknames',
+        items: [
+            '<b>NFL games</b> puts the play by play right under the score: one drive at a time, newest play first, with earlier drives a press away and a list of every drive.',
+            'Each team’s players are grouped by position. <b>Points</b> draws each player’s projection on his points bar, so you can see who is running hot or cold; <b>Box score</b> lines every position up on one grid, and a header sorts it.',
+            'The fantasy points on each play carry the player’s face, and Scoring sits beside Team stats.',
+            'Player nicknames: the name his team gave him shows under his name on his card and on the Team roster. Name your own players from their card. Sleeper posts a new nickname in league chat.',
+            'A back-up on a waiver claim is one rule: <b>if no spot is open, drop this player and bid this much</b>. Each rule is exactly one claim in Sleeper.',
+            'A claim that can fail says every reason, such as no open spot and no money left, and its fix covers both.',
+            'The Team page has one lineup button. Its window lists every check (empty slots, byes, players out or questionable, the flex, your best lineup) as passing or needing a fix. Keep a questionable player in when you mean to, and the check stays quiet.',
+            'Byes now show in <b>Weeks ahead</b>.',
+            'During games, Over / under performers compares each player to where his projection says he should be by now, and a D/ST waits for the final whistle.',
+            'The live game line on your roster wraps instead of being cut off, and the Players quick filters and roster arrows keep working while games are on.',
+        ],
+    },
+    {
         v: '2026.10.14', when: 'October 14, 2026', title: 'Waiver claims that say what will happen',
         items: [
             '<b>Transactions</b> is two tabs under one search box: <b>Waivers & Adds</b> (your claims, ideas for who to add, and history) and <b>Trades</b> (offers and history).',
