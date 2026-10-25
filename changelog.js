@@ -7,6 +7,19 @@
 // say adds none and rides under the latest one.
 globalThis.BADGER_NOTES = [
     {
+        v: '2026.10.25', when: 'October 25, 2026', title: 'A Breakdown tab for your matchup, and NFL games by drive',
+        items: [
+            'Your matchup has two tabs. <b>Live</b> is the page you know. <b>Breakdown</b> adds over and under performers in your game, who has moved the win odds most, where each side’s points came from, big plays and the red zone, how your score stacks up across the league, bench points and the best possible lineup, and your record against this opponent in every season.',
+            'Win probability has a third view, <b>Projected</b>: each side’s projected final through the week.',
+            'Head to head shows each player’s face, ringed by his game clock: a full ring before kickoff that empties as his game runs. A <b>Positions</b> view adds up each position, with the flex as its own; press one to see its players.',
+            'The league’s other matchups sit in a rail beside yours, with <b>All matchups</b> at the top. On a narrower window the rail shows each team’s avatar and score, and the play log leaves out its Score now column to make room.',
+            '<b>NFL games</b> lists every drive beside the plays of the one you open, with its plays, yards, time and starting spot, and what each play gained.',
+            'The field is drawn to scale: ten-yard bands, yard numbers, midfield and both red zones. Between a score and the kickoff, it says who kicks off.',
+            'Player names in the play by play are in bold: teal for yours, blue for your opponent’s.',
+            'Touchbacks and two-point tries no longer count as drives of their own.',
+        ],
+    },
+    {
         v: '2026.10.24', when: 'October 24, 2026', title: 'NFL games, rebuilt, and player nicknames',
         items: [
             '<b>NFL games</b> puts the play by play right under the score: one drive at a time, newest play first, with earlier drives a press away and a list of every drive.',

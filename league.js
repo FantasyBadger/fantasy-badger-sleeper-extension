@@ -3899,15 +3899,16 @@ function matchupHeader(roster, compact) {
     // "Pace" is where the score would sit had every played starter hit his
     // projection exactly, so actual − pace is simply projected final − pregame
     // projection: the one number this page never stated before.
-    const lens = wpLens(), pts = lens === 'pts', pre = preProj;
+    const lens = wpLens(), pts = lens === 'pts', proj = lens === 'proj', pre = preProj;
     const paceEl = (fX, preX) => {
         if (!pts || !started || done) return null;
         const d = fX - preX, sign = d >= 0 ? '+' : '−';
         return h('span', { class: 'pace', title: 'Actual points minus what the played starters were projected for' }, h('b', { class: d >= 0 ? 'up' : 'dn' }, `${sign}${fmt1(Math.abs(d))}`), ' vs pace');
     };
     const lensEl = (ghost) => h('span', { class: `wlens${ghost ? ' ghost' : ''}` },
-        h('span', { class: pts ? '' : 'on', onclick: ghost ? null : () => setWpLens('wp') }, 'WIN %'),
-        h('span', { class: pts ? 'on' : '', onclick: ghost ? null : () => setWpLens('pts') }, 'POINTS'));
+        h('span', { class: lens === 'wp' ? 'on' : '', onclick: ghost ? null : () => setWpLens('wp') }, 'WIN %'),
+        h('span', { class: pts ? 'on' : '', onclick: ghost ? null : () => setWpLens('pts') }, 'POINTS'),
+        h('span', { class: proj ? 'on' : '', onclick: ghost ? null : () => setWpLens('proj') }, 'PROJECTED'));
     // the lens switch lives on the card's title row now, with the copy button; the rows are name and number
     const wpRow = (R, cls, num, fX, preX) => h('div', { class: `wprow ${cls}` }, avatarEl(R, 'xs'), h('span', { class: 'nm2' }, R ? teamName(R) : 'Bye'),
         h('span', { class: 'sp' }), paceEl(fX, preX), h('span', { class: 'n' }, num));
@@ -3928,14 +3929,17 @@ function matchupHeader(roster, compact) {
             blk(B, 'b', sB, sB > sA, g && g.rowB),
             g && g.rail),
         h('div', { class: 'card mwpcard' },
-            h('div', { class: 'card-h' }, h('h3', null, pts ? 'Points through the week' : 'Win probability'), lensEl(false)),
+            h('div', { class: 'card-h' }, h('h3', null, pts ? 'Points through the week' : proj ? 'Projected finals' : 'Win probability'), lensEl(false)),
             h('div', { class: 'mwp' },
-                wpRow(A, 't', pts ? fmtS(sA) : `${wA}%`, fA, pre(A, mm.mine)),
-                wpChart(A, mm.mine, B, mm.opp, pts ? { sA: aA, sB: aB, fA, fB, started, done } : null),
-                wpRow(B, 'b', pts ? fmtS(sB) : `${100 - wA}%`, fB, pre(B, mm.opp)))));
+                wpRow(A, 't', pts ? fmtS(sA) : proj ? fmtS(fA) : `${wA}%`, fA, pre(A, mm.mine)),
+                // the second team's row sits right under the curve, above the window names and the strip a hover fills
+                // (the user, 2026-10-25: the second team's line goes "above the details of the hover location")
+                (() => { const box = wpChart(A, mm.mine, B, mm.opp, pts || proj ? { proj, sA: aA, sB: aB, fA, fB, started, done } : null), sv2 = box.querySelector('svg');
+                    if (!box.querySelector('.wfoot')) box.append(h('div', { class: 'wfoot' }));
+                    sv2.after(wpRow(B, 'b', pts ? fmtS(sB) : proj ? fmtS(fB) : `${100 - wA}%`, fB, pre(B, mm.opp))); return box; })())));
 }
 // The lens is a per-viewer preference, kept in localStorage like the UI toggle.
-function wpLens() { if (S.ui.wpLens) return S.ui.wpLens; let v = 'wp'; try { v = localStorage.getItem('badgerWpLens') === 'pts' ? 'pts' : 'wp'; } catch (e) {} return (S.ui.wpLens = v); }
+function wpLens() { if (S.ui.wpLens) return S.ui.wpLens; let v = 'wp'; try { const k = localStorage.getItem('badgerWpLens'); v = k === 'pts' || k === 'proj' ? k : 'wp'; } catch (e) {} return (S.ui.wpLens = v); }
 function setWpLens(v) { S.ui.wpLens = v; try { localStorage.setItem('badgerWpLens', v); } catch (e) {} render(); }
 // The curve. Until the week's play history is wired in there is one point to
 // draw — where it stands now — so it renders as a flat line at that value,
@@ -4019,6 +4023,7 @@ function muGauge(A, a, B, b, st2) {
 function wpChart(A, a, B, b, ptsOpts) {
     buildLedger(A, a, B, b);   // memoised; the hero renders before the log that would otherwise fill this in
     const W = 360, H = 118, PAD = 6, series = (S.wpHist && S.wpHist[S.week]) || [];
+    if (ptsOpts && ptsOpts.proj) return projChart(A, a, B, b, ptsOpts, W, H, PAD);
     if (ptsOpts) return ptsChart(A, a, B, b, ptsOpts, W, H, PAD);
     const w = winProbFor(A, a, B, b);
     // The x-axis is game time: the trace reaches only as far as the matchup
@@ -4136,6 +4141,7 @@ function wpReadout(card, box, e, lens, final) {
         row.querySelectorAll('.wphsc').forEach((x) => x.remove());
         // the rows hold the moment (score, chance); what the play changed is said once, in the strip
         if (lens === 'pts') n.textContent = fmtS(sc);
+        else if (lens === 'proj') n.textContent = fmtS(k === 't' ? e.ta : e.tb);
         else {
             n.textContent = pct(w);
             const nm = row.querySelector('.nm2'); if (nm) nm.after(h('span', { class: 'wphsc mono' }, fmtS(sc)));
@@ -4265,7 +4271,7 @@ function ptsChart(A, a, B, b, o, W, H, PAD) {
         if (!o.done) {
             svg.appendChild(mk('path', { d: `M${span.toFixed(1)},${y(cur[i])} L${W},${y(fin[i])}`, class: `pttail ${k}` }));
             // pregame the rows already print the projections these tails climb to
-            if (o.started) box.appendChild(h('span', { class: `ptlab ${k}`, style: `top:${(+y(fin[i]) / H * 100).toFixed(1)}%`, title: 'Projected final' }, fmt1(fin[i])));
+            if (o.started) box.appendChild(h('span', { class: `ptlab ${k}`, style: `top:${y(fin[i])}px`, title: 'Projected final' }, fmt1(fin[i])));
             if (o.started) svg.appendChild(mk('circle', { cx: Math.max(3.6, Math.min(W - 3, span)).toFixed(1), cy: y(pace[i]), r: 3.4, class: `ptring ${k}` }));
         }
         svg.appendChild(mk('circle', { cx: Math.max(3.6, Math.min(W - 3, span)).toFixed(1), cy: y(cur[i]), r: 3.6, class: `ptdot ${k}` }));
@@ -4274,6 +4280,31 @@ function ptsChart(A, a, B, b, o, W, H, PAD) {
     if (o.started && !o.done && Math.abs(y(fin[0]) - y(fin[1])) < 11) box.querySelector(`.ptlab.${fin[0] >= fin[1] ? 'b' : 'a'}`).classList.add('below');
     if (L && ph.length) wpHover(box, svg, W, H, L.events.slice().reverse().filter((e) => e.x != null).map((e) => ({ cx: Math.min(span, xmap(e.x)), e, ys: [[+y(e.sa), 'a'], [+y(e.sb), 'b']] })),
         'pts', `${S.week}:${A && A.roster_id}:${B && B.roster_id}:pts`, L.settled, A, B);
+    return box;
+}
+// The PROJECTED lens (the user, 2026-10-25): each side's projected final after every play (points scored plus
+// what its starters still to play are projected for), so the line says how the expected result moved; flat on
+// to the right edge, where the projection stands now.
+function projChart(A, a, B, b, o, W, H, PAD) {
+    const L = S.ledger && S.ledger[S.week], evs = L ? L.events.filter((e) => e.x != null && e.ta != null).reverse() : [];
+    const { svg, mk, box, xmap } = chartFrame(A, a, B, b, W, H, PAD, 'wpsvg pts');
+    const span = xmap(muTimeFrac(A, a, B, b)), start = [preProj(A, a), preProj(B, b)], fin = [o.fA || 0, o.fB || 0];
+    const vals = evs.flatMap((e) => [e.ta, e.tb]).concat(start, fin), lo0 = Math.min(...vals), hi0 = Math.max(...vals), pad = Math.max(2, (hi0 - lo0) * 0.15);
+    const lo = lo0 - pad, hi = hi0 + pad, y = (v) => (PAD + (1 - (v - lo) / (hi - lo)) * (H - 2 * PAD)).toFixed(1), cx = Math.max(3.6, Math.min(W - 3, span)).toFixed(1);
+    for (const q of [0.25, 0.5, 0.75]) svg.appendChild(mk('line', { x1: 0, x2: W, y1: y(lo + (hi - lo) * q), y2: y(lo + (hi - lo) * q), class: 'ptgrid' }));
+    svg.appendChild(mk('line', { x1: span.toFixed(1), x2: span.toFixed(1), y1: PAD, y2: H - PAD, class: 'ptfront' }));
+    ['a', 'b'].forEach((k, i) => {
+        let d = `M0,${y(start[i])}`, prev = start[i];
+        for (const e of evs) { const x = Math.min(span, xmap(e.x)).toFixed(1), v = i ? e.tb : e.ta; d += ` L${x},${y(prev)} L${x},${y(v)}`; prev = v; }
+        d += ` L${span.toFixed(1)},${y(prev)} L${span.toFixed(1)},${y(fin[i])}`;
+        svg.appendChild(mk('path', { d, class: `ptline ${k}` }));
+        if (!o.done) svg.appendChild(mk('path', { d: `M${span.toFixed(1)},${y(fin[i])} L${W},${y(fin[i])}`, class: `pttail ${k}` }));
+        box.appendChild(h('span', { class: `ptlab ${k}`, style: `top:${y(fin[i])}px`, title: 'Projected final' }, fmt1(fin[i])));
+        svg.appendChild(mk('circle', { cx, cy: y(fin[i]), r: 3.6, class: `ptdot ${k}` }));
+    });
+    if (Math.abs(y(fin[0]) - y(fin[1])) < 11) box.querySelector(`.ptlab.${fin[0] >= fin[1] ? 'b' : 'a'}`).classList.add('below');
+    if (L && evs.length) wpHover(box, svg, W, H, evs.map((e) => ({ cx: Math.min(span, xmap(e.x)), e, ys: [[+y(e.ta), 'a'], [+y(e.tb), 'b']] })),
+        'proj', `${S.week}:${A && A.roster_id}:${B && B.roster_id}:proj`, L.settled, A, B);
     return box;
 }
 function preProj(R, m) { return R ? muStarters(R, m).reduce((t2, pid) => t2 + (pid && pid !== '0' ? projOf(pid, S.week) || 0 : 0), 0) : 0; }
@@ -7649,6 +7680,15 @@ function muStatLine(pid) {
     if (st.fum_lost) bits.push(`${st.fum_lost} fum lost`);
     return bits.length ? h('div', { class: 'statl' }, bits.join(' \u00b7 ')) : null;
 }
+// His face, ringed by his game's clock (the user, 2026-10-25): a full ring before kickoff (all sixty minutes to play),
+// an arc that empties as they run, none once it is final. Teal for the left team, blue for the right, as on the win chart.
+function clockFace(pid, right) {
+    const left = Math.min(1, gameFracLeft(pid)), pre = left >= 1, live = left > 0 && left < 1, r = 21.5, c = 2 * Math.PI * r;
+    const ring = left > 0 ? sv('circle', { cx: 23, cy: 23, r, fill: 'none', class: `cfarc ${right ? 'op' : 'me'}`, 'stroke-dasharray': `${(c * left).toFixed(1)} ${c.toFixed(1)}`, transform: 'rotate(-90 23 23)' }) : null;
+    return h('span', { class: 'cface', title: pre ? 'His game has not started' : live ? `About ${Math.max(1, Math.round(left * 60))} of 60 minutes left in his game` : 'His game is over' },
+        sv('svg', { viewBox: '0 0 46 46', 'aria-hidden': 'true' }, sv('circle', { cx: 23, cy: 23, r, fill: 'none', class: 'cftrack' }), ring),
+        h('img', { src: headshot(pid), alt: '', loading: 'lazy', onerror: hideBroken }));
+}
 function muPlayerCell(pid, right, m, slot) {
     const cls = right ? 'op' : 'me';
     if (!pid || pid === '0') {
@@ -7665,9 +7705,10 @@ function muPlayerCell(pid, right, m, slot) {
     // left out here: this is the week's matchup, so a bye eleven weeks off is
     // noise, and a D/ST's name already says its team.
     const nm = h('div', { class: 'nm', onclick: () => { S.ui.sel = pid; render(); } },
-        pname(pid), pos === 'DEF' ? null : h('span', { class: 'posl' }, pos), teamMeta(pid, true),
+        h('span', { class: 'mnm', title: pname(pid) }, pname(pid)), pos === 'DEF' ? null : h('span', { class: 'posl' }, pos), teamMeta(pid, true),
         S.fracDone ? null : injuryChip(pid, true), S.fracDone ? null : newsIcon(pid));
-    return h('td', { class: `${cls}${willNotPlay(pid) ? ' np' : ''}` }, nm, S.fracDone ? muStatLine(pid) : gameSub(pid));
+    const text = h('div', { class: 'mutx' }, nm, S.fracDone ? muStatLine(pid) : gameSub(pid)), face = clockFace(pid, right);
+    return h('td', { class: `${cls}${willNotPlay(pid) ? ' np' : ''}` }, h('div', { class: `mucell${right ? ' r' : ''}` }, right ? [text, face] : [face, text]));
 }
 // One cell per side rather than two: what he has, large, and a projection small
 // underneath. While his game runs that is where he is heading; once it is over
@@ -7695,7 +7736,7 @@ function muMirror(A, a, B, b) {
     // whatever a row puts in them, the numbers and the slot chip stay on the
     // spine. Nothing a player is called can pull the score off centre.
     const tbl = h('table', { class: 'mu' }, h('colgroup', null,
-        h('col'), h('col', { style: 'width:74px' }), h('col', { style: 'width:58px' }), h('col', { style: 'width:74px' }), h('col')));
+        h('col'), h('col', { style: 'width:70px' }), h('col', { style: 'width:58px' }), h('col', { style: 'width:70px' }), h('col')));
     const label = (anyLive || S.fracDone) ? 'Pts' : 'Proj';
     tbl.append(h('tr', null, h('th', { style: 'text-align:left' }, teamName(A)),
         h('th', { class: 'r' }, label), h('th', null, ''), h('th', { style: 'text-align:left' }, label),
@@ -7722,9 +7763,50 @@ function muMirror(A, a, B, b) {
             muPts(pB, b, true, anyLive),
             muPlayerCell(pB, true, b)));
     }
-    return h('div', { class: 'card mumir scroll-x' }, h('div', { class: 'card-h' }, h('h3', null, 'Head to head'), h('span', { class: 'dim', style: 'font-size:12px' }, anyLive ? null : 'bench dims because it does not count')), tbl);
+    const view = muH2HView();
+    return h('div', { class: 'card mumir' }, h('div', { class: 'card-h' }, h('h3', null, 'Head to head'),
+            h('span', { class: 'wlens' }, ...[['players', 'PLAYERS'], ['positions', 'POSITIONS']].map(([k, t]) => h('span', { class: view === k ? 'on' : '', onclick: () => setMuH2HView(k) }, t)))),
+        h('div', { class: 'muscroll', 'data-keep': `mumir-${view}` }, view === 'positions' ? muPositions(A, a, B, b, anyLive) : tbl));
 }
 
+function muH2HView() { if (S.ui.muH2H) return S.ui.muH2H; let v = 'players'; try { v = localStorage.getItem('badgerMuH2H') === 'positions' ? 'positions' : 'players'; } catch (e) {} return (S.ui.muH2H = v); }
+function setMuH2HView(v) { S.ui.muH2H = v; try { localStorage.setItem('badgerMuH2H', v); } catch (e) {} render(); }
+// Head to head by POSITION (the user, 2026-10-25): each position adds up its slots, flex a position of its own,
+// what each side has with its projected finish under it; press a position to open its players, slot against slot.
+function muPositions(A, a, B, b, anyLive) {
+    const slots = starterSlots(), sa = muStarters(A, a), sb = muStarters(B, b), groups = [], by = {};
+    slots.forEach((sl, i) => { const k = slotLabel(sl); if (!by[k]) groups.push(by[k] = { k, sl, idx: [] }); by[k].idx.push(i); });
+    const live = anyLive || S.fracDone, ok = (pid) => pid && pid !== '0';
+    const has = (m, pid) => !ok(pid) ? 0 : live ? (((m && m.players_points) || {})[pid] || 0) : (projOf(pid, S.week) || 0);
+    const fin = (m, pid) => !ok(pid) ? 0 : (live ? (((m && m.players_points) || {})[pid] || 0) : 0) + (projOf(pid, S.week) || 0) * (live ? Math.max(0, gameFracLeft(pid)) : 1);
+    const rows = groups.map((g) => ({ g, ta: g.idx.reduce((t, i) => t + has(a, sa[i]), 0), tb: g.idx.reduce((t, i) => t + has(b, sb[i]), 0),
+        fa: g.idx.reduce((t, i) => t + fin(a, sa[i]), 0), fb: g.idx.reduce((t, i) => t + fin(b, sb[i]), 0),
+        left: g.idx.reduce((t, i) => t + [sa[i], sb[i]].filter((pid) => ok(pid) && gameFracLeft(pid) > 0).length, 0) }));
+    const max = Math.max(1, ...rows.map((r) => Math.max(r.ta, r.tb)));
+    S.ui.muPosOpen = S.ui.muPosOpen || {};
+    const tag = (pid) => !ok(pid) ? 'empty' : gameFracLeft(pid) <= 0 ? 'final' : gameFracLeft(pid) >= 1 ? 'to play' : 'live';
+    const who = (pid, right, m) => h('span', { class: `ppn${right ? ' r' : ''}` }, ok(pid) && !right ? clockFace(pid, false) : null,
+        h('span', null, h('b', null, ok(pid) ? ((P(pid) || {}).last_name || pname(pid)) : 'Empty slot'), h('small', { class: tag(pid) === 'live' ? 'lv' : '' }, tag(pid))), ok(pid) && right ? clockFace(pid, true) : null);
+    const out = [];
+    let wa = 0, wb = 0;
+    for (const r of rows) {
+        const open = !!S.ui.muPosOpen[r.g.k], n = r.g.idx.length;
+        if (r.ta > r.tb) wa++; else if (r.tb > r.ta) wb++;
+        out.push(h('div', { class: `pgrow${open ? ' open' : ''}`, role: 'button', tabindex: '0', 'aria-expanded': String(open), 'data-focus': `mupos:${r.g.k}`,
+            onclick: () => { S.ui.muPosOpen[r.g.k] = !open; render(); }, onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); S.ui.muPosOpen[r.g.k] = !open; render(); } } },
+            foldCaret(open, 'chev'),
+            h('span', { class: `pgv mono${r.ta > r.tb ? ' lead' : ''}` }, fmtS(r.ta), live ? h('small', null, `${fmtS(r.fa)} proj`) : null),
+            h('span', { class: 'pgb l' }, h('i', { style: `width:${(r.ta / max * 100).toFixed(1)}%` })),
+            h('span', { class: 'pgl' }, slotChip(r.g.sl, null, r.g.idx.flatMap((i) => [sa[i], sb[i]])), h('small', null, [n > 1 ? `${n} v ${n}` : '', r.left ? `${r.left} to play` : ''].filter(Boolean).join(' · '))),
+            h('span', { class: 'pgb r' }, h('i', { style: `width:${(r.tb / max * 100).toFixed(1)}%` })),
+            h('span', { class: `pgv r mono${r.tb > r.ta ? ' lead' : ''}` }, fmtS(r.tb), live ? h('small', null, `${fmtS(r.fb)} proj`) : null)));
+        if (open) for (const i of r.g.idx) out.push(h('div', { class: 'pprow' }, who(sa[i], false, a),
+            h('span', { class: `mono${has(a, sa[i]) > has(b, sb[i]) ? ' lead' : ''}` }, ok(sa[i]) ? fmtS(has(a, sa[i])) : '—'),
+            h('span', { class: `mono r${has(b, sb[i]) > has(a, sa[i]) ? ' lead' : ''}` }, ok(sb[i]) ? fmtS(has(b, sb[i])) : '—'), who(sb[i], true, b)));
+    }
+    return h('div', { class: 'pgs' }, h('div', { class: 'pghead' }, h('span', { class: 'a' }, teamName(A)), h('span', null, live ? 'Pts' : 'Proj'), h('span', { class: 'b' }, teamName(B))), ...out,
+        h('div', { class: 'cap' }, `${teamName(A)} leads ${wa} of ${rows.length} positions, ${teamName(B)} ${wb}. A position adds up its slots; flex is a position of its own.`));
+}
 function muEdge(A, a, B, b) {
     const slots = starterSlots();
     const duels = slots.map((sl, i) => { const pA = muStarters(A, a)[i], pB = muStarters(B, b)[i]; return { sl, pA, pB, d: muVal(a, pA) - muVal(b, pB) }; })
@@ -8238,12 +8320,12 @@ function scorersCard(started) {
 // and yards-allowed bonus counts in full from kickoff while the pace grows with
 // the clock, so mid-game every defence read as a big beat (2026-10-18: PIT 12.75
 // against "2.4", the user asking why the D/ST projections were all so low).
-function overUnderCard(started) {
+function overUnderCard(started, opts) {
     const liveDst = started.filter(x => ppos(x.pid) === 'DEF' && x.played > 0 && x.played < 1).length;
     const all = started.filter(x => x.proj >= 6 && x.played > 0 && !(ppos(x.pid) === 'DEF' && x.played < 1))
         .map(x => { const exp = x.proj * x.played; return { ...x, exp, gap: x.pts - exp }; })
         .filter(x => Math.abs(x.gap) >= 0.5);
-    const head = s6Head('Over / under performers', 'against his projection so far');
+    const head = s6Head('Over / under performers', (opts && opts.sub) || 'against his projection so far');
     if (!all.length) return h('div', { class: 'card' }, head, h('div', { class: 'empty' }, started.length ? 'Everyone who has played is on his projection.' : 'Nothing has kicked off yet.'));
     // Beats and misses are not the same size — a miss can be a whole projection,
     // a beat rarely doubles one — so a single list by size buries the beats.
@@ -8272,7 +8354,7 @@ function overUnderCard(started) {
         h('div', { class: 'seg ouseg' }, chip('both', 'Both', all.length), chip('over', 'Over', over.length), chip('under', 'Under', under.length)),
         h('div', { class: 'ouaxis' }, h('span'), h('span'), s6Ticks([[0, 'under'], [50, 'on pace'], [100, 'over']]),
             h('span', { class: 's6colh' }, 'ACT'), h('span', { class: 's6colh', title: 'His projection for the share of his game played so far; under it, his projection for the whole game' }, 'BY NOW')),
-        rows.length ? h('div', { class: 's6list', 'data-keep': 'sixou' }, ...rows)
+        rows.length ? h('div', { class: 's6list', 'data-keep': (opts && opts.keep) || 'sixou' }, ...rows)
             : h('div', { class: 'empty' }, f === 'over' ? 'Nobody is beating his projection yet.' : 'Nobody is missing his projection.'),
         liveDst ? h('div', { class: 'cap ounote' }, `${liveDst === 1 ? 'One D/ST joins' : `${liveDst} D/STs join`} when ${liveDst === 1 ? 'its game ends' : 'their games end'}: points and yards allowed only settle at the final whistle.`) : null);
 }
@@ -8307,6 +8389,9 @@ function allSixPage() {
 // drive list, so drives are rebuilt from changes of possession.
 const GC_POS = new Set(['QB', 'RB', 'WR', 'TE', 'K']);
 const GC_NOPOS = new Set(['kickoff', 'extra_point', 'two_point', 'timeout', 'end_period', 'end_half', 'two_minute_warning', 'game_over']);
+// Sleeper names kickoffs kickoff, kickoff_touchback, kickoff_muffed… and two-point tries conversion_pass,
+// conversion_rush… (never two_point): each began a one-play drive of its own until 2026-10-24.
+const gcNoPos = (t) => GC_NOPOS.has(t) || /^(kickoff|conversion)/.test(t || '');
 const teamLogo = (t) => `https://sleepercdn.com/images/team_logos/nfl/${String(t).toLowerCase()}.png`;
 const teamNick = (t) => { const d = S.players && S.players[t]; return (d && d.last_name && d.last_name !== 'D/ST' ? d.last_name : null) || t; };
 function nflGames() {
@@ -8321,6 +8406,27 @@ function gcStake(g) {
     const inGame = (pid) => { const tm = (P(pid) || {}).team; return tm === g.home || tm === g.away; };
     const starters = (m, R) => ((m && m.starters) || (R && R.starters) || []).filter(p => p && p !== '0' && inGame(p));
     return { mine: my ? starters(mm && mm.mine, my) : [], opps: oppR ? starters(mm.opp, oppR) : [], oppR };
+}
+// A play's text with each player's name in bold, coloured by whose he is in this league: yours teal, your
+// opponent's blue, anyone else plain (the user, 2026-10-25: no free-agent colour here). Sleeper writes a name as
+// initial, dot, last name ("J.Love", "A.St. Brown") and leaves off the Jr./Sr. its own last_name carries.
+const GC_NAME = /\b[A-Z][A-Za-z]{0,2}\.(?:St\. )?[A-Z][A-Za-z'\-]+(?: (?:Jr|Sr|II|III|IV)\b\.?)?/g;
+const GC_SUFFIX = /\s+(?:Jr|Sr|II|III|IV|V)\.?$/;
+function gcDescNames(desc, p, oppR) {
+    const ids = playStatsOf(p).map((x) => String(x.player_id)).filter((x) => /^\d+$/.test(x));
+    const whose = (nm) => {
+        const last = nm.slice(nm.indexOf('.') + 1).replace(GC_SUFFIX, '');
+        const pid = ids.find((x) => { const d = P(x) || {}; return (d.last_name || '').replace(GC_SUFFIX, '') === last && (d.first_name || '')[0] === nm[0]; });
+        const o = pid ? gcOwner(pid, oppR) : null;
+        return o && (o.cls === 'me' || o.cls === 'opp') ? o.cls : '';
+    };
+    const text = desc || '', out = []; let i = 0;
+    for (const mt of text.matchAll(GC_NAME)) {
+        if (mt.index > i) out.push(text.slice(i, mt.index));
+        const c = whose(mt[0]); out.push(h('b', { class: `gcnm${c ? ' ' + c : ''}` }, mt[0])); i = mt.index + mt[0].length;
+    }
+    if (i < text.length) out.push(text.slice(i));
+    return out;
 }
 function gcOwner(pid, oppR) {
     const R = ownerOf(pid);
@@ -8354,8 +8460,8 @@ function gcDrives(plays) {
         const m = p.metadata || {};
         // a kickoff always starts a new drive, even when the same team gets the ball back (a
         // defensive score, an onside kick) — otherwise a pick-six vanishes into the next series
-        if (m.play_type === 'kickoff') { if (cur) { cur.after.push(p); cur.closed = true; } continue; }
-        if (!m.possession || GC_NOPOS.has(m.play_type)) { if (cur) cur.after.push(p); continue; }
+        if (/^kickoff/.test(m.play_type || '')) { if (cur) { cur.after.push(p); cur.closed = true; } continue; }
+        if (!m.possession || gcNoPos(m.play_type)) { if (cur) cur.after.push(p); continue; }
         if (!cur || cur.closed || cur.pos !== m.possession) { cur = { pos: m.possession, q: m.quarter_name, plays: [], after: [] }; drives.push(cur); }
         cur.plays.push(p);
         if (m.is_scoring_play) cur.closed = true;
@@ -8464,69 +8570,95 @@ function gameCenterPage() {
         fav ? h('span', null, `Line: ${fav[0]} ${fav[1] > 0 ? '+' : ''}${fav[1]}`) : null);
     // ── the field, while it is live
     const lastPlay = plays.length ? plays[plays.length - 1].metadata : null;
-    let field = null, nowTxt = null;
+    let field = null;
     if (g.live && lastPlay) {
         const pos = g.pos || lastPlay.possession, def = pos === g.home ? g.away : g.home;
         const ylt = g.ylt || lastPlay.yard_line_territory_end, yl = g.yl !== '' && g.yl != null ? Number(g.yl) : lastPlay.yard_line_end;
-        const down = g.down || lastPlay.down_end, dist = lastPlay.distance_end;
+        // down and distance from the score line first, else the last real play (a TV timeout carries neither)
+        const snap = (plays.findLast((p) => p.metadata.play_type) || { metadata: {} }).metadata, st = snap.play_type || '';
+        const ddm = /&\s*(\d+)/.exec(g.dd || ''), down = g.down || snap.down_end, dist = ddm ? Number(ddm[1]) : snap.distance_end;
         if (pos && ylt && yl != null && !isNaN(yl)) {
             const ownYds = ylt === pos ? yl : 100 - yl, X = (y) => 8.33 + Math.max(0, Math.min(100, y)) / 100 * 83.34;
             const drives0 = gcDrives(plays), lastD = drives0[drives0.length - 1], curD = lastD && lastD.pos === pos && lastD.result === 'In progress' ? lastD : null;
             const startYds = curD ? (curD.plays[0].metadata.yard_line_territory === pos ? curD.plays[0].metadata.yard_line : 100 - curD.plays[0].metadata.yard_line) : ownYds;
             const goal = dist != null && (100 - ownYds) <= dist;
-            const nowDd = g.dd || (down && dist != null ? `${['', '1st', '2nd', '3rd', '4th'][down]} & ${goal ? 'Goal' : dist}` : '');
-            nowTxt = { pos, txt: `${pos} ball${nowDd ? `, ${nowDd}` : ''} at ${ylt} ${yl}`, fresh: !curD };
+            // after a touchdown's try or a made field goal the next snap is a kickoff, not a down
+            const kickNext = !down && (/^(extra_point|conversion)/.test(st) || (/^field_goal/.test(st) && !!snap.is_scoring_play));
             field = h('div', { class: 'gcfield-wrap' },
-                h('div', { class: 'gcfield' }, h('span', { class: 'ez l' }, pos), h('span', { class: 'ez r' }, def),
+                // a real field (the user, 2026-10-25): ten 10-yard bands between the goal lines, a line every ten,
+                // midfield, the yard numbers, and both red zones (inside each 20) as a red shade of the turf. The
+                // offense always drives right.
+                h('div', { class: 'gcfield' },
+                    h('span', { class: 'yds' }, [10, 20, 30, 40, 50, 40, 30, 20, 10].map((n, i) => h('i', { style: `left:${(i + 1) * 10}%` }, n))),
+                    h('span', { class: 'ez l' }, pos), h('span', { class: 'ez r' }, def),
                     h('span', { class: 'drv', style: `left:${Math.min(X(startYds), X(ownYds))}%;width:${Math.abs(X(ownYds) - X(startYds))}%` }),
                     h('span', { class: 'los', style: `left:${X(ownYds)}%` }), dist && !goal ? h('span', { class: 'fdm', style: `left:${X(ownYds + dist)}%` }) : null,
                     h('span', { class: 'ball', style: `left:${X(ownYds)}%` })),
-                h('div', { class: 'gcdnd' }, h('b', { class: 'mono' }, g.dd || (down ? `${['', '1st', '2nd', '3rd', '4th'][down]} & ${goal ? 'Goal' : dist}` : `${pos} ball`)), h('span', null, `at ${ylt} ${yl}`),
-                    curD ? h('span', null, `drive: ${curD.n} plays · ${curD.yds} yds`) : null, (g.rz || (ylt === def && yl <= 20)) ? h('span', { class: 'rz' }, 'RED ZONE') : null));
+                h('div', { class: 'gcdnd' }, h('b', { class: 'mono' }, g.dd || (down ? `${['', '1st', '2nd', '3rd', '4th'][down]} & ${goal ? 'Goal' : dist}` : kickNext ? `${pos} to kick off` : `${pos} ball`)), h('span', null, `${kickNext && !down ? 'from' : 'at'} ${ylt} ${yl}`),
+                    (g.rz || (ylt === def && yl <= 20)) ? h('span', { class: 'rz' }, 'RED ZONE') : null));
         }
     }
-    // ── play by play, under the score: one drive at a time, newest play first, six of them with the rest of the
-    // drive one press away and the other drives a step either side (the user, 2026-10-20: play by play "closer to
-    // the top score/field widget", "a reasonable limit to how many recent plays it shows, with the option to go to
-    // previous drives").
+    // ── play by play, under the score (the user, 2026-10-25, picked C): every drive in a list on the left, newest
+    // first, and the open drive on the right: a labelled total (it reads as the drive, not as one more play), then
+    // its plays newest first, six of them with the rest one press away, each with its gain. The field above
+    // already says what is happening now, so nothing here repeats it.
     const drives = gcDrives(plays);
-    if (S.ui.gcDrvFor !== g.gid) { S.ui.gcDrvFor = g.gid; S.ui.gcDrv = null; S.ui.gcMore = false; S.ui.gcList = false; }
+    if (S.ui.gcDrvFor !== g.gid) { S.ui.gcDrvFor = g.gid; S.ui.gcDrv = null; S.ui.gcMore = false; }
     const di = S.ui.gcDrv == null || S.ui.gcDrv >= drives.length ? drives.length - 1 : S.ui.gcDrv, d = drives[di];
     const resTag = (d) => d.result === 'Touchdown' ? ['td', 'TD'] : d.result === 'Field goal' ? ['fg', 'FG'] : /^Interception/.test(d.result) ? ['to', 'INT'] : /^Fumble/.test(d.result) ? ['to', 'FUM'] : d.result === 'Safety' ? ['to', 'SAFETY'] : d.result === 'Turnover on downs' ? ['to', 'DOWNS'] : d.result === 'In progress' ? ['live', 'LIVE'] : /^End/.test(d.result) ? ['end', 'END'] : ['punt', d.result === 'Missed field goal' ? 'MISS' : 'PUNT'];
     const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
     // the newest drive is held as null, so a new drive replaces it on screen as it starts
     const tap = (fn, focus) => ({ role: 'button', tabindex: '0', 'data-focus': focus, onclick: fn, onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(e); } } });
-    const goDrv = (n) => { S.ui.gcDrv = n >= drives.length - 1 ? null : n; S.ui.gcMore = false; S.ui.gcList = false; render(); };
+    const goDrv = (n) => { S.ui.gcDrv = n >= drives.length - 1 ? null : n; S.ui.gcMore = false; render(); };
     const drvName = (x) => `${x.pos} ${x.result === 'In progress' ? 'drive in progress' : x.result}`;
+    // what the play gained, in a word where yards don't say it
+    const gainOf = (m) => { const t = m.play_type || '';
+        if (!t) return ['', ''];
+        if (/no_play/.test(t) || t === 'penalty') return ['PEN', 'pen'];
+        if (/spike/i.test(m.description || '')) return ['spike', 'z'];
+        if (/interception/.test(t)) return ['INT', 'dn'];
+        if (/^pass_incomplete/.test(t) && !/sacked/.test(t)) return ['inc', 'z'];
+        if (/^punt/.test(t)) return ['punt', 'z'];
+        if (/^kickoff/.test(t)) return ['kickoff', 'z'];
+        if (/^(field_goal|extra_point|conversion)/.test(t)) return [m.is_scoring_play ? (/^field/.test(t) ? 'FG' : /^extra/.test(t) ? 'PAT' : '2-PT') : 'no good', 'z'];
+        const y = m.yards_gained || 0;
+        return y > 0 ? [`▲ +${y}`, 'up'] : y < 0 ? [`▼ −${-y}`, 'dn'] : ['0', 'z']; };
     const playRow = (p) => {
-        const m = p.metadata, pfx = gcPlayFx(p);
+        const m = p.metadata, pfx = gcPlayFx(p), [gn, gc] = gainOf(m);
         const goal = m.yards_to_end_zone != null && m.distance != null && m.yards_to_end_zone <= m.distance;
-        const dd = m.down ? `${['', '1st', '2nd', '3rd', '4th'][m.down]} & ${goal ? 'Goal' : m.distance} · ${m.yard_line_territory || ''} ${m.yard_line ?? ''}` : /extra_point/.test(m.play_type) ? 'PAT' : '';
+        const dd = m.down ? `${['', '1st', '2nd', '3rd', '4th'][m.down]} & ${goal ? 'Goal' : m.distance}` : /^conversion/.test(m.play_type || '') ? '2-PT' : /extra_point/.test(m.play_type) ? 'PAT' : '';
+        const at = m.play_type && m.yard_line != null ? `${m.yard_line_territory || ''} ${m.yard_line}`.trim() : '';
         return h('div', { class: `gcplay ${m.is_scoring_play ? 'sc' : ''} ${/INTERCEPTED|FUMBLES/i.test(m.description || '') ? 'bad' : ''}` },
-            h('span', { class: 'cl mono' }, `${playQuarter(m.quarter_name)} ${m.time_remaining_minutes ?? ''}:${String(m.time_remaining_seconds ?? 0).padStart(2, '0')}`), h('span', { class: 'dd mono' }, dd),
-            h('span', { class: 'ds' }, m.description || ''), pfx.length ? h('div', { class: 'fx' }, ...pfx.map(x => gcChip(x.pid, x.pts, oppR))) : null);
+            h('span', { class: 'cl mono' }, `${playQuarter(m.quarter_name)} ${m.time_remaining_minutes ?? ''}:${String(m.time_remaining_seconds ?? 0).padStart(2, '0')}`),
+            h('span', { class: 'dd mono' }, dd, at ? h('em', null, at) : null),
+            h('div', { class: 'dsw' }, h('span', { class: 'ds' }, ...gcDescNames(m.description, p, oppR)), pfx.length ? h('div', { class: 'fx' }, ...pfx.map(x => gcChip(x.pid, x.pts, oppR))) : null),
+            h('span', { class: `gn mono ${gc}` }, gn));
     };
     let pbp;
     if (!d) pbp = h('div', { class: 'card gcpbp' }, h('div', { class: 'gcpbh' }, h('h3', null, 'Play by play')), h('div', { class: 'gcnone' }, started2 ? 'No plays yet.' : `No plays yet: it kicks off ${day(g.t)} ${kick(g.t)}.`));
     else {
         const all = d.plays.concat(d.after).sort((a, b) => (b.metadata.sequence || 0) - (a.metadata.sequence || 0)), shown = S.ui.gcMore ? all : all.slice(0, 6), [rc, rl] = resTag(d);
+        const live = g.live && di === drives.length - 1 && d.result === 'In progress', head = live ? 'In progress' : d.result;
+        const cell = (k, v) => h('div', { class: 'cell' }, h('span', null, k), h('b', { class: 'mono' }, v));
         pbp = h('div', { class: 'card gcpbp' },
-            h('div', { class: 'gcpbh' }, h('h3', null, 'Play by play'), h('span', { class: 'shm' }, `newest first · drive ${di + 1} of ${drives.length}`),
-                h('span', { class: 'gcnav' },
-                    h('button', { class: 'btn sm', type: 'button', 'data-act': 'gc-prev', disabled: di <= 0, onclick: () => goDrv(di - 1) }, '‹ Previous drive'),
-                    h('button', { class: 'btn sm', type: 'button', 'data-act': 'gc-next', disabled: di >= drives.length - 1, onclick: () => goDrv(di + 1) }, 'Next drive ›'),
-                    h('button', { class: 'btn sm s', type: 'button', 'data-act': 'gc-drives', 'aria-expanded': String(!!S.ui.gcList), onclick: () => { S.ui.gcList = !S.ui.gcList; render(); } }, `All ${drives.length} drives `, foldCaret(!!S.ui.gcList)))),
-            S.ui.gcList ? h('div', { class: 'gcdlist' }, ...drives.map((x, n) => n).reverse().map((n) => {
-                const x = drives[n], [c2, l2] = resTag(x), top = Object.entries(x.fx).filter(([, v]) => Math.abs(v) >= 0.5).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 3);
-                return h('div', { class: `gcdl ${n === di ? 'on' : ''}`, 'data-drive': n, ...tap(() => goDrv(n), `gcdl:${n}`) }, h('img', { class: 'gclogo', src: teamLogo(x.pos), alt: '' }), h('span', { class: `gcrc ${c2}` }, l2),
-                    h('b', null, drvName(x)), h('span', { class: 'shm' }, `${playQuarter(x.q)} ${x.start} · ${x.n} play${x.n === 1 ? '' : 's'} · ${x.yds} yds`), h('span', { class: 'fx' }, ...top.map(([pid, v]) => gcChip(pid, v, oppR)))); })) : null,
-            nowTxt && di === drives.length - 1 ? h('div', { class: 'gcnow' }, h('img', { class: 'gclogo', src: teamLogo(nowTxt.pos), alt: '' }), h('span', { class: 'gcrc live' }, 'LIVE'), h('b', null, nowTxt.txt),
-                nowTxt.fresh && d.pos !== nowTxt.pos ? h('span', { class: 'shm' }, `drive starting after ${d.result === 'In progress' ? `the ${d.pos} drive` : `a ${d.pos} ${d.result.toLowerCase()}`}`) : null) : null,
-            h('div', { class: 'gcdh' }, h('img', { class: 'gclogo', src: teamLogo(d.pos), alt: '' }),
-                h('div', null, h('div', { class: 'res' }, h('span', { class: `gcrc ${rc}` }, rl), drvName(d)), h('div', { class: 'sum mono' }, `${playQuarter(d.q)} ${d.start} · ${d.n} play${d.n === 1 ? '' : 's'} · ${d.yds} yds · ${mmss(d.dur)} · from ${d.startYl}`))),
-            ...shown.map(playRow),
-            all.length > shown.length ? h('div', { class: 'gcmore' }, `${all.length - shown.length} earlier play${all.length - shown.length === 1 ? '' : 's'} in this drive · `,
-                h('button', { class: 'lnk', type: 'button', 'data-act': 'gc-more', onclick: () => { S.ui.gcMore = true; render(); } }, 'show')) : null);
+            h('div', { class: 'gcpbh' }, h('h3', null, 'Play by play'), h('span', { class: 'shm' }, 'newest first · press a drive to open it')),
+            h('div', { class: 'gccg' },
+                h('div', { class: 'gcdcol' }, h('div', { class: 'gcdlh' }, `Drives · ${drives.length}`),
+                    h('div', { class: 'gcdls', 'data-keep': `gcdrives-${g.gid}` }, ...drives.map((x, n) => n).reverse().map((n) => {
+                        const x = drives[n], [c2, l2] = resTag(x);
+                        return h('div', { class: `gcdl ${n === di ? 'on' : ''}`, 'data-drive': n, 'aria-current': n === di ? 'true' : null, title: drvName(x), ...tap(() => goDrv(n), `gcdl:${n}`) },
+                            h('img', { class: 'gclogo', src: teamLogo(x.pos), alt: '' }),
+                            h('div', { class: 't' }, h('div', { class: 'nm' }, h('span', { class: `gcrc ${c2}` }, l2), drvName(x)),
+                                h('div', { class: 'sub mono' }, `${playQuarter(x.q)} ${x.start} · ${x.n} play${x.n === 1 ? '' : 's'} · ${x.yds} yds`))); }))),
+                h('div', { class: 'gcpcol' },
+                    h('div', { class: `gcsum${live ? ' live' : ''}` }, h('img', { class: 'gclogo', src: teamLogo(d.pos), alt: '' }),
+                        h('div', { class: 'gcst' }, h('span', { class: 'eb' }, `${d.pos} drive · ${di + 1} of ${drives.length}`),
+                            h('div', { class: 'hl', title: head }, h('span', { class: `gcrc ${live ? 'live' : rc}` }, live ? 'LIVE' : rl), head)),
+                        h('div', { class: 'cells' }, cell('Plays', String(d.n)), cell('Yards', String(d.yds)), cell('Time', mmss(d.dur)), cell('Started', `${playQuarter(d.q)} ${d.start} · ${d.startYl}`))),
+                    h('div', { class: 'gccolh' }, h('span', null, 'Clock'), h('span', null, 'Down · spot'), h('span', null, 'Play · fantasy points'), h('span', { class: 'r' }, 'Gain')),
+                    ...shown.map(playRow),
+                    all.length > shown.length ? h('div', { class: 'gcmore' }, `${all.length - shown.length} earlier play${all.length - shown.length === 1 ? '' : 's'} in this drive · `,
+                        h('button', { class: 'lnk', type: 'button', 'data-act': 'gc-more', onclick: () => { S.ui.gcMore = true; render(); } }, 'show')) : null)));
     }
     // ── the players, a column a team and a group a position. Points draws each one's projection on his bar (the
     // fill scored, the outline his projection for the game, the tick that projection's share for the game played);
@@ -8728,11 +8860,228 @@ function pageMatchup() {
         foldCaret(wallOpen, 'chev'), h('b', null, wallOpen ? 'League scoreboard' : 'League'),
         wallOpen ? null : h('span', { class: 'wallchips', onclick: (e) => e.stopPropagation() }, ...games.map(foldChip)));
     page.append(swCard, h('div', { class: `card span2 wallcard ${wallOpen ? '' : 'folded'}` }, bar, wallOpen ? h('div', { class: 'wall' }, ...games.map(g2 => sixCell(g2, viewId))) : null));
+    if (a && B) {
+        const tab = muTab(); page.classList.add('mtabbed'); page.append(muRail(games, viewId), muTabBar(tab));
+        if (tab === 'bd') { page.append(...breakdownCards(A, a, B, b)); return page; }
+    }
     page.append(matchupHeader(R, false));
     if (a && B) { page.append(muMirror(A, a, B, b)); page.append(muState(A, a, B, b).state === 'proj' ? edgeCard(A, a, B, b) : playLog(A, a, B, b)); }
     else if (a) { page.append(lineupCard(A, a, true)); page.append(h('div', { class: 'card' }, h('div', { class: 'empty' }, 'Bye week — no opponent.'))); }
     else page.append(h('div', { class: 'card span2' }, h('div', { class: 'empty' }, ms.length ? 'Pick a matchup above.' : 'No matchups for this week.')));
     return page;
+}
+// ── the matchup's Breakdown tab ──────────────────────────────────────────────
+// The single matchup page has two tabs (the user, 2026-10-25, picked B): Live, the page it always was with two
+// cards gaining a view each, and Breakdown, the second-level read. Rows have a set height and a long list
+// scrolls inside its card ("make the tiles less freakishly tall and use scrolls within the widgets"), so a row
+// ends level without a tile stretched to its tallest neighbour. The open tab is a per-viewer preference.
+function muTab() { if (S.ui.muTab) return S.ui.muTab; let v = 'live'; try { v = localStorage.getItem('badgerMuTab') === 'bd' ? 'bd' : 'live'; } catch (e) {} return (S.ui.muTab = v); }
+function setMuTab(v) { S.ui.muTab = v; try { localStorage.setItem('badgerMuTab', v); } catch (e) {} render(); }
+// The league's games in a rail on the left, as NFL games has them (the user, 2026-10-25), wherever the page has two
+// columns: with team names from 1600px; narrower, slim (each team its avatar and score) with the play log's Score
+// now column dropped to pay for it, which at 1280 leaves Head to head's names as the League strip did. Stacked,
+// CSS hides the rail and the strip stays. All matchups at the top, your game first, the one on screen marked.
+function muRail(games, viewId) {
+    const cell = (g) => {
+        const st = g.st, pre = st.state === 'proj', on = viewId != null && g.m.matchup_id === viewId, go = () => openGame(g);
+        const line = (R, v, lead) => h('div', { class: `rmt${lead ? ' lead' : ''}`, title: R ? `${teamName(R)} ${fmtS(v)}` : 'Bye' },
+            R ? avatarEl(R, 'xs') : h('span'), h('span', { class: 'nm' }, R ? teamName(R) : 'Bye'), h('span', { class: 'sc mono' }, R ? fmtS(v) : ''));
+        const pct = st.state === 'fin' || !g.B ? '' : `${st.wX}% – ${100 - st.wX}%`;
+        return h('div', { class: `rmg${on ? ' on' : ''}`, role: 'button', tabindex: '0', 'aria-current': on ? 'true' : null, 'data-focus': `murail:${g.m.matchup_id}`,
+            title: `${g.A ? teamName(g.A) : ''} ${fmtS(st.vX)} v ${g.B ? teamName(g.B) : 'Bye'} ${g.B ? fmtS(st.vY) : ''}${pct ? ` · ${pct}` : ''} · ${on ? 'on screen' : 'open this matchup'}`,
+            onclick: (e) => { e.stopPropagation(); go(); }, onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } } },
+            line(g.A, st.vX, !pre && st.vX >= st.vY), line(g.B, st.vY, !pre && st.vY > st.vX),
+            h('div', { class: 'rms mono' }, st.state === 'live' ? h('span', { class: 'lv' }, '● LIVE') : muTag(st), pct ? h('span', { class: 'rpc' }, ` · ${pct}`) : null));
+    };
+    const mine = games.filter((g) => g.mine), rest = games.filter((g) => !g.mine);
+    return h('div', { class: 'card murail' },
+        h('button', { class: 'ram', type: 'button', onclick: (e) => { e.stopPropagation(); S.ui.muPick = false; S.ui.muView = 'all'; render(); } }, 'All matchups', h('span', null, `${games.length} games`)),
+        mine.length ? h('h4', null, 'Your matchup') : null, ...mine.map(cell),
+        rest.length ? h('h4', null, 'The league') : null, ...rest.map(cell));
+}
+function muTabBar(on) {
+    return h('div', { class: 'span2 mutabs' }, h('div', { class: 'ptabs', role: 'tablist' },
+        ...[['live', 'Live'], ['bd', 'Breakdown']].map(([k, t]) => h('button', { class: k === on ? 'on' : '', type: 'button', role: 'tab', 'aria-selected': String(k === on), 'data-focus': `mutab:${k}`,
+            onclick: (e) => { e.stopPropagation(); setMuTab(k); } }, t))));
+}
+function breakdownCards(A, a, B, b) {
+    // a number is the row's height; 'fit' sizes the row to its right-hand stack and lets the left card's list scroll
+    const row = (h0, ...cards) => h('div', { class: `bdrow${h0 === 'fit' ? ' fit' : h0 ? ' set' : ''}`, style: typeof h0 === 'number' && h0 ? `height:${h0}px` : null }, ...cards);
+    return [h('div', { class: 'span2 bdgrid' },
+        row(470, bdOverUnder(A, a, B, b), bdWinAdded(A, a, B, b)),
+        row(0, bdSources(A, a, B, b), bdBigPlays(A, a, B, b)),
+        row('fit', bdLeagueWeek(A, B), h('div', { class: 'bdstack' }, bdBench(A, a, B, b), bdMeetings(A, B))))];
+}
+// 4 · Over / under: the all-games card itself, cut to these two lineups
+function bdOverUnder(A, a, B, b) {
+    const ids = new Set([A.roster_id, B.roster_id]);
+    return overUnderCard(leagueStarters().filter((x) => x.started && ids.has(x.R.roster_id)), { sub: 'against his projection so far, in this game only', keep: 'muou' });
+}
+// 5 · Win probability added: each play's swing in this game's odds, shared among the starters on it by their
+// points, and counted for the player's own side
+function bdWinAdded(A, a, B, b) {
+    const L = buildLedger(A, a, B, b), tot = {};
+    for (const e of (L ? L.events : [])) {
+        if (e.kind === 'clock' || !e.who || !e.who.length) continue;
+        const abs = e.who.reduce((t, w) => t + Math.abs(w.dp || 0), 0); if (!abs) continue;
+        for (const w of e.who) { const share = e.dw * Math.abs(w.dp || 0) / abs; tot[w.pid] = (tot[w.pid] || { v: 0, side: w.side }); tot[w.pid].v += w.side === 'b' ? -share : share; }
+    }
+    const rows = Object.entries(tot).map(([pid, x]) => ({ pid, v: x.v * 100, side: x.side })).filter((x) => Math.abs(x.v) >= 0.05).sort((p, q) => q.v - p.v);
+    const head = s6Head('Win probability added', 'who has moved this game’s odds most for his own side');
+    if (!rows.length) return h('div', { class: 'card s6feed bdcard' }, head, h('div', { class: 'empty' }, L ? 'No play has moved the odds yet.' : 'Reading this week’s plays from Sleeper…'));
+    const max = Math.max(...rows.map((x) => Math.abs(x.v)));
+    const R0 = { a: A, b: B };
+    return h('div', { class: 'card s6feed bdcard' }, head,
+        h('div', { class: 's6list', 'data-keep': 'muwpa' }, ...rows.map((x) => h('div', { class: 'wparow', title: `${pname(x.pid)}: ${x.v > 0 ? 'added' : 'cost'} ${fmt1(Math.abs(x.v))} points of ${teamName(R0[x.side])}’s chance to win`, onclick: () => { S.ui.sel = x.pid; render(); } },
+            faceEl(x.pid, R0[x.side]),
+            s6Lab([h('b', null, pname(x.pid))], [h('span', { class: `s6l2 ${x.side}` }, teamName(R0[x.side]))]),
+            h('span', { class: 'wpabar' }, h('i', { class: `${x.side}${x.v < 0 ? ' neg' : ''}`, style: `width:${(Math.abs(x.v) / max * 100).toFixed(1)}%` })),
+            h('span', { class: `wpav mono ${x.v > 0 ? 'up' : 'dn'}` }, `${x.v > 0 ? '▲ +' : '▼ −'}${fmt1(Math.abs(x.v))}%`)))),
+        h('div', { class: 'cap' }, 'Each play’s swing in win odds, shared among the players on it by their points.'));
+}
+// 2 · Where the points came from, in this league's scoring: each starter's stats priced by category, a
+// defence's points as D/ST, and whatever a stat line does not explain (bonuses, rounding) as Other
+const BD_SRC = [['Yardage', 'yd'], ['Touchdowns', 'td'], ['Receptions', 'rec'], ['Kicking', 'k'], ['D/ST', 'dst'], ['Turnovers', 'to'], ['Other', 'oth']];
+const bdCat = (k) => /^(pass|rush|rec)_yd$/.test(k) ? 'Yardage' : /^(pass|rush|rec)_(td|2pt)/.test(k) ? 'Touchdowns' : (k === 'rec' || /^bonus_rec/.test(k)) ? 'Receptions'
+    : /^(pass_int|fum_lost|fum)$/.test(k) ? 'Turnovers' : /^(fgm|fgmiss|xpm|xpmiss)/.test(k) ? 'Kicking' : 'Other';
+function bdSourcesOf(R, m) {
+    const out = {}, sc = (S.league && S.league.scoring_settings) || {}, add = (c, v) => { out[c] = (out[c] || 0) + v; };
+    for (const pid of muStarters(R, m)) {
+        if (!pid || pid === '0') continue;
+        const pts = ((m && m.players_points) || {})[pid] || 0;
+        if (ppos(pid) === 'DEF') { add('D/ST', pts); continue; }
+        const st = ((S.stats[S.week] || {})[pid] || {}).stats || {}; let got = 0;
+        for (const k in st) if (sc[k] != null && typeof st[k] === 'number' && st[k]) { const v = st[k] * sc[k]; add(bdCat(k), v); got += v; }
+        if (Math.abs(pts - got) > 0.05) add('Other', pts - got);
+    }
+    return out;
+}
+// A stacked bar in seven category colours read badly (the user, 2026-10-25: greys and pinks too alike). Away from
+// teal and blue (the two sides) and green and red (gain and loss), no set of hues stays apart, so there are none: a row per
+// category, your side's bar to the left and theirs to the right in the sides' own colours, the numbers at the ends.
+function bdSources(A, a, B, b) {
+    const sa = bdSourcesOf(A, a), sb = bdSourcesOf(B, b);
+    const cats = BD_SRC.filter(([c2]) => Math.abs(sa[c2] || 0) >= 0.05 || Math.abs(sb[c2] || 0) >= 0.05);
+    const max = Math.max(1, ...cats.flatMap(([c2]) => [sa[c2] || 0, sb[c2] || 0]));
+    const W = (v) => `${(Math.max(0, v) / max * 100).toFixed(1)}%`, tot = (sx) => cats.reduce((t, [c2]) => t + (sx[c2] || 0), 0);
+    const v = (x, lead, r) => h('span', { class: `srcv mono${lead ? ' lead' : ''}${r ? ' r' : ''}` }, `${x < 0 ? '−' : ''}${fmt1(Math.abs(x))}`);
+    return h('div', { class: 'card bdcard' }, s6Head('Where the points came from', 'did each side win on volume, or on touchdowns?'),
+        h('div', { class: 'srchead' }, h('span', { class: 'a' }, teamName(A)), h('span', { class: 'b' }, teamName(B))),
+        ...cats.map(([c2]) => { const va = sa[c2] || 0, vb = sb[c2] || 0;
+            return h('div', { class: 'srcrow', title: `${c2}: ${teamName(A)} ${fmt1(va)}, ${teamName(B)} ${fmt1(vb)}` }, v(va, va > vb),
+                h('span', { class: 'srcb l' }, h('i', { style: `width:${W(va)}` })), h('span', { class: 'srcc' }, c2),
+                h('span', { class: 'srcb r' }, h('i', { style: `width:${W(vb)}` })), v(vb, vb > va, true)); }),
+        h('div', { class: 'srcrow tot' }, v(tot(sa), tot(sa) > tot(sb)), h('span'), h('span', { class: 'srcc' }, 'Total'), h('span'), v(tot(sb), tot(sb) > tot(sa), true)),
+        h('div', { class: 'cap' }, 'In this league’s scoring. A negative, such as an interception, shows its number with no bar.'));
+}
+// 14 · Big plays and the red zone, from the week's plays: starters only
+function bdBigPlays(A, a, B, b) {
+    const sets = { a: new Set(muStarters(A, a)), b: new Set(muStarters(B, b)) }, cnt = { a: { big: 0, pass: 0, rz: 0 }, b: { big: 0, pass: 0, rz: 0 } }, tds = { a: [], b: [] };
+    const rec = S.plays[S.week];
+    for (const p of (rec && rec.list) || []) {
+        const md = p.metadata || {};
+        for (const ps of playStatsOf(p)) {
+            const pid = String(ps.player_id), st = ps.stats || {}, k = sets.a.has(pid) ? 'a' : sets.b.has(pid) ? 'b' : null;
+            if (!k) continue;
+            if (Math.max(st.rush_yd || 0, st.rec_yd || 0) >= 20) cnt[k].big++;
+            if ((st.pass_yd || 0) >= 20 && ppos(pid) === 'QB') cnt[k].pass++;
+            if (md.yards_to_end_zone != null && md.yards_to_end_zone <= 20 && (st.rush_att || st.rec_tgt)) cnt[k].rz++;
+            if (st.rush_td) tds[k].push([pid, `${md.yards_gained || 0}-yard TD run`]);
+            if (st.rec_td) tds[k].push([pid, `${md.yards_gained || 0}-yard TD catch`]);
+        }
+    }
+    const side = (R, k) => h('div', { class: 'bpside' }, h('div', { class: `bpnm ${k}` }, teamName(R)),
+        h('div', { class: 'bptiles' }, ...[['big', '20+ yard plays'], ['pass', '20+ yard passes'], ['rz', 'red-zone touches']].map(([f, t]) => h('div', { class: 'bptile' }, h('b', { class: 'mono' }, String(cnt[k][f])), h('span', null, t)))),
+        tds[k].length ? h('div', { class: 'bptds' }, ...tds[k].map(([pid, t]) => h('div', { class: 'bptd', onclick: () => { S.ui.sel = pid; render(); } }, faceEl(pid, R), h('b', null, (P(pid) || {}).last_name || pname(pid)), h('span', null, t))))
+            : h('div', { class: 'bptd none' }, 'No touchdowns yet.'));
+    return h('div', { class: 'card bdcard' }, s6Head('Big plays and the red zone', 'how did the points happen?'),
+        h('div', { class: 'bpsides' }, side(A, 'a'), side(B, 'b')),
+        h('div', { class: 'cap' }, rec ? 'Starters only, from every play Sleeper records.' : 'Reading this week’s plays from Sleeper…'));
+}
+// 11 · This week across the league: every team's score so far, and whom each side would beat
+function bdLeagueWeek(A, B) {
+    const ms = (S.matchups[S.week] || []).map((m) => ({ R: rosterById(m.roster_id), v: m.points || 0 })).filter((x) => x.R).sort((p, q) => q.v - p.v);
+    const beats = (R) => { const me = ms.find((x) => x.R.roster_id === R.roster_id); return me ? ms.filter((x) => x !== me && x.v < me.v).length : 0; };
+    const max = Math.max(1, ...ms.map((x) => x.v)), cls = (R) => R.roster_id === A.roster_id ? 'a' : R.roster_id === B.roster_id ? 'b' : '';
+    return h('div', { class: 'card s6feed bdcard' }, s6Head('This week across the league', 'would your score beat anyone else this week?'),
+        h('div', { class: 'lwhead' }, h('span', { class: 'a' }, `${teamName(A)} would beat `, h('b', { class: 'mono' }, String(beats(A))), ` of ${ms.length - 1}`),
+            h('span', { class: 'b' }, `${teamName(B)} `, h('b', { class: 'mono' }, String(beats(B))), ` of ${ms.length - 1}`)),
+        h('div', { class: 's6list lwlist', 'data-keep': 'mulw' }, ...ms.map((x, i) => h('div', { class: `lwrow ${cls(x.R)}` },
+            h('span', { class: 'lwn' }, `${i + 1}. `, teamName(x.R)), h('span', { class: 'lwbar' }, h('i', { style: `width:${(x.v / max * 100).toFixed(1)}%` })), h('span', { class: 'mono lwv' }, fmt1(x.v))))),
+        h('div', { class: 'cap' }, 'Every team’s score this week so far.'));
+}
+// 7 · Bench points and the best possible lineup, with hindsight, from points scored so far: Sleeper's best
+// legal lineup (the same exact search the standings use), and the bench players who outscored a starter
+function bdBenchSide(R, m, k) {
+    const pp = (m && m.players_points) || {}, starters = muStarters(R, m), slots = starterSlots();
+    const bench = muBench(R, m), bpts = bench.reduce((t, pid) => t + (pp[pid] || 0), 0), best = Math.max(m.points || 0, optimalPointsFrom(m));
+    const fits = (pid, sl) => { const p2 = ppos(pid); return FLEX[sl] ? FLEX[sl].includes(p2) : (sl === 'DEF' ? p2 === 'DEF' : p2 === sl); };
+    const used = new Set(), swaps = [];
+    for (const bp of bench.slice().sort((x, y) => (pp[y] || 0) - (pp[x] || 0))) {
+        let low = -1;
+        starters.forEach((sp, i) => { if (used.has(i) || !fits(bp, slots[i])) return; const v = sp && sp !== '0' ? pp[sp] || 0 : -1; if ((pp[bp] || 0) > v && (low < 0 || v < (pp[starters[low]] || 0))) low = i; });
+        if (low >= 0) { used.add(low); swaps.push([bp, starters[low], (pp[bp] || 0) - (pp[starters[low]] || 0)]); }
+    }
+    return h('div', { class: 'bnside' }, h('div', { class: `bnnm ${k}` }, teamName(R)),
+        h('div', { class: 'bnl' }, h('b', { class: 'mono' }, fmt1(bpts)), ' on the bench so far'),
+        h('div', { class: 'bnl dim' }, 'Best possible lineup ', h('b', { class: 'mono' }, fmt1(best)), ` against ${fmt1(m.points || 0)} started`),
+        ...swaps.map(([i2, o, d]) => h('div', { class: 'bnsw' }, faceEl(i2, R), h('span', null, h('b', null, (P(i2) || {}).last_name || pname(i2)), h('small', null, ` ${fmt1(pp[i2] || 0)}`), ' over ',
+            h('b', null, o && o !== '0' ? (P(o) || {}).last_name || pname(o) : 'an empty slot'), h('small', null, ` ${fmt1(pp[o] || 0)}`)), h('span', { class: 'mono up' }, `+${fmt1(d)}`))));
+}
+function bdBench(A, a, B, b) {
+    return h('div', { class: 'card bdcard bdscroll' }, s6Head('Bench points and the best possible lineup', 'what did each side leave on the bench?'),
+        h('div', { class: 'bdbody', 'data-keep': 'mubench' }, h('div', { class: 'bngrid' }, bdBenchSide(A, a, 'a'), bdBenchSide(B, b, 'b'))),
+        h('div', { class: 'cap' }, 'With hindsight, from the points scored so far.'));
+}
+// 12 · Head to head, all time: every regular-season meeting of these two managers in this league, this
+// season's from the weeks already loaded and earlier seasons' from the previous_league_id chain, fetched
+// once a season and kept (a finished season never changes)
+async function loadPastMeetings() {
+    if (S.pastMu || S.pastMuBusy) return; S.pastMuBusy = true;
+    try {
+        await Promise.all(Array.from({ length: Math.max(0, S.week - 1) }, (_, i) => i + 1).filter((w) => !S.matchups[w]).map((w) => loadMatchups(w)));
+        await loadSeasonChain();
+        const out = [];
+        for (const c of S.chain || []) {
+            let rec = await idbGet(`pastmu:${c.id}`);
+            if (!rec) {
+                const rs = await rest(`${API}/league/${c.id}/rosters`), weeks = {};
+                for (let w = 1; w <= 18; w++) {
+                    const ms = await rest(`${API}/league/${c.id}/matchups/${w}`).catch(() => null);
+                    if (!ms || !ms.length || !ms.some((m) => m.points)) break;
+                    weeks[w] = ms.map((m) => ({ roster_id: m.roster_id, matchup_id: m.matchup_id, points: m.points || 0 }));
+                }
+                rec = { season: c.season, owners: Object.fromEntries(rs.map((r) => [r.roster_id, r.owner_id])), weeks };
+                await idbSet(`pastmu:${c.id}`, rec);
+            }
+            out.push(rec);
+        }
+        S.pastMu = out;
+    } catch (e) { console.warn(TAG, 'past meetings:', e.message); S.pastMu = S.pastMu || []; }
+    finally { S.pastMuBusy = false; render(); }
+}
+function bdMeetings(A, B) {
+    if (!S.pastMu) loadPastMeetings();
+    const oa = A.owner_id, ob = B.owner_id, list = [];
+    const scan = (season, owners, weeks, live) => {
+        const ra = Object.keys(owners).find((r) => owners[r] === oa), rb = Object.keys(owners).find((r) => owners[r] === ob);
+        if (!ra || !rb) return;
+        for (const w of Object.keys(weeks).map(Number).sort((x, y) => y - x)) {
+            const x = weeks[w].find((m) => String(m.roster_id) === ra), y = weeks[w].find((m) => String(m.roster_id) === rb);
+            if (x && y && x.matchup_id && x.matchup_id === y.matchup_id) list.push({ season, w, a: x.points || 0, b: y.points || 0, live: live && w === S.week && S.week >= S.curWeek });
+        }
+    };
+    const cur = {}; for (let w = 1; w <= S.week; w++) if (S.matchups[w]) cur[w] = S.matchups[w];
+    scan(S.season, Object.fromEntries(S.rosters.map((r) => [String(r.roster_id), r.owner_id])), cur, true);
+    for (const p of S.pastMu || []) scan(p.season, Object.fromEntries(Object.entries(p.owners).map(([r, o]) => [String(r), o])), p.weeks, false);
+    const done = list.filter((x) => !x.live), wa = done.filter((x) => x.a > x.b).length, wb = done.filter((x) => x.b > x.a).length;
+    return h('div', { class: 'card bdcard bdscroll' }, s6Head('Head to head, all time', 'how have these two done against each other?'),
+        h('div', { class: 'mtrec' }, h('span', { class: 'a' }, teamName(A)), h('b', { class: 'mono' }, `${wa} – ${wb}`), h('span', { class: 'b' }, teamName(B))),
+        h('div', { class: 'bdbody', 'data-keep': 'mumeet' }, ...(list.length ? list.map((x) => h('div', { class: 'mtrow' }, h('span', { class: 'dim' }, `${x.season} · week ${x.w}${x.live ? ' · live' : ''}`),
+            h('span', { class: `mono a${x.a > x.b ? ' w' : ''}` }, fmtS(x.a)), h('span', { class: 'dim' }, '–'), h('span', { class: `mono b${x.b > x.a ? ' w' : ''}` }, fmtS(x.b)),
+            h('span', { class: 'dim' }, x.live ? '' : x.a === x.b ? 'tied' : `${x.a > x.b ? 'won' : 'lost'} by ${fmtS(Math.abs(x.a - x.b))}`)))
+            : [h('div', { class: 'empty' }, S.pastMuBusy ? 'Reading earlier seasons from Sleeper…' : 'These two have not met in a regular-season game in this league.')])),
+        h('div', { class: 'cap' }, 'Regular-season meetings between these two managers in this league, newest first.'));
 }
 // Before kickoff, in the play log's place: where each side is projected ahead,
 // slot by slot, with the total. One scale for every bar — half the track is the
