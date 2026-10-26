@@ -2772,3 +2772,21 @@
 .bl .murail .rms .lv { color: var(--red); }
 
 .bl .ptbox > .wprow.b { margin: 4px 0 0; }   /* the second team's row, under the curve and above its window names */
+
+/* ── Trades › Ideas: each idea in the drawer's card, with both sides' chances (the user, 2026-10-25) ── */
+.bl .txd .tiyou { background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; margin-bottom: 8px; }
+.bl .txd .tiyh { font-weight: 800; font-size: 12px; margin-bottom: 4px; }
+.bl .txd .tiyo { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); } .bl .txd .tiyo b { font: 700 14px var(--mono); color: var(--ink); }
+.bl .txd .tigoal { display: flex; align-items: center; gap: 8px; margin-top: 7px; } .bl .txd .tigl { font: 700 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); }
+.bl .txd .tinote { font-size: 11px; color: var(--ink-3); margin-top: 4px; }
+.bl .txd .tiodds { display: flex; flex-direction: column; gap: 3px; border-top: 1px solid var(--line); margin-top: 4px; padding-top: 6px; }
+.bl .txd .tiod { display: grid; grid-template-columns: minmax(0, 92px) 1fr 1fr; gap: 6px; align-items: baseline; font-size: 12px; color: var(--ink-3); }
+.bl .txd .tiwho { font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .bl .txd .tiod.me .tiwho { color: var(--teal); } .bl .txd .tiod.them .tiwho { color: var(--blue); }
+.bl .txd .tiol b { font: 600 12px var(--mono); color: var(--ink-2); }
+.bl .txd .tich { font: 700 12px var(--mono); } .bl .txd .tich.up { color: var(--green); } .bl .txd .tich.dn { color: var(--red); } .bl .txd .tich.flat { color: var(--ink-3); font-weight: 600; }
+.bl .txd .tisit { font-size: 11.5px; color: var(--ink-3); padding-left: 8px; border-left: 2px solid var(--line-2); margin-top: 5px; } .bl .txd .tisit.po { border-left-color: var(--amber); } .bl .txd .tisit.title { border-left-color: var(--ink-2); }
+.bl .txd .tiavg { font-size: 11px; color: var(--ink-3); margin-top: 4px; }
+.bl .txd .tihard { font-size: 11.5px; color: var(--amber); margin-top: 4px; }
+.bl .txd .tialt { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--ink-2); padding: 4px 0 0 8px; } .bl .txd .tialt > span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bl .txd .tirg { position: relative; display: inline-block; width: 46px; height: 6px; border-radius: 3px; background: var(--line); vertical-align: 1px; margin-right: 2px; }
+.bl .txd .tirg i { position: absolute; top: 0; bottom: 0; border-radius: 3px; background: var(--ink-3); } .bl .txd .tirg b { position: absolute; top: -2px; width: 2px; height: 10px; border-radius: 1px; background: var(--ink); }

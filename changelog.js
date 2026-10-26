@@ -7,6 +7,16 @@
 // say adds none and rides under the latest one.
 globalThis.BADGER_NOTES = [
     {
+        v: '2026.10.26', when: 'October 26, 2026', title: 'Trade ideas, judged by your chances',
+        items: [
+            'Trades has a new part, <b>Ideas</b>: trades across the whole league that raise your chances of making the playoffs or winning the title, including two for one either way and three-team trades.',
+            'Each idea shows both sides’ playoff and title odds before and after, what the other team is playing for, and each player’s usual week, from a bad one to a good one. The odds come from playing out the rest of the season, every player’s ups and downs included, thousands of times.',
+            '<b>Rank by</b> playoff odds or title odds; it starts from where you stand. A trade that lowers the other side’s odds stays in the list, marked as a hard sell.',
+            '<b>Propose</b> opens the trade screen with both sides filled in. A three-team trade goes to both managers as one offer.',
+            'Offers you send or receive now show what they do to each side’s playoff and title odds.',
+        ],
+    },
+    {
         v: '2026.10.25', when: 'October 25, 2026', title: 'A Breakdown tab for your matchup, and NFL games by drive',
         items: [
             'Your matchup has two tabs. <b>Live</b> is the page you know. <b>Breakdown</b> adds over and under performers in your game, who has moved the win odds most, where each side’s points came from, big plays and the red zone, how your score stacks up across the league, bench points and the best possible lineup, and your record against this opponent in every season.',

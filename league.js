@@ -6733,9 +6733,9 @@ const seg = (labels, on, pick) => h('span', { class: 'txseg', role: 'group' }, .
 // Two tabs, by kind. Each has the thing you start with pinned on top (the search
 // box; "Propose a trade"), and under it the parts: what is live, and History.
 // Waivers & Adds also has Ideas, the players worth a look.
-const TX_PARTS = { waivers: [['claims', 'Claims'], ['ideas', 'Ideas'], ['history', 'History']], trades: [['offers', 'Offers'], ['history', 'History']] };
+const TX_PARTS = { waivers: [['claims', 'Claims'], ['ideas', 'Ideas'], ['history', 'History']], trades: [['offers', 'Offers'], ['ideas', 'Ideas'], ['history', 'History']] };
 // The commissioner's Trades has Review between them, always, so nothing moves when a trade arrives.
-const txPartList = (tab) => tab === 'trades' && amCommish() ? [['offers', 'Offers'], ['review', 'Review'], ['history', 'History']] : TX_PARTS[tab];
+const txPartList = (tab) => tab === 'trades' && amCommish() ? [['offers', 'Offers'], ['ideas', 'Ideas'], ['review', 'Review'], ['history', 'History']] : TX_PARTS[tab];
 const lastNm = (pid) => (ppos(pid) === 'DEF' ? pname(pid) : (P(pid) || {}).last_name || pname(pid));
 const runDay = (at) => { const d = new Date(at); return `${DAY[d.getDay()]} ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`; };
 const NUMW = ['no', 'one', 'two', 'three', 'four', 'five', 'six'];
@@ -7415,6 +7415,325 @@ function txOffers() {
     if (!ts.length) { const dl = (S.league.settings || {}).trade_deadline; return [txEmpty(`No offers either way.${dl && dl <= LAST_WEEK ? ` The deadline is week ${dl}.` : ''}`)]; }
     return [h('div', { class: 'txcols' }, h('span'), h('span', { class: 'txc' }, `WK ${txWeek()}`), h('span', { class: 'txc' }, 'RoS')), ...[...by.toyou, ...by.sent, ...by.review].map(tradeCardTx)];
 }
+// ── Trades › Ideas: the season played player by player ───────────────────────
+// (the user, 2026-10-25: "trades that help win, which sometimes means big swings rather than margin increases in
+// average points".) The playoff odds play a team's week as one number whose spread depends only on its projected
+// total, so a steady player and a boom-or-bust one with the same projection look alike there. Ideas need the
+// difference, so here each player's week is drawn:
+//  - his Sleeper projection times a ratio drawn from what actually happened to projections at his position this
+//    season (every player-week projected at 3 or more), the spread widened or narrowed by his own record, shrunk
+//    toward his position's until he has games behind him;
+//  - every team starts its best projected lineup, as a manager would, and only starters count;
+//  - the regular season plays out on the real schedule, seeded by the same rules as the playoff odds, and the
+//    bracket plays to a champion, so title odds come with it;
+//  - a trade is replayed on the same draws (a draw is a hash of season, week and player), so the difference is the
+//    trade and not the luck of a different run.
+// Each idea is judged by what it does to each side's chance of the playoffs and of the title. A team's own goal is
+// read from where it stands: a contender plays for the title, everyone else for a playoff spot.
+const TS_N = 2000, TS_N2 = 10000, TS_POS = ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'];
+// Before there are games to learn from: actual over projected at each position, 10th / 50th / 90th percentile, as
+// Sleeper's projections did through week 6 of 2026.
+const TS_FALLBACK = { QB: [0.47, 0.96, 1.68], RB: [0.18, 0.74, 1.85], WR: [0.13, 0.79, 2.08], TE: [0, 0.66, 2.34], K: [0.44, 0.99, 1.84], DEF: [0.33, 1.55, 3.22] };
+const tsYield = () => new Promise((res) => setTimeout(res, 0));
+async function tsPools() {
+    const cur = Math.max(1, S.curWeek), key = `tspools:${S.leagueId}:${S.season}:${cur}`;
+    if (S.tsPools && S.tsPools.key === key) return S.tsPools;
+    let rec = await idbGet(key);
+    if (!rec) {
+        const pool = Object.fromEntries(TS_POS.map((p) => [p, []])), own = {}, qs = TS_POS.map((p) => `&position[]=${p}`).join('');
+        for (let w = 1; w < cur; w++) {
+            const [pr, st] = await Promise.all([rest(weekProjUrl(w)).catch(() => []), rest(`${API2}/stats/nfl/${S.season}/${w}?season_type=regular${qs}`).catch(() => [])]);
+            const act = {}; for (const x of st) act[x.player_id] = x.stats || {};
+            for (const x of pr) {
+                const pid = String(x.player_id), p = ppos(pid), pj = scoreStats(x.stats), a = act[pid], got = a ? scoreStats(a) || 0 : 0;
+                if (!pool[p] || !(pj >= 3) || !a || (!a.gp && !a.gms_active && !got)) continue;   // no line, or a line for a game he sat out
+                const r = Math.max(0, got / pj); pool[p].push(r); (own[pid] = own[pid] || []).push(r);
+            }
+        }
+        rec = { key, pool, own };
+        if (cur > 1) idbSet(key, rec);
+    }
+    // a position with too little behind it (week 1 or 2) borrows the shape above
+    for (const p of TS_POS) {
+        if (rec.pool[p].length >= 40) { rec.pool[p].sort((x, y) => x - y); continue; }
+        const [a, m, b] = TS_FALLBACK[p], out = [];
+        for (let i = 0; i <= 100; i++) { const u = i / 100; out.push(u <= 0.1 ? a * u / 0.1 : u <= 0.5 ? a + (m - a) * (u - 0.1) / 0.4 : u <= 0.9 ? m + (b - m) * (u - 0.5) / 0.4 : b * (1 + (u - 0.9) * 3)); }
+        rec.pool[p] = out;
+    }
+    const sd = (a) => { if (a.length < 2) return 0; const m = a.reduce((t, x) => t + x, 0) / a.length; return Math.sqrt(a.reduce((t, x) => t + (x - m) ** 2, 0) / (a.length - 1)); };
+    const sdPos = Object.fromEntries(TS_POS.map((p) => [p, sd(rec.pool[p])])), vols = {};
+    rec.vol = (pid) => { if (vols[pid] != null) return vols[pid]; const p = ppos(pid), o = rec.own[pid] || [], k = o.length, s0 = sdPos[p];
+        return (vols[pid] = !s0 ? 1 : Math.max(0.55, Math.min(1.7, ((k * (k >= 2 ? sd(o) : s0)) + 6 * s0) / (k + 6) / s0))); };
+    // his usual week: the 10th and 90th percentile of his draws at his average projection
+    rec.band = (pid, avg) => { const P = rec.pool[ppos(pid)] || [], v = rec.vol(pid), q = (u) => avg * Math.max(0, 1 + ((P[Math.floor(u * (P.length - 1))] ?? 1) - 1) * v); return [q(0.1), q(0.9)]; };
+    S.tsPools = rec; return rec;
+}
+// the best projected lineup a manager would set from these players, one week
+function tsLineup(ids, w) {
+    const slots = starterSlots(), pl = ids.map((pid) => ({ pid, p: ppos(pid), v: projOf(pid, w) || 0 })).sort((a, b) => b.v - a.v), used = new Set(), out = [];
+    for (const s of slots) if (!FLEX[s]) { const x = pl.find((y) => !used.has(y.pid) && y.p === s); if (x) { used.add(x.pid); out.push(x.pid); } }
+    for (const s of slots) if (FLEX[s]) { const x = pl.find((y) => !used.has(y.pid) && FLEX[s].includes(y.p)); if (x) { used.add(x.pid); out.push(x.pid); } }
+    return out;
+}
+const tsActive = (R) => (R.players || []).filter((pid) => !(R.reserve || []).includes(pid) && !(R.taxi || []).includes(pid));
+async function tsContext() {
+    const games = await poEnsureData(); if (!games) return null;
+    const cur = Math.max(1, S.curWeek), end = regSeasonEnd(), st = S.league.settings || {};
+    const nPO = Math.min(st.playoff_teams || 6, S.rosters.length), size = 2 ** Math.ceil(Math.log2(Math.max(2, nPO))), nRounds = Math.log2(size), rt = st.playoff_round_type || 0;
+    const roundWeeks = []; let w0 = st.playoff_week_start || end + 1;
+    for (let r = 0; r < nRounds; r++) { const two = rt === 2 || (rt === 1 && r === nRounds - 1); roundWeeks.push(two ? [w0, w0 + 1] : [w0]); w0 += two ? 2 : 1; }
+    const last = roundWeeks[roundWeeks.length - 1].slice(-1)[0];
+    await Promise.all(Array.from({ length: Math.max(0, last - cur) }, (_, i) => loadProj(cur + 1 + i).catch(() => {})));
+    const pools = await tsPools();
+    const base = new Map(), h2hBase = {};
+    for (const R of S.rosters) base.set(R.roster_id, { rid: R.roster_id, w: 0, l: 0, t: 0, pf: 0, division: (R.settings || {}).division || 0 });
+    const result = (a, b, pa, pb) => { const A = base.get(a), B = base.get(b); if (!A || !B) return; A.pf += pa; B.pf += pb;
+        if (pa > pb) { A.w++; B.l++; h2hBase[`${a}:${b}`] = (h2hBase[`${a}:${b}`] || 0) + 1; } else if (pb > pa) { B.w++; A.l++; h2hBase[`${b}:${a}`] = (h2hBase[`${b}:${a}`] || 0) + 1; } else { A.t++; B.t++; } };
+    for (let w = 1; w < cur; w++) for (const g of games[w] || []) result(g.a, g.b, g.pa, g.pb);
+    // the week under way counts as projected: points on the board plus what is still to play
+    for (const g of games[cur] || []) { const ma = (S.matchups[cur] || []).find((m) => m.roster_id === g.a), mb = (S.matchups[cur] || []).find((m) => m.roster_id === g.b);
+        result(g.a, g.b, ma ? muProjected(rosterById(g.a), ma) : g.pa, mb ? muProjected(rosterById(g.b), mb) : g.pb); }
+    const simWeeks = []; for (let w = cur + 1; w <= end; w++) simWeeks.push(w);
+    const allWeeks = []; for (let w = cur + 1; w <= last; w++) allWeeks.push(w);
+    const R0 = Object.fromEntries(S.rosters.map((R) => [R.roster_id, tsActive(R)]));
+    return { cur, end, simWeeks, allWeeks, games, base: [...base.values()], h2hBase, nPO, size, roundWeeks, reseed: !!st.playoff_seed_type, pools, R0, rids: S.rosters.map((R) => R.roster_id),
+        book: poDefaultRules() };
+}
+// the standard bracket order for a power-of-two field, so 1 and 2 meet only in the final: 8 → 1 8 4 5 2 7 3 6
+function tsOrder(n) { let o = [1]; while (o.length < n) { const m = o.length * 2 + 1, next = []; for (const x of o) next.push(x, m - x); o = next; } return o; }
+const tsHash = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; };
+const tsU = (h, s, w) => { let x = (h ^ Math.imul(s + 1, 0x9E3779B1) ^ Math.imul(w + 7, 0x85EBCA77)) >>> 0; x ^= x >>> 16; x = Math.imul(x, 0x7feb352d); x ^= x >>> 15; x = Math.imul(x, 0x846ca68b); x ^= x >>> 16; return (x >>> 0) / 4294967296; };
+// n seasons from season `from` on; `track` keeps each season's result for the teams named, for error bars
+async function tsSim(ctx, R, n, track = []) {
+    const P = ctx.pools, LU = {};
+    for (const rid of ctx.rids) { LU[rid] = {}; for (const w of ctx.allWeeks) LU[rid][w] = tsLineup(R[rid] || [], w).map((pid) => ({ m: projOf(pid, w) || 0, pool: P.pool[ppos(pid)], v: P.vol(pid), h: tsHash(pid) })).filter((e) => e.m > 0); }
+    const out = Object.fromEntries(ctx.rids.map((rid) => [rid, { po: 0, bye: 0, title: 0 }])), keep = Object.fromEntries(track.map((rid) => [rid, { po: new Uint8Array(n), title: new Uint8Array(n) }]));
+    const order = tsOrder(ctx.size);
+    for (let s = 0; s < n; s++) {
+        if (s && s % 500 === 0) await tsYield();
+        const memo = {}, score = (rid, w) => { const k = rid * 100 + w; if (memo[k] != null) return memo[k]; let t = 0;
+            for (const e of LU[rid][w]) { const r = e.pool ? e.pool[Math.min(e.pool.length - 1, Math.floor(tsU(e.h, s, w) * e.pool.length))] : 1; t += Math.max(0, e.m * (1 + (r - 1) * e.v)); } return (memo[k] = t); };
+        const T = new Map(); for (const b of ctx.base) T.set(b.rid, { ...b }); const h2h = { ...ctx.h2hBase };
+        for (const w of ctx.simWeeks) for (const g of ctx.games[w] || []) { const A = T.get(g.a), B = T.get(g.b); if (!A || !B) continue; const sa = score(g.a, w), sb = score(g.b, w); A.pf += sa; B.pf += sb;
+            if (sa >= sb) { A.w++; B.l++; h2h[`${g.a}:${g.b}`] = (h2h[`${g.a}:${g.b}`] || 0) + 1; } else { B.w++; A.l++; h2h[`${g.b}:${g.a}`] = (h2h[`${g.b}:${g.a}`] || 0) + 1; } }
+        const res = FBCalc.applyRules(ctx.book, [...T.values()], (a, b) => [h2h[`${a}:${b}`] || 0, h2h[`${b}:${a}`] || 0], ctx.nPO), seeds = res.seeds.map((x) => x.rid);
+        seeds.forEach((rid, i) => { const o = out[rid]; if (!o) return; o.po++; if (i < res.byes) o.bye++; if (keep[rid]) keep[rid].po[s] = 1; });
+        // the bracket, round by round; a missing seed is a bye
+        const play = (a, b, weeks) => { if (a == null) return b; if (b == null) return a; let x = 0, y = 0; for (const w of weeks) { x += score(a, w); y += score(b, w); } return x >= y ? a : b; };
+        let field = order.map((sd) => seeds[sd - 1] ?? null);
+        for (let ri = 0; ri < ctx.roundWeeks.length; ri++) {
+            const weeks = ctx.roundWeeks[ri];
+            // the first round keeps its byes; re-seeding starts after it
+            if (ctx.reseed && ri > 0) { const alive = field.filter((x) => x != null).sort((a, b) => seeds.indexOf(a) - seeds.indexOf(b)), nf = []; for (let i = 0; i < alive.length / 2; i++) nf.push(play(alive[i], alive[alive.length - 1 - i], weeks)); field = nf; }
+            else { const nf = []; for (let i = 0; i < field.length; i += 2) nf.push(play(field[i], field[i + 1], weeks)); field = nf; }
+            if (field.length <= 1) break;
+        }
+        const champ = field[0]; if (champ != null && out[champ]) { out[champ].title++; if (keep[champ]) keep[champ].title[s] = 1; }
+    }
+    for (const rid of ctx.rids) { const o = out[rid]; o.po /= n; o.bye /= n; o.title /= n; }
+    return { out, keep, n };
+}
+// a trade's moves applied to the rosters; the side taking more players drops its least useful bench player
+function tsApply(ctx, moves) {
+    const R = { ...ctx.R0 }, ros = (pid) => ctx.allWeeks.reduce((t, w) => t + (projOf(pid, w) || 0), 0);
+    for (const rid of new Set(moves.flatMap((m) => [m.from, m.to]))) R[rid] = ctx.R0[rid].slice();
+    for (const m of moves) { R[m.from] = R[m.from].filter((x) => x !== m.pid); R[m.to] = R[m.to].concat([m.pid]); }
+    for (const rid of Object.keys(R)) { let extra = R[rid].length - ctx.R0[rid].length;
+        while (extra-- > 0) { const starters = new Set(); for (const w of ctx.allWeeks) tsLineup(R[rid], w).forEach((x) => starters.add(x)); const bench = R[rid].filter((x) => !starters.has(x));
+            const drop = (bench.length ? bench : R[rid]).slice().sort((a, b) => ros(a) - ros(b))[0]; R[rid] = R[rid].filter((x) => x !== drop); } }
+    return R;
+}
+const tsMean = (ctx, ids) => ctx.allWeeks.reduce((t, w) => t + tsLineup(ids, w).reduce((u, pid) => u + (projOf(pid, w) || 0), 0), 0);
+// What a team is playing for, from its own odds: a contender the title, a bubble team a playoff spot.
+function tsGoal(base, rid) { const p = base.out[rid].po; return p >= 0.9 ? 'title' : p >= 0.25 ? 'po' : 'long'; }
+function tsDelta(base, sim, rid, n) {
+    const b = base.keep[rid], s = sim.keep[rid], d = { po: sim.out[rid].po - base.out[rid].po, title: sim.out[rid].title - base.out[rid].title, sePo: 0, seTitle: 0 };
+    if (b && s) for (const k of ['po', 'title']) { let m = 0, v = 0; for (let i = 0; i < n; i++) m += s[k][i] - b[k][i]; m /= n; for (let i = 0; i < n; i++) v += (s[k][i] - b[k][i] - m) ** 2; d[k === 'po' ? 'sePo' : 'seTitle'] = Math.sqrt(v / Math.max(1, n - 1) / n); }
+    return d;
+}
+// a baseline cut to its first n seasons, so a trade simulated over fewer seasons compares on the same draws
+function tsCut(base, n) { const out = {}, keep = {}; for (const rid of Object.keys(base.out)) { const k = base.keep[rid]; if (!k) { out[rid] = base.out[rid]; continue; }
+    const po = k.po.subarray(0, n), title = k.title.subarray(0, n); out[rid] = { po: po.reduce((t, x) => t + x, 0) / n, title: title.reduce((t, x) => t + x, 0) / n, bye: base.out[rid].bye }; keep[rid] = { po, title }; } return { out, keep, n }; }
+async function tsRun() {
+    const my = S.myRoster; if (!my) return;
+    const key = `${S.leagueId}:${S.curWeek}:${S.rosters.map((R) => (R.players || []).join(',')).join('|')}:${Object.keys(S.proj).length}`;
+    if (S.ts && (S.ts.key === key || S.ts.busy)) return;
+    const ts = S.ts = { key, busy: true, phase: 'Reading the season from Sleeper', done: 0, total: 0, ideas: [], at: Date.now() };
+    let lastPaint = 0; const paint = () => { if (Date.now() - lastPaint > 600) { lastPaint = Date.now(); render(); } };
+    try {
+        const ctx = await tsContext(); if (!ctx) throw new Error('The rest of the schedule isn’t in yet.');
+        ts.ctx = ctx; ts.phase = 'Playing out the season'; paint();
+        ts.base = await tsSim(ctx, ctx.R0, TS_N2, ctx.rids); ts.base1 = tsCut(ts.base, TS_N);
+        // the quick read: every trade by what it does to each side's average lineup
+        ts.phase = 'Looking at every trade'; paint(); await tsYield();
+        const me = my.roster_id, M0 = Object.fromEntries(ctx.rids.map((rid) => [rid, tsMean(ctx, ctx.R0[rid])])), ros = (pid) => ctx.allWeeks.reduce((t, w) => t + (projOf(pid, w) || 0), 0);
+        const pool = (rid, n) => ctx.R0[rid].filter((pid) => ['QB', 'RB', 'WR', 'TE'].includes(ppos(pid)) && ros(pid) >= 30).sort((a, b) => ros(b) - ros(a)).slice(0, n);
+        const two = [], three = [];
+        for (const t of ctx.rids) { if (t === me) continue; const mc = pool(me, 12), tc = pool(t, 12);
+            for (const a of mc) for (const b of tc) two.push([{ from: me, to: t, pid: a }, { from: t, to: me, pid: b }]);
+            for (let i = 0; i < mc.length; i++) for (let j = i + 1; j < mc.length; j++) for (const b of tc.slice(0, 6)) two.push([{ from: me, to: t, pid: mc[i] }, { from: me, to: t, pid: mc[j] }, { from: t, to: me, pid: b }]);
+            for (const a of mc.slice(0, 6)) for (let i = 0; i < tc.length; i++) for (let j = i + 1; j < tc.length; j++) two.push([{ from: me, to: t, pid: a }, { from: t, to: me, pid: tc[i] }, { from: t, to: me, pid: tc[j] }]); }
+        for (const A of ctx.rids) for (const B of ctx.rids) { if (A === me || B === me || A === B) continue;
+            for (const x of pool(me, 6)) for (const y of pool(A, 6)) for (const z of pool(B, 6)) three.push([{ from: me, to: A, pid: x }, { from: A, to: B, pid: y }, { from: B, to: me, pid: z }]); }
+        const quick = (moves) => { const R = tsApply(ctx, moves), ids = [...new Set(moves.flatMap((m) => [m.from, m.to]))]; return { moves, g: Object.fromEntries(ids.map((rid) => [rid, tsMean(ctx, R[rid]) - M0[rid]])) }; };
+        const q2 = [], q3 = []; ts.total = two.length + three.length;
+        for (let i = 0; i < two.length; i++) { const x = quick(two[i]); if (x.g[me] >= 1 && Object.entries(x.g).every(([rid, v]) => +rid === me || v >= -12)) q2.push(x); if (i % 300 === 0) { ts.done = i; paint(); await tsYield(); } }
+        for (let i = 0; i < three.length; i++) { const x = quick(three[i]); if (x.g[me] >= 1 && Object.entries(x.g).every(([rid, v]) => +rid === me || v >= -6)) q3.push(x); if (i % 300 === 0) { ts.done = two.length + i; paint(); await tsYield(); } }
+        const rank = (x) => x.g[me] + 0.5 * Math.min(0, ...Object.entries(x.g).filter(([rid]) => +rid !== me).map(([, v]) => v));
+        const pick = [...q2.sort((a, b) => rank(b) - rank(a)).slice(0, 36), ...q3.sort((a, b) => rank(b) - rank(a)).slice(0, 8)];
+        // the simulation, for the ones worth it; then the best of them again, over more seasons
+        ts.phase = 'Simulating the best trades'; ts.done = 0; ts.total = pick.length; paint();
+        for (const x of pick) {
+            const ids = [...new Set(x.moves.flatMap((m) => [m.from, m.to]))], sim = await tsSim(ctx, tsApply(ctx, x.moves), TS_N, ids);
+            ts.ideas.push({ moves: x.moves, mean: x.g, n: TS_N, d: Object.fromEntries(ids.map((rid) => [rid, tsDelta(ts.base1, sim, rid, TS_N)])) });
+            ts.done++; paint();
+        }
+        const myBest = (goal) => ts.ideas.slice().sort((a, b) => b.d[me][goal] - a.d[me][goal]);
+        const short = [...new Set([...myBest('title').slice(0, 8), ...myBest('po').slice(0, 8)])];
+        ts.phase = 'Checking the best again'; ts.done = 0; ts.total = short.length; paint();
+        for (const x of short) { const ids = Object.keys(x.d).map(Number), sim = await tsSim(ctx, tsApply(ctx, x.moves), TS_N2, ids);
+            x.n = TS_N2; x.d = Object.fromEntries(ids.map((rid) => [rid, tsDelta(ts.base, sim, rid, TS_N2)])); ts.done++; paint(); }
+        ts.phase = null;
+    } catch (e) { console.warn(TAG, 'trade ideas:', e.message); ts.error = e.message; }
+    finally { ts.busy = false; render(); }
+}
+// An offer you are part of, read the same way: each side's chances with and without it.
+async function tsOfferRead(t) {
+    const ts = S.ts; if (!ts || !ts.base || ts.busy) return null;
+    S.tsOffers = S.tsOffers || {}; const k = `${ts.key}:${t.transaction_id}`;
+    if (S.tsOffers[k]) return S.tsOffers[k];
+    S.tsOffers[k] = { busy: true };
+    const moves = Object.entries(t.adds || {}).map(([pid, to]) => ({ pid, to, from: (t.drops || {})[pid] })).filter((m) => m.from != null && ts.ctx.R0[m.from] && ts.ctx.R0[m.from].includes(m.pid));
+    const ids = [...new Set(moves.flatMap((m) => [m.from, m.to]))];
+    const sim = await tsSim(ts.ctx, tsApply(ts.ctx, moves), TS_N2, ids);
+    S.tsOffers[k] = { d: Object.fromEntries(ids.map((rid) => [rid, tsDelta(ts.base, sim, rid, TS_N2)])), n: TS_N2 };
+    render(); return S.tsOffers[k];
+}
+
+// ── Trades › Ideas: the cards ──
+// Each idea is a card in the drawer's own shape: what you give and get, then each side's chances of the playoffs
+// and of the title with and without it, what the other side is playing for, and average points last. A change
+// inside the simulation's own noise reads ≈ 0. A trade that lowers the other side's chances stays, marked as a
+// hard sell (the user, 2026-10-25).
+const tiPct = (v) => `${v >= 0.995 ? Math.round(v * 100) : (v * 100).toFixed(v < 0.1 ? 1 : 0)}%`;
+function tiChange(v, se) {
+    if (Math.abs(v) < Math.max(0.001, 2 * (se || 0))) return h('span', { class: 'tich flat', title: `Within the simulation’s own noise${se ? ` (±${(se * 100).toFixed(1)})` : ''}` }, '≈ 0');
+    return h('span', { class: `tich ${v > 0 ? 'up' : 'dn'}` }, `${v > 0 ? '▲ +' : '▼ −'}${Math.abs(v * 100).toFixed(1)}`);
+}
+function tiOdds(base, d, rid, me) {
+    const b = base.out[rid];
+    return h('div', { class: `tiod ${rid === me ? 'me' : 'them'}` }, h('span', { class: 'tiwho' }, rid === me ? 'You' : teamName(rosterById(rid))),
+        h('span', { class: 'tiol' }, 'Playoffs ', h('b', null, tiPct(b.po)), ' ', tiChange(d.po, d.sePo)),
+        h('span', { class: 'tiol' }, 'Title ', h('b', null, tiPct(b.title)), ' ', tiChange(d.title, d.seTitle)));
+}
+const TI_GOAL_WORDS = { title: 'a contender, so title odds are what move them', po: 'on the bubble, so a playoff spot comes first', long: 'a long shot, so hard to read' };
+function tiHard(base, x, me) {
+    for (const [rid, d] of Object.entries(x.d)) { if (+rid === me) continue; const g = tsGoal(base, +rid), k = g === 'title' ? 'title' : 'po', se = k === 'title' ? d.seTitle : d.sePo;
+        if (d[k] < -Math.max(0.003, 2 * (se || 0))) return `${teamName(rosterById(+rid))}’s ${k === 'title' ? 'title' : 'playoff'} odds drop ${Math.abs(d[k] * 100).toFixed(1)}`; }
+    return null;
+}
+// his usual week, from a bad one to a good one, at his average projection the rest of the way
+function tiRange(pid) {
+    const ts = S.ts, ws = ts.ctx.allWeeks, avg = ws.reduce((t, w) => t + (projOf(pid, w) || 0), 0) / Math.max(1, ws.length), [lo, hi] = S.tsPools.band(pid, avg), mx = 40;
+    return [h('span', { class: 'tirg', title: `Most weeks between ${fmt0(lo)} and ${fmt0(hi)} (a bad week to a good one); ${fmt1(avg)} on average` },
+        h('i', { style: `left:${Math.min(96, lo / mx * 100).toFixed(0)}%;width:${Math.max(3, Math.min(100, (hi - lo) / mx * 100)).toFixed(0)}%` }), h('b', { style: `left:${Math.min(97, avg / mx * 100).toFixed(0)}%` })),
+        ` usually ${fmt0(lo)}–${fmt0(hi)}`];
+}
+function tiKind(x, me) { const ids = new Set(x.moves.flatMap((m) => [m.from, m.to])); if (ids.size === 3) return 'three'; const g = x.moves.filter((m) => m.from === me).length, r = x.moves.filter((m) => m.to === me).length; return g === 1 && r === 1 ? 'one' : g > r ? 'give2' : 'get2'; }
+const tiKey = (x) => x.moves.map((m) => `${m.pid}>${m.to}`).sort().join(',');
+function tiHidden() { try { return new Set(JSON.parse(localStorage.getItem(`badgerTiHide:${S.leagueId}`) || '[]')); } catch (e) { return new Set(); } }
+function tiHide(x) { const s = tiHidden(); s.add(tiKey(x)); try { localStorage.setItem(`badgerTiHide:${S.leagueId}`, JSON.stringify([...s])); } catch (e) { /* this visit only */ } S.ui.tiHid = (S.ui.tiHid || 0) + 1; render(); }
+function tiCard(x, alts, goal) {
+    const ts = S.ts, me = S.myRoster.roster_id, kind = tiKind(x, me), others = Object.keys(x.d).map(Number).filter((rid) => rid !== me);
+    const rows = kind === 'three'
+        ? x.moves.map((m) => txRow(m.pid, { dir: m.to === me ? 'get' : m.from === me ? 'send' : null, noOpp: true, sub: [`${teamName(rosterById(m.from))} → ${teamName(rosterById(m.to))} · `, ...tiRange(m.pid)] }))
+        : [...x.moves.filter((m) => m.to === me), ...x.moves.filter((m) => m.from === me)].map((m) => txRow(m.pid, { dir: m.to === me ? 'get' : 'send', noOpp: true, sub: tiRange(m.pid) }));
+    const odds = h('div', { class: 'tiodds' }, tiOdds(ts.base, x.d[me], me, me), ...others.map((rid) => tiOdds(ts.base, x.d[rid], rid, me)));
+    const sit = others.map((rid) => h('div', { class: `tisit ${tsGoal(ts.base, rid)}` }, `${teamName(rosterById(rid))} is ${TI_GOAL_WORDS[tsGoal(ts.base, rid)]}.`));
+    const nW = ts.ctx.allWeeks.length, avg = h('div', { class: 'tiavg' }, `Average points the rest of the way: ${x.mean[me] >= 0 ? '+' : '−'}${fmt1(Math.abs(x.mean[me] / nW))} a week for you`,
+        ...others.map((rid) => `, ${x.mean[rid] >= 0 ? '+' : '−'}${fmt1(Math.abs(x.mean[rid] / nW))} for ${teamName(rosterById(rid))}`));
+    const hard = tiHard(ts.base, x, me), open = S.ui.tiAlts === tiKey(x);
+    const altRows = open ? alts.map((a) => h('div', { class: 'tialt' }, h('span', null, a.moves.filter((m) => m.from === me).map((m) => shortName(m.pid)).join(' + ')), tiChange(a.d[me][goal], goal === 'title' ? a.d[me].seTitle : a.d[me].sePo),
+        h('button', { class: 'lnk', type: 'button', onclick: () => tiPropose(a) }, 'Propose'))) : [];
+    return txCard({ R: kind === 'three' ? null : rosterById(others[0]), who: kind === 'three' ? `3 teams · ${others.map((rid) => teamName(rosterById(rid))).join(' · ')}` : teamName(rosterById(others[0])),
+        kind: { one: '1 FOR 1', give2: '2 FOR 1', get2: '1 FOR 2', three: '3 TEAMS' }[kind], pill: hard ? ['amb', 'HARD SELL'] : null, cls: 'ticard', attrs: { 'data-idea': tiKey(x), 'data-kind': kind },
+        rows: [...rows, odds, ...sit, avg, ...(hard ? [h('div', { class: 'tihard' }, `Hard sell: ${hard}.`)] : []), ...altRows],
+        acts: [h('button', { class: 'btn sm p', type: 'button', 'data-act': 'idea-propose', onclick: () => tiPropose(x) }, 'Propose ›'),
+            alts.length ? h('button', { class: 'lnk', type: 'button', 'aria-expanded': String(open), onclick: () => { S.ui.tiAlts = open ? null : tiKey(x); render(); } }, `${alts.length} other way${alts.length === 1 ? '' : 's'} `, foldCaret(open)) : null,
+            h('button', { class: 'lnk dim', type: 'button', 'data-act': 'idea-hide', onclick: () => tiHide(x) }, 'Not interested')].filter(Boolean) });
+}
+function txTradeIdeas() {
+    const ts = S.ts, my = S.myRoster, me = my.roster_id, out = [];
+    const dl = (S.league.settings || {}).trade_deadline;
+    if (dl && S.curWeek > dl && dl <= LAST_WEEK) return [txEmpty(`Trades closed after week ${dl}. Ideas come back next season.`)];
+    if (!ts || ts.key == null || (!ts.busy && !ts.base && !ts.error)) tsRun();
+    if (ts && ts.error && !ts.base) return [txEmpty(`Couldn’t play out the season: ${ts.error}`)];
+    if (!ts || !ts.base) return [txEmpty(ts && ts.phase ? `${ts.phase}…` : 'Reading the season from Sleeper…')];
+    const b = ts.base.out[me], goal = S.ui.tiGoal || (b.po >= 0.9 ? 'title' : 'po');
+    out.push(h('div', { class: 'tiyou' }, h('div', { class: 'tiyh' }, `You today, from ${TS_N2.toLocaleString()} simulated seasons`),
+        h('div', { class: 'tiyo' }, h('span', null, 'Playoffs ', h('b', null, tiPct(b.po))), h('span', null, 'Bye ', h('b', null, tiPct(b.bye))), h('span', null, 'Title ', h('b', null, tiPct(b.title)))),
+        h('div', { class: 'tigoal' }, h('span', { class: 'tigl' }, 'Rank by'), pills([['po', 'Playoff odds'], ['title', 'Title odds']], goal, (k) => { S.ui.tiGoal = k; render(); }, 'Rank by')),
+        S.ui.tiGoal ? null : h('div', { class: 'tinote' }, b.po >= 0.9 ? 'You are safely in, so this starts on title odds.' : 'You are not in yet, so this starts on playoff odds.')));
+    const kind = S.ui.tiKind || 'all';
+    out.push(h('div', { class: 'txplrow' }, h('span'), pills([['all', 'All'], ['one', '1 for 1'], ['give2', '2 for 1'], ['get2', '1 for 2'], ['three', '3 teams']], kind, (k) => { S.ui.tiKind = k; render(); }, 'Kind of trade')));
+    const hidden = tiHidden(), se = (x) => goal === 'title' ? x.d[me].seTitle : x.d[me].sePo;
+    // your gain, less three quarters of what the other side loses in the odds IT plays for: a hard sell stays in the
+    // list, below trades nearly as good for you that they would take
+    const partnerLoss = (x) => Math.min(0, ...Object.entries(x.d).filter(([rid]) => +rid !== me).map(([rid, d]) => d[tsGoal(ts.base, +rid) === 'title' ? 'title' : 'po']));
+    const score = (x) => x.d[me][goal] + 0.75 * partnerLoss(x);
+    const list = ts.ideas.filter((x) => !hidden.has(tiKey(x)) && (kind === 'all' || tiKind(x, me) === kind) && x.d[me][goal] > Math.max(0.001, 2 * se(x)))
+        .sort((a, c) => score(c) - score(a));
+    // packages for the same player(s) from the same team(s) fold into one idea, its other ways under it
+    const groups = new Map();
+    for (const x of list) { const k = `${Object.keys(x.d).sort().join(',')}|${x.moves.filter((m) => m.to === me).map((m) => m.pid).sort().join(',')}`; if (!groups.has(k)) groups.set(k, { best: x, alts: [] }); else groups.get(k).alts.push(x); }
+    out.push(txHead(`Trades that raise your ${goal === 'title' ? 'title' : 'playoff'} odds`, ts.busy ? `${ts.phase}… ${ts.done} of ${ts.total}` : `${ts.ideas.length} simulated`, { cols: true }));
+    if (!groups.size) out.push(txEmpty(ts.busy ? 'Simulating; ideas appear here as each one finishes.' : `No trade the simulation found raises your ${goal === 'title' ? 'title' : 'playoff'} odds by more than its own noise. Try the other ranking, or come back after the next waiver run.`));
+    for (const g of [...groups.values()].slice(0, 12)) out.push(tiCard(g.best, g.alts.slice(0, 3), goal));
+    out.push(h('div', { class: 'txfoot2' }, `Each player’s week is drawn from what happened to projections at his position this season; every team starts its best projected lineup; the season and the bracket play out ${TS_N2.toLocaleString()} times, a trade on the same draws as without it.`));
+    return out;
+}
+// Propose: today's trade screen with both sides in, or, for three teams, a screen of its own
+function tiPropose(x) {
+    const me = S.myRoster.roster_id, ids = [...new Set(x.moves.flatMap((m) => [m.from, m.to]))];
+    if (ids.length === 2) {
+        const other = ids.find((rid) => rid !== me);
+        openTrade(other);
+        for (const m of x.moves) (m.from === me ? S.ui.trade.give : S.ui.trade.get).add(m.pid);
+        render(); return;
+    }
+    S.ui.trade3 = { moves: x.moves.slice(), days: 2, sending: false };
+    Object.assign(S.ui.tx, { view: 'trade3', from: S.ui.tx.view || 'list' }); render();
+}
+function trade3Body() {
+    const t3 = S.ui.trade3, me = S.myRoster.roster_id, ids = [...new Set(t3.moves.flatMap((m) => [m.from, m.to]))].filter((rid) => rid !== me);
+    return [h('div', { class: 'txempty' }, `One offer to ${ids.map((rid) => teamName(rosterById(rid))).join(' and ')}. It goes through when both accept.`),
+        ...t3.moves.map((m) => txRow(m.pid, { dir: m.to === me ? 'get' : m.from === me ? 'send' : null, noOpp: true, sub: `${teamName(rosterById(m.from))} → ${teamName(rosterById(m.to))}` })),
+        h('div', { class: 'txplrow' }, h('span', { class: 'shm' }, 'Offer open for'), pills([[1, '1 day'], [2, '2 days'], [3, '3 days']], t3.days, (k) => { t3.days = k; render(); }, 'Offer open for')),
+        h('div', { class: 'txacts' }, h('button', { class: 'btn p', type: 'button', disabled: t3.sending, 'data-act': 'trade3-send', onclick: sendTrade3 }, t3.sending ? 'Sending…' : 'Send to both managers'))];
+}
+async function sendTrade3() {
+    const t3 = S.ui.trade3; if (!t3 || t3.sending) return;
+    const adds = {}, drops = {}; for (const m of t3.moves) { adds[m.pid] = m.to; drops[m.pid] = m.from; }
+    const a = kv(adds), dr = kv(drops), expires = Math.round(Date.now() / 1000) + t3.days * 86400;
+    t3.sending = true; render();
+    try {
+        const d = await gql('propose_trade', `mutation propose_trade($k_adds: [String], $v_adds: [Int], $k_drops: [String], $v_drops: [Int]) { propose_trade(league_id: "${S.leagueId}", draft_picks: [], waiver_budget: [], expires_at: ${expires}, k_adds: $k_adds, v_adds: $v_adds, k_drops: $k_drops, v_drops: $v_drops){ transaction_id status } }`,
+            { k_adds: a.keys, v_adds: a.values, k_drops: dr.keys, v_drops: dr.values });
+        const id = d && d.propose_trade && d.propose_trade.transaction_id;
+        S.ui.trade3 = null; if (S.ui.tx) Object.assign(S.ui.tx, { view: 'list', tab: 'trades', tpart: 'offers', justSent: id || null });
+        toast('Three-team offer sent', 'ok'); await loadPending(); render();
+    } catch (e) { t3.sending = false; render(); toast(e.message, 'err'); }
+}
+// an offer's read, under its rows: each side's chances with it
+function tiOfferRead(t) {
+    const ts = S.ts, me = S.myRoster.roster_id;
+    if (!ts || !ts.base) { if (!ts || (!ts.busy && !ts.error)) tsRun(); return h('div', { class: 'tiavg' }, 'Playing out the season to read this offer…'); }
+    const k = `${ts.key}:${t.transaction_id}`, r = (S.tsOffers || {})[k];
+    if (!r) { tsOfferRead(t); return h('div', { class: 'tiavg' }, 'Reading this offer…'); }
+    if (r.busy || !r.d || !r.d[me]) return h('div', { class: 'tiavg' }, 'Reading this offer…');
+    return h('div', { class: 'tiodds' }, tiOdds(ts.base, r.d[me], me, me), ...Object.keys(r.d).map(Number).filter((rid) => rid !== me).map((rid) => tiOdds(ts.base, r.d[rid], rid, me)));
+}
+
 function txTradeHistory() {
     const tx = S.ui.tx, me = S.myRoster.roster_id, yours = tx.twho === 'yours', done = [], out = [];
     for (let w = 1; w <= Math.max(1, S.curWeek); w++) for (const t of S.txns[w] || []) if (t.type === 'trade' && t.status === 'complete') done.push(t);
@@ -7445,13 +7764,14 @@ function txDrawer() {
     const back = (label, fn) => h('button', { class: 'btn sm s', type: 'button', 'data-act': 'tx-back', onclick: fn || (() => txBack('list')) }, label || '‹ Transactions');
     let w = 420, head, body, top = null;
     if (tx.view === 'trade' && S.ui.trade) { w = 760; head = [back(), h('span', null, 'Propose a trade')]; body = [tradeBody()]; }
+    else if (tx.view === 'trade3' && S.ui.trade3) { w = 520; head = [back('‹ Ideas', () => { S.ui.trade3 = null; tx.view = 'list'; tx.tab = 'trades'; tx.tpart = 'ideas'; render(); }), h('span', null, 'Propose a three-team trade')]; body = trade3Body(); }
     else if (tx.view === 'cut') {
         w = 1060; const vs = tx.vs && tx.pick && tx.pick.pid === tx.vs ? tx.vs : null;
         head = vs ? [back(`‹ ${tx.pick.waiv ? 'Claim' : 'Add'}`, () => { tx.view = 'list'; tx.part = 'ideas'; render(); }), h('span', null, `Your roster against ${pname(vs)}`)] : [back(), h('span', null, 'Your roster against waivers')];
         body = txCut();
     } else {
         tx.view = 'list'; head = [h('span', null, 'Transactions')]; top = [txTabs(), ...txPinned(), txParts()];
-        body = tx.tab === 'trades' ? (tx.tpart === 'history' ? txTradeHistory() : tx.tpart === 'review' ? txReview() : txOffers()) : tx.part === 'ideas' ? txIdeas() : tx.part === 'history' ? txHistory() : txClaims();
+        body = tx.tab === 'trades' ? (tx.tpart === 'history' ? txTradeHistory() : tx.tpart === 'review' ? txReview() : tx.tpart === 'ideas' ? txTradeIdeas() : txOffers()) : tx.part === 'ideas' ? txIdeas() : tx.part === 'history' ? txHistory() : txClaims();
     }
     const part = tx.tab === 'trades' ? tx.tpart : tx.part;
     return h('div', { class: 'drawer txd', style: `width:${w}px`, role: 'dialog', 'aria-label': 'Transactions', 'data-view': tx.view, 'data-tab': tx.tab, 'data-part': part },
@@ -7581,6 +7901,7 @@ function tradeCardTx(t) {
             h('button', { class: 'btn sm danger', 'data-act': 'trade-cancel', 'data-txn': t.transaction_id, onclick: () => act(() => respondTrade(t, false), `Offer to ${otherName} cancelled`) }, 'Cancel')];
     } else foot = 'Accepted · in league review';
     const fresh = tx.justSent && String(tx.justSent) === String(t.transaction_id);
+    if (role === 'toyou' || role === 'sent') rows.push(tiOfferRead(t));   // each side's chances with it, the way Ideas reads a trade
     return txCard({ R, who: otherName || 'Trade', kind: 'TRADE', pill: role === 'toyou' ? ['amb', 'TO YOU'] : role === 'sent' ? ['wait', 'SENT'] : ['wait', 'IN REVIEW'], when: left,
         cls: fresh ? 'txfresh' : '', attrs: { 'data-trade': t.transaction_id, 'data-role': role }, rows,
         foot: fresh ? [h('b', { class: 'txjust' }, 'Just sent'), ' · ', foot] : foot, acts });
