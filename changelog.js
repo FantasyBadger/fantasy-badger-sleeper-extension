@@ -7,6 +7,18 @@
 // say adds none and rides under the latest one.
 globalThis.BADGER_NOTES = [
     {
+        v: '2026.10.28', when: 'October 28, 2026', title: 'Pick your trade partners, and odds on every trade you build',
+        items: [
+            '<b>Trade partners</b> in Ideas opens a list with a box for every team: tick the ones you would trade with, or press <b>All teams</b>, <b>No teams</b> or <b>Leave out my division</b>. It is remembered for each league.',
+            'Show two-team or three-team trades, and show or hide hard sells. Ideas are listed by how much they raise your odds, biggest first.',
+            'While Ideas plays out the season, a bar shows how far along it is, and <b>Run again</b> plays it out once more.',
+            '<b>Full view</b> lists every idea in one column, each trade beside its odds.',
+            '<b>Propose a trade</b> shows each side’s playoff and title odds under its name, and what the trade does to them as you build it. The rosters scroll in their columns, so Send stays in view.',
+            'A three-team offer shows every part of the trade, not only what you send and get.',
+            'A long warning on one of your claims wraps onto a second line instead of running under the bid.',
+        ],
+    },
+    {
         v: '2026.10.26', when: 'October 26, 2026', title: 'Trade ideas, judged by your chances',
         items: [
             'Trades has a new part, <b>Ideas</b>: trades across the whole league that raise your chances of making the playoffs or winning the title, including two for one either way and three-team trades.',
