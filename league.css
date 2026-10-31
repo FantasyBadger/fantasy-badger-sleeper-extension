@@ -2861,3 +2861,45 @@
 .bl .txd .tioh { display: grid; font: 700 10.5px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); }
 .bl .txd .tiwc > .txf { grid-column: 2; grid-row: 3; margin-top: 0; }
 @media (max-width: 1100px) { .bl .txd .tiwide { grid-template-columns: 1fr; } .bl .txd .tiwl { position: static; } }
+/* Trade for a player (2026-10-28): the field that aims Ideas at him, his team's situation, the hard sells folded;
+   and his card's best three offers, from the same search */
+.bl .txd .tiaim { position: relative; flex: none; display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 34px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--bg-2); padding: 0 10px; margin-bottom: 6px; }
+.bl .txd .tiaim .tigl { flex: none; }
+.bl .txd .tiaim:focus-within { border-color: var(--teal); } .bl .txd .tiaim.on { border-color: rgba(32,206,184,.45); }
+.bl .txd .tiaimf { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; cursor: text; }
+.bl .txd .tiaimf input { flex: 1; min-width: 0; background: none; border: 0; outline: 0; color: var(--ink); font: 600 12.5px var(--sans); padding: 8px 0; }
+.bl .txd .tiaimf input::placeholder { color: var(--ink-3); font-weight: 500; }
+.bl .txd .tiaimw { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; font-size: 12.5px; }
+.bl .txd .tiaimw > * { flex: none; } .bl .txd .tiaimw .pnm { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.bl .txd .tiaimt { color: var(--ink-3); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.bl .txd .tiaimw .tiaimt { flex: 0 1 auto; }
+/* the full view's left column is narrow: the name keeps its line, the teams go under it */
+.bl .txd .tiwl .tiaim.on { align-items: flex-start; } .bl .txd .tiwl .tiaim.on > .tigl, .bl .txd .tiwl .tiaimx { margin-top: 8px; }
+.bl .txd .tiwl .tiaimw { flex-wrap: wrap; row-gap: 1px; padding: 7px 0; } .bl .txd .tiwl .tiaimw .tiaimt { order: 3; flex-basis: 100%; }
+.bl .txd .tiaimx { flex: none; background: none; border: 0; color: var(--ink-3); font: 700 17px/1 var(--sans); cursor: pointer; padding: 3px 4px; border-radius: 4px; }
+.bl .txd .tiaimx:hover { color: var(--ink); } .bl .txd .tiaimx:focus-visible { outline: 2px solid var(--teal); outline-offset: 1px; }
+.bl .txd .tiaimlist { position: absolute; left: -1px; right: -1px; top: calc(100% + 4px); z-index: 6; display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--line-2); border-radius: 10px; box-shadow: 0 14px 34px rgba(0,0,0,.55); padding: 4px; }
+.bl .txd .tiaimo { display: grid; grid-template-columns: 24px auto minmax(0, auto) minmax(0, 1fr); gap: 8px; align-items: center; background: none; border: 0; border-radius: 7px; padding: 4px 6px; color: var(--ink); font: 600 12.5px var(--sans); text-align: left; cursor: pointer; }
+.bl .txd .tiaimo:hover, .bl .txd .tiaimo:focus-visible { background: var(--bg-2); outline: 0; }
+.bl .txd .tiaimo .hs { width: 24px; height: 24px; border-radius: 50%; object-fit: cover; background: var(--bg-2); }
+.bl .txd .tiaimo .pnm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bl .txd .tiaimnone { font-size: 12px; color: var(--ink-3); padding: 6px 8px; }
+.bl .txd .tiaimsub { font-size: 12px; color: var(--ink-2); line-height: 1.45; padding: 0 2px 4px; }
+.bl .txd .tiaimsub b { font: 700 12px var(--mono); color: var(--ink); }
+.bl .txd .lnk.tihf { white-space: normal; flex-wrap: wrap; text-align: left; font-size: 12px; margin: 8px 0 2px; gap: 3px 6px; }
+.bl .txd .tihfs { color: var(--ink-3); font-weight: 500; }
+.bl .pmodal .pctf { flex: none; margin-top: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-2); padding: 9px 12px 8px; }
+.bl .pctfh { display: flex; align-items: baseline; gap: 4px 10px; flex-wrap: wrap; font-size: 13px; }
+.bl .pctfs { font-size: 11.5px; color: var(--ink-3); }
+.bl .pctfb { display: flex; flex-direction: column; justify-content: center; min-height: 104px; margin: 6px 0; }
+.bl .pctfr { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; padding: 4px 0; border-top: 1px solid var(--line); font-size: 12.5px; }
+.bl .pctfr:first-child { border-top: 0; }
+.bl .pctfo { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); } .bl .pctfo b { color: var(--ink); }
+.bl .pctfd { white-space: nowrap; font-size: 12px; } .bl .pctfy { color: var(--teal); font-weight: 800; }
+.bl .pctfn { font-size: 12px; color: var(--ink-3); line-height: 1.45; }
+.bl .pctff { display: flex; align-items: baseline; gap: 4px 12px; flex-wrap: wrap; }
+.bl .pctfq { font-size: 11px; color: var(--ink-3); }
+.bl .pctf .tich { font: 700 12px var(--mono); } .bl .pctf .tich.up { color: var(--green); } .bl .pctf .tich.dn { color: var(--red); } .bl .pctf .tich.flat { color: var(--ink-3); font-weight: 600; }
+.bl .pctf .tiprog { margin: 0; } .bl .pctf .tipl { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; } .bl .pctf .tipl .mono { color: var(--ink-3); font-size: 11px; }
+.bl .pctf .tipb { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; } .bl .pctf .tipb i { display: block; height: 100%; border-radius: 3px; background: var(--teal); transition: width .4s ease; }
+@media (prefers-reduced-motion: reduce) { .bl .pctf .tipb i { transition: none; } }

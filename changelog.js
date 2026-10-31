@@ -7,6 +7,16 @@
 // say adds none and rides under the latest one.
 globalThis.BADGER_NOTES = [
     {
+        v: '2026.10.31', when: 'October 31, 2026', title: 'Trade for a player, right from his card',
+        items: [
+            'A player on another team has <b>Trade for him</b> on his card: the best offers his team comes out even on or gains from, each with what it does to your playoff odds and a <b>Propose</b> button.',
+            '<b>Trade for</b> in Trades › Ideas: type a name and every offer that lands him is listed, the ones his team would take first and hard sells folded underneath. The top says where his team stands, what it plays for and who would replace him.',
+            'Offers that come to the same thing show once, as the simpler one: a player who would only sit on a bench no longer makes a second idea.',
+            'A long-shot team, under 25% to make the playoffs, counts as a hard sell only when a trade costs it more than a point a week.',
+            'Trade and playoff odds no longer stay blank when the page opens before everything has loaded.',
+        ],
+    },
+    {
         v: '2026.10.28', when: 'October 28, 2026', title: 'Pick your trade partners, and odds on every trade you build',
         items: [
             '<b>Trade partners</b> in Ideas opens a list with a box for every team: tick the ones you would trade with, or press <b>All teams</b>, <b>No teams</b> or <b>Leave out my division</b>. It is remembered for each league.',
