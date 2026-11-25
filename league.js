@@ -380,7 +380,7 @@ async function loadStats(week) {
     const url = `${API2}/stats/nfl/${S.season}/${week}?season_type=regular&position[]=QB&position[]=RB&position[]=WR&position[]=TE&position[]=K&position[]=DEF&order_by=pts_half_ppr`;
     const list = await rest(url).catch(() => []);
     const m = {};
-    for (const x of list) m[x.player_id] = { pid: String(x.player_id), pts: scoreStats(x.stats), opp: x.opponent, stats: x.stats };
+    for (const x of list) m[x.player_id] = { pid: String(x.player_id), pts: scoreStats(x.stats), opp: x.opponent, team: x.team, stats: x.stats };   // team: who he played for THAT week (teamAt)
     if (week === S.curWeek) for (const x of list) foldStanding(String(x.player_id), x.player);
     S.stats[week] = m;
 }
@@ -1945,6 +1945,177 @@ function poGames() {
     }
     return out;
 }
+// Magic numbers, the strict kind (the user, 2026-11-11: "Anyway to calculate magic numbers?"). The season sim's
+// number is a likelihood: the wins after which a team made the playoffs in 99% of simulated seasons. This one is a
+// guarantee: the fewest of its own remaining wins that put a team in whatever else happens. Any of its games can be the
+// losses, every other result goes against it, every tie is broken against it (points are not known in advance), and a
+// seat decided by points is never counted on. It is exact: a team misses only if some set of rivals can ALL finish
+// level with it or above and that leaves it no seat. More teams above only ever hurts it, so it is enough to find the
+// smallest such sets and ask whether the schedule lets every member of one get there at once.
+// Each team: { k: wins needed (0 = in already) or null, left: games left, out: no seat even winning out with every
+// result its way; once in, div / bye: the division title / a bye are its whatever happens too }. Under the season's last eight weeks only: before that every set of rivals can get anywhere.
+// `proj` (roster id → points) takes the week in progress as decided at those points, the standings' "as projected":
+// the numbers then count from the week after it.
+const MAGIC_WEEKS = 8;
+function clinchNumbers(proj) {
+    const games = poGames(), now = Math.max(1, S.curWeek), cur = proj ? now + 1 : now, end = regSeasonEnd();
+    if (!games || !S.rosters || !S.rosters.length) { loadSeasonMatchups(); return null; }
+    if (end - cur + 1 > MAGIC_WEEKS || cur > end) return null;
+    const book = poDefaultRules(), nPO = Math.min((S.league.settings || {}).playoff_teams || 6, S.rosters.length);
+    const rids = S.rosters.map((R) => R.roster_id), div = Object.fromEntries(S.rosters.map((R) => [R.roster_id, (R.settings || {}).division || 0]));
+    const base = Object.fromEntries(rids.map((r) => [r, 0])), rest = [];
+    for (let w = 1; w <= end; w++) for (const g of games[w] || []) {
+        if (base[g.a] == null || base[g.b] == null) continue;
+        if (w >= cur) { rest.push(g); continue; }   // a week is fact once it is behind us, as the odds count it
+        const pa = proj && w === now ? proj[g.a] ?? g.pa : g.pa, pb = proj && w === now ? proj[g.b] ?? g.pb : g.pb;
+        if (pa > pb) base[g.a]++; else if (pb > pa) base[g.b]++; else { base[g.a] += 0.5; base[g.b] += 0.5; }
+    }
+    const key = `${JSON.stringify(book.seeds)}|${nPO}|${cur}|${rids.map((r) => `${r}:${base[r]}:${div[r]}`).join(',')}|${rest.map((g) => `${g.a}-${g.b}`).join(',')}`;
+    const slot = proj ? 'clinchProj' : 'clinch';   // the forecast line and an as-projected table can be on screen together
+    if (S[slot] && S[slot].key === key) return S[slot].res;
+    const byRec = (chain) => !!chain && chain[0] === 'win_pct';
+    // Is X seated, every team's final wins in hand? worst: a tie is a team above X, and a seat decided by anything but
+    // the record goes to someone else (to a team below X, so the ones above stay in the race); best: the other way.
+    // Any rulebook, any number of seats: the first two seats of the full book are the byes, and a book of the division
+    // rule alone, as many seats as divisions, is the division titles.
+    const seatedIn = (bk, nSeat) => (fin, X, best) => {
+        const above = (r) => r !== X && (best ? fin[r] > fin[X] : fin[r] >= fin[X]);
+        let left = rids.slice(), seats = 0;
+        const drop = (r) => { left = left.filter((x) => x !== r); seats++; };
+        for (const rule of bk.seeds) {
+            if (seats >= nSeat) break;
+            if (rule.take === 'division_winners') {
+                const rec = byRec(!rule.winner || rule.winner === 'sleeper_default' ? ['win_pct', 'pf'] : rule.winner);
+                const winners = [];
+                for (const d of [...new Set(left.map((r) => div[r]))].filter((x) => x > 0)) {
+                    const inD = left.filter((r) => div[r] === d), others = inD.filter((r) => r !== X), ab = others.filter(above);
+                    if (inD.includes(X) && (rec ? !ab.length : best || !others.length)) { winners.push(X); continue; }
+                    winners.push(rec ? (ab[0] ?? others[0]) : best ? (ab[0] ?? others[0]) : (others.find((r) => !above(r)) ?? others[0]));
+                }
+                // the order the champions are seeded in decides who is left out when they outnumber the seats
+                const recOrder = byRec(rule.order), rank = (r) => r === X ? 1 : above(r) ? 0 : 2;
+                winners.sort((a, b) => recOrder ? rank(a) - rank(b) : best ? (b === X) - (a === X) : (a === X) - (b === X));
+                for (const r of winners) { if (seats >= nSeat) break; if (r === X) return true; drop(r); }
+            } else {
+                const chain = rule.take === 'most_pf' ? ((rule.order || [])[0] === 'pf' ? rule.order : ['pf'].concat(rule.order || [])) : rule.order;
+                const n = Math.min(rule.count || 0, nSeat - seats), others = left.filter((r) => r !== X);
+                if (byRec(chain)) { const ab = others.filter(above); if (ab.length < n) return true; ab.slice(0, n).forEach(drop); }
+                else if (best) { if (n > 0) return true; }
+                else others.filter((r) => !above(r)).concat(others.filter(above)).slice(0, n).forEach(drop);
+            }
+        }
+        return false;
+    };
+    const seated = seatedIn(book, nPO);
+    const cnt = (r, list) => list.filter((g) => g.a === r || g.b === r).length;
+    const subsets = (arr, k, from = 0, cur2 = [], out = []) => { if (cur2.length === k) { out.push(cur2.slice()); return out; } for (let i = from; i < arr.length; i++) { cur2.push(arr[i]); subsets(arr, k, i + 1, cur2, out); cur2.pop(); } return out; };
+    // Can every team in G reach `tgt` at once? Its games with teams outside G go to it; up to `lose` of X's games against
+    // G go to G; the games inside G are split every way there is.
+    const allReach = (G, X, tgt, lose, open, xg) => {
+        const inG = new Set(G), have = {}, inside = [];
+        for (const r of G) have[r] = base[r];
+        for (const g of open) { const a = inG.has(g.a), b = inG.has(g.b); if (a && b) inside.push(g); else if (a) have[g.a]++; else if (b) have[g.b]++; }
+        if (G.some((r) => have[r] + cnt(r, inside) + (xg[r] || 0) < tgt)) return false;
+        if (inside.length > 16) return true;   // too many to split: assume they can, which only makes the number stricter
+        for (let m = 0; m < 1 << inside.length; m++) {
+            let need = 0, ok = true;
+            for (const r of G) { let v = have[r]; for (let i = 0; i < inside.length; i++) if (((m >> i) & 1 ? inside[i].a : inside[i].b) === r) v++;
+                const d = Math.max(0, Math.ceil(tgt - v)); if (d > (xg[r] || 0)) { ok = false; break; } need += d; }
+            if (ok && need <= lose) return true;
+        }
+        return false;
+    };
+    // X with k more wins, any k of its games: in whatever else happens?
+    const sure = (X, k, st = seated, nSeat = nPO) => {
+        const mine = rest.filter((g) => g.a === X || g.b === X), open = rest.filter((g) => g.a !== X && g.b !== X), tgt = base[X] + k, lose = mine.length - k;
+        const xg = {}; for (const g of mine) { const o = g.a === X ? g.b : g.a; xg[o] = (xg[o] || 0) + 1; }
+        const live = rids.filter((r) => r !== X && base[r] + cnt(r, open) + Math.min(xg[r] || 0, lose) >= tgt);
+        const fails = [];
+        for (let size = 0; size <= Math.min(live.length, nSeat + 1); size++) for (const G of subsets(live, size)) {
+            if (fails.some((F) => F.every((r) => G.includes(r)))) continue;   // only the smallest sets matter
+            const fin = {}; for (const r of rids) fin[r] = r === X || G.includes(r) ? tgt : -1;
+            if (st(fin, X, false)) continue;
+            fails.push(G);
+            if (allReach(G, X, tgt, lose, open, xg)) return false;
+        }
+        return true;
+    };
+    // X wins out and every other result goes its way: a seat? Games where one side can't pass X go to that side; the
+    // rest are split every way (more than 16 of them: call it alive).
+    const alive = (X, st = seated) => {
+        const mine = rest.filter((g) => g.a === X || g.b === X), open = rest.filter((g) => g.a !== X && g.b !== X), fin = { ...base };
+        fin[X] += mine.length;
+        const contested = [];
+        for (const g of open) { const ta = base[g.a] + cnt(g.a, open) > fin[X], tb = base[g.b] + cnt(g.b, open) > fin[X]; if (!ta) fin[g.a]++; else if (!tb) fin[g.b]++; else contested.push(g); }
+        if (contested.length > 16) return true;
+        for (let m = 0; m < 1 << contested.length; m++) { const f = { ...fin }; for (let i = 0; i < contested.length; i++) f[(m >> i) & 1 ? contested[i].a : contested[i].b]++; if (st(f, X, true)) return true; }
+        return false;
+    };
+    // A team in already: has it the division too (a title decided on points can't be clinched), and a bye (the seats
+    // the bracket rests come first)?
+    const divRule = book.seeds.find((r) => r.take === 'division_winners'), nDivs = new Set(rids.map((r) => div[r]).filter((d) => d > 0)).size;
+    const byDiv = divRule && nDivs >= 2 ? seatedIn({ seeds: [divRule] }, nDivs) : null, nBye = Math.min((book.seeds[0] || {}).byes || 0, nPO), byBye = nBye > 0 ? seatedIn(book, nBye) : null;
+    const res = new Map();
+    for (const X of rids) {
+        const left = cnt(X, rest); let k = null;
+        for (let j = 0; j <= left; j++) if (sure(X, j)) { k = j; break; }
+        const c = { k, left, out: k == null && !alive(X) };
+        if (k === 0) { c.div = !!byDiv && sure(X, 0, byDiv, nDivs); c.bye = !!byBye && sure(X, 0, byBye, nBye); }
+        res.set(X, c);
+    }
+    S[slot] = { key, res };
+    return res;
+}
+// The number in words, for the standings line and the Playoffs view. `sim` is the season sim's 99% number.
+function magicText(c, sim) {
+    if (c && c.k === 0) return { txt: c.bye ? 'clinched a bye' : c.div ? 'clinched the division' : 'clinched', tip: `In the playoffs${c.bye ? ' with a bye' : c.div ? ' as division champion' : ''} whatever happens from here` };
+    const likely = sim != null && sim > 0 ? `Win ${sim} and you're in 99% of the time` : null;
+    if (c && c.k != null) return { txt: `magic number ${c.k}`, tip: `Win ${c.k} of your last ${c.left} and you're in, whatever else happens: every tie broken against you, and a seat decided by points never counted on.${likely && sim < c.k ? ` ${likely}.` : ''}`, likely: sim != null && sim < c.k ? sim : null };
+    if (c && c.out) return { txt: 'eliminated', tip: 'No seat even winning out, with every other result going your way' };
+
+    if (c) return { txt: 'no magic number: you need help', tip: `Winning out doesn't make it certain; it depends on other results too.${likely ? ` ${likely}.` : ''}`, likely: sim };
+    return sim != null ? { txt: `win ${sim} and you're in 99% of the time`, tip: 'From the season played out 3,000 times' } : null;
+}
+// Your number on the standings line: the strict one, and the season sim's likelier count beside it when that is smaller.
+function magicBit(V, cap) {
+    const c = (clinchNumbers() || new Map()).get(S.myRoster && S.myRoster.roster_id), t = magicText(c, V.magic);
+    if (!t) return null;
+    return h('span', { class: c && c.k === 0 ? 'teal' : c && c.out ? 'red' : '', title: t.tip }, cap ? t.txt[0].toUpperCase() + t.txt.slice(1) : t.txt,
+        t.likely != null ? ` \u00b7 win ${t.likely} and you're in 99% of the time` : '');
+}
+// The Playoffs view's cell: a number, clinched, needs help or eliminated, each with its reason on hover. ("out" was
+// the word until 2026-11-24; OUT is Sleeper's injury tag.)
+function magicCell(c, sim, name, rid, live) {
+    if (!c) return h('span', { class: 'mono dim', title: regSeasonEnd() - Math.max(1, S.curWeek) + 1 > MAGIC_WEEKS ? `Magic numbers start with ${MAGIC_WEEKS} weeks of the regular season left` : 'No magic numbers once the regular season is over' }, '—');
+    const likely = sim != null && sim > 0 ? ` The season played out 3,000 times: win ${sim} and it's in 99% of the time.` : '';
+    if (c.k === 0) return h('span', { class: 'mono teal', title: `${name} is in the playoffs whatever happens from here` }, 'clinched');
+    if (c.k != null) return h('span', { class: 'mono', title: `${name}: win ${c.k} of its last ${c.left} and it's in, whatever else happens.${sim != null && sim < c.k ? likely : ''}` }, String(c.k));
+    if (c.out) return h('span', { class: 'mgk c-e', title: `${name} has no seat even winning out, with every other result going its way` }, h('span', { class: 'w' }, 'eliminated'));
+
+    return h('span', { class: 'dim', style: 'font-size:11.5px', title: `Winning out doesn't make it certain for ${name}: it needs other results too.${likely}` }, 'needs help');
+}
+// The race in a letter beside the seed, on every Standings view and on Home's standings card, the sports page's way
+// (the user, 2026-11-24: green for clinched, red for eliminated; the letter and its key always there, so the colour
+// never carries it alone). Each is one of the strict magic numbers' guarantees. Nothing until those start, and no
+// slot until some team has a letter, so the names don't move for nothing.
+const RACE_MARKS = [['x', 'clinched a seat'], ['y', 'clinched the division'], ['z', 'clinched a bye'], ['e', 'eliminated']];
+function raceMarks(live) {
+    const c = clinchNumbers(live ? poProjPoints() : null); if (!c) return null;
+    const out = new Map();
+    for (const [rid, v] of c) { const l = v.k === 0 ? (v.bye ? 'z' : v.div ? 'y' : 'x') : v.out ? 'e' : null; if (l) out.set(rid, l); }
+    return out.size ? out : null;
+}
+function raceMarkEl(marks, rid) {
+    if (!marks) return null;
+    const l = marks.get(rid), w = l && (RACE_MARKS.find((x) => x[0] === l) || [])[1];
+    return l ? h('span', { class: `shmk m-${l}`, title: `${l}: ${w}` }, l) : h('span', { class: 'shmk', 'aria-hidden': 'true' });
+}
+// The key under the table: the letters this league can show (no y without divisions, no z without byes).
+function raceKey(marks) {
+    if (!marks) return null;
+    const book = poDefaultRules(), has = { y: ((S.league.settings || {}).divisions || 0) >= 2, z: ((book.seeds[0] || {}).byes || 0) > 0 };
+    return RACE_MARKS.filter(([l]) => has[l] !== false).map(([l, w], i) => [i ? ' \u00b7 ' : '', h('span', { class: `shmk m-${l}` }, l), ` ${w}`]);
+}
 async function poEnsureData() {
     loadSeasonMatchups();
     const cur = Math.max(1, S.curWeek), end = regSeasonEnd();
@@ -1999,36 +2170,60 @@ const poKey = () => {
 // projected total per roster per unplayed week (the best legal lineup by
 // Sleeper's weekly projections).
 function poSim(games) {
+    S.po = { key: S.po.key, res: poSimulate(games, null) };
+    render();
+}
+// The same season with the week in progress decided at `proj` (roster id → points): the standings' "as projected",
+// played out from the week after. Its own memo, keyed by those points, so the forecast beside it is never disturbed.
+const poProjPoints = () => Object.fromEntries((S.matchups[S.curWeek] || []).map((m) => [m.roster_id, countedPoints(m)]));
+const poProjKey = () => `${S.curWeek}|${(S.matchups[S.curWeek] || []).map((m) => `${m.roster_id}:${Math.round(countedPoints(m))}`).join(',')}`;
+function poProjRun() {
+    const key = poProjKey();
+    if (S.poProj && (S.poProj.running || S.poProj.key === key)) return;
+    S.poProj = { running: true, key, res: (S.poProj && S.poProj.res) || null };
+    poEnsureData().then((games) => {
+        if (!games) {   // still arriving: hold the memo and try again from a timer, as poRun does
+            S.poProj = { key, waiting: true, res: (S.poProj && S.poProj.res) || null };
+            if (!S.poProjRetry) S.poProjRetry = setTimeout(() => { S.poProjRetry = null; S.poProj = null; render(); }, 1000);
+            return;
+        }
+        S.poProj = { key, res: poSimulate(games, poProjPoints()) };
+        render();
+    }).catch((e) => { S.poProj = { key, error: e.message, res: (S.poProj && S.poProj.res) || null }; render(); });
+}
+function poSimulate(games, proj) {
     const book = poDefaultRules();
-    const end = regSeasonEnd(), cur = Math.max(1, S.curWeek);
+    const end = regSeasonEnd(), now = Math.max(1, S.curWeek), cur = proj ? now + 1 : now;
     const st = S.league.settings || {}, playoffTeams = Math.min(st.playoff_teams || 6, S.rosters.length);
     const rosterIds = S.rosters.map(r => r.roster_id);
     const division = new Map(S.rosters.map(r => [r.roster_id, (r.settings || {}).division || 0]));
     // A week is fact once it is behind us; the one in progress is simulated and
-    // floored at the points already on the board, inside the sim.
+    // floored at the points already on the board, inside the sim. As projected,
+    // the week in progress is fact too, at its projected finals.
     const finalWeeks = []; for (let w = 1; w < cur; w++) finalWeeks.push(w);
     const gameMap = new Map();
-    for (let w = 1; w <= end; w++) gameMap.set(w, (games[w] || []).map(g => ({ week: w, a: g.a, b: g.b, pa: g.pa, pb: g.pb })));
+    for (let w = 1; w <= end; w++) gameMap.set(w, (games[w] || []).map(g => ({ week: w, a: g.a, b: g.b,
+        pa: proj && w === now ? proj[g.a] ?? g.pa : g.pa, pb: proj && w === now ? proj[g.b] ?? g.pb : g.pb })));
     const means = new Map();
     for (const R of S.rosters) {
         const m = new Map();
-        for (let w = cur; w <= end; w++) m.set(w, bestLineup(R, w).reduce((t, pid) => t + (pid !== '0' ? (projOf(pid, w) || 0) : 0), 0));
+        for (let w = cur; w <= end; w++) m.set(w, projWeekTotal(R, w));
         means.set(R.roster_id, m);
     }
     const currentPoints = new Map();
-    for (const m of S.matchups[cur] || []) currentPoints.set(m.roster_id, m.points || 0);
+    if (!proj) for (const m of S.matchups[cur] || []) currentPoints.set(m.roster_id, m.points || 0);
     // What each roster still has to come this week: its projected final less the
     // points on the board. With it the sim scores the week in progress as the
     // board plus a draw for only the football left, so a team with everyone
     // played is its score and the odds move as the games are played. Read only
     // when this week's kickoffs are in hand; otherwise the sim keeps its floor.
     let currentRemaining;
-    if (S.week === cur && S.kickWeek === cur) {
+    if (!proj && S.week === cur && S.kickWeek === cur) {
         currentRemaining = new Map();
         for (const m of S.matchups[cur] || []) { const R = rosterById(m.roster_id); if (R) currentRemaining.set(m.roster_id, Math.max(0, muProjected(R, m) - (m.points || 0))); }
     }
     let mtot = 0, mcnt = 0; for (const m of means.values()) for (const v of m.values()) { mtot += v; mcnt++; }
-    console.info(TAG, `odds inputs: wk ${cur}-${end}, ${rosterIds.length} rosters, mean/team/wk ${(mtot / Math.max(1, mcnt)).toFixed(1)}, book "${book.label}"`);
+    console.info(TAG, `odds inputs${proj ? ` (week ${now} as projected)` : ''}: wk ${cur}-${end}, ${rosterIds.length} rosters, mean/team/wk ${(mtot / Math.max(1, mcnt)).toFixed(1)}, book "${book.label}"`);
     const t0 = performance.now();
     const res = FBCalc.simulateSeason({
         rosterIds, division, games: gameMap, finalWeeks, currentWeek: cur,
@@ -2038,12 +2233,11 @@ function poSim(games) {
     const mine = res.teams.get(myRid) || null;
     const took = Math.round(performance.now() - t0);
     if (took > 400) console.info(TAG, `season sim: ${res.n} seasons in ${took}ms`);
-    S.po = { key: S.po.key, res: {
+    return {
         book, playoffTeams, remaining: res.remaining, n: res.n, teams: res.teams, mine,
         myGame: (games[cur] || []).find(g => g.a === myRid || g.b === myRid) || null,
         source: 'local',
-    } };
-    render();
+    };
 }
 // The playoff picture. Its number is a line at the top of the standings; the
 // rest opens beneath it by hand, and only from the halfway mark — an early
@@ -2067,7 +2261,7 @@ function poLine() {
     line.append(h('b', { class: 'big mono' }, `${V.inP}%`),
         h('span', { class: 'txt' }, h('b', null, `make the ${V.playoffTeams}`),
             V.byes ? ` \u00b7 bye ${V.byeP}%` : '',
-            V.magic != null ? ` \u00b7 magic number ${V.magic}` : (S.curWeek <= 2 ? ' \u00b7 too early to mean much' : '')),
+            magicBit(V) ? [' \u00b7 ', magicBit(V)] : (S.curWeek <= 2 ? ' \u00b7 too early to mean much' : '')),
         h('span', { class: 'src mono dim' }, src));
     if (unlocked) line.append(h('span', { class: 'poexp', onclick: () => setPoOpen(!open) }, open ? 'fold ' : 'full picture ', caret('', open)));
     else line.append(h('span', { class: 'poexp off', title: `Opens at the halfway mark \u2014 week ${poHalfway()}` }, `full picture \u00b7 wk ${poHalfway()}`));
@@ -2079,7 +2273,7 @@ function poLine() {
 }
 function poBody(V, po) {
     const playoffTeams = V.playoffTeams;
-    const pIn = V.inP, pBye = V.byeP, magic = V.magic;
+    const pIn = V.inP, pBye = V.byeP;
     // Routes in: one line per seeding rule that ever seated you.
     const routes = V.rules.map((name, i) => ({
         name: name === 'Division champ' ? 'win the division' : name === 'Points seat' ? 'points wild card' : 'record wild card',
@@ -2132,7 +2326,7 @@ function poBody(V, po) {
     return h('div', { class: 'pogrid' },
         h('div', null,
             h('div', { style: 'display:flex;align-items:baseline;gap:8px' }, h('b', { class: 'mono teal', style: 'font-size:30px;letter-spacing:-.02em' }, `${pIn}%`), h('span', { class: 'dim', style: 'font-size:12px' }, `make the ${playoffTeams}`)),
-            byes ? h('div', { class: 'dim', style: 'font-size:11.5px' }, `First-round bye ${pBye}%`, magic != null ? ` · magic number ${magic}` : '') : (magic != null ? h('div', { class: 'dim', style: 'font-size:11.5px' }, `Magic number ${magic}`) : null),
+            byes ? h('div', { class: 'dim', style: 'font-size:11.5px' }, `First-round bye ${pBye}%`, magicBit(V) ? [' · ', magicBit(V)] : '') : (magicBit(V) ? h('div', { class: 'dim', style: 'font-size:11.5px' }, magicBit(V, true)) : null),
             h('div', { class: 'muted', style: 'font-size:11px;margin:8px 0 3px' }, 'HOW YOU GET IN'),
             ...(routes.length ? routes.map(routeRow) : [h('div', { class: 'dim', style: 'font-size:11.5px' }, 'No path found in 3,000 seasons — the points race below is the honest hope.')]),
             lev),
@@ -2282,7 +2476,7 @@ async function vaultWeek(V, w) {
         }
         withVault(V, () => {   // scoreStats needs the ARCHIVED league's scoring
             const pm = {}; for (const x of wk.proj) pm[x.player_id] = { pts: scoreStats(x.stats), opp: x.opponent, game: x.game_id, team: x.team, stats: x.stats };
-            const sm = {}; for (const x of wk.stats) sm[x.player_id] = { pts: scoreStats(x.stats), opp: x.opponent, stats: x.stats };
+            const sm = {}; for (const x of wk.stats) sm[x.player_id] = { pts: scoreStats(x.stats), opp: x.opponent, team: x.team, stats: x.stats };
             V.proj[w] = pm; V.stats[w] = sm;
         });
         V.plays[w] = { at: Date.now(), done: true, list: wk.plays.slice().sort(byPlayOrder) };   // an archived week cached under the old order sorts on read too
@@ -3435,36 +3629,76 @@ function playStatsOf(p) {
         if (st.pass_att) out.pass_inc = (out.pass_inc || 0) + 1;
         return { player_id: ps.player_id, stats: out }; });
 }
-// An individual defender's stat credits his team's defence, and his team is
-// whichever one does not have the ball. Sacks come off the sacked quarterback's
-// row, which is authoritative where the tacklers' rows split shared credit.
+// An individual defender's stat credits his team's defence. Sacks come off the
+// sacked quarterback's row, which is authoritative where the tacklers' rows
+// split shared credit.
 const IDP_TO_TEAM = { idp_sack: 'sack', idp_int: 'int', idp_ff: 'ff', idp_fum_rec: 'fum_rec', idp_tkl_loss: 'tkl_loss',
     idp_blk_kick: 'blk_kick', idp_safe: 'safe', idp_def_td: 'def_td', idp_int_td: 'def_td', idp_fum_rec_td: 'def_td' };
-// What a play gave each defence, from its players' rows: [team, stat, count]. A credit goes to the side without the
-// ball, except where the feed books it on someone else's row:
-// - A forced fumble (idp_ff) is on the man who FUMBLED, never on the man who forced it (all 42 of 2026 week 5's).
-//   It belongs to the other side from the fumbler's own team, under the stat Sleeper's line books it as: ff when
-//   his team had the ball at the snap; def_st_ff when he was returning a kick; ff_misc when he was a defender
-//   running back a takeaway. "The side without the ball" handed Turpin's kickoff fumble, forced by Tampa Bay, to
-//   the Dallas D/ST: a point Sleeper never gave (week 5).
-// - A blocked kick is on the kicker's row only (xp_blkd, fg_blkd): blk_kick for the other side, unless the
-//   blocker has a row of his own. A return touchdown is on the returner's (st_td): def_st_td for his team.
-// A stat the defence's own team row already carries on the play is never added twice.
+// The team a player was on THAT week. The week's stat line knows it; the players file knows only today's, and a
+// punt returner who has changed teams since read as nobody's, so the fumble he lost was credited to his own side
+// (2026 week 6). Defenders have no line in the week's stats and fall back to today's team.
+const teamAt = (pid) => ((((S.stats || {})[S.week] || {})[pid]) || {}).team || (P(pid) || {}).team;
+// The play-by-play text still writes two teams the old way.
+const DESC_TEAM = { LA: 'LAR', JAC: 'JAX' };
+// What a play gave each defence, from its rows and, where the feed has no row for it, its words: [team, stat,
+// count]. Checked against Sleeper's official line for every defence, 2026 weeks 1–10.
+// - A defender's stat goes to the side without the ball, except on a play where the ball changes hands (a
+//   takeaway, a kick): there the side with it at the snap can be the one defending, and his own team decides. Josh
+//   Myers recovering the fumble on Buffalo's interception return is the Jets' recovery, not Buffalo's (week 10);
+//   Khalil Mack's tackle for loss on a sack-fumble return is the Chargers' (week 3), though review overturned the
+//   fumble: a reversed call keeps the rows of the call it reversed. Only there, because a defender's team is
+//   today's: Andre Cisco's sack for the Jets in week 3 would be Detroit's, where he plays now.
+// - A forced fumble (idp_ff) is on the man who FUMBLED, never on the man who forced it. It belongs to the other
+//   side from the fumbler's own team, under the stat Sleeper's line books it as: ff when his team had the ball at
+//   the snap; def_st_ff on any kick (a return, a blocked field goal run back); ff_misc when he was a defender
+//   running back a takeaway. A fumble whose forcer the text leaves blank ("FUMBLES, forced by.") has no idp_ff at
+//   all; it is booked the same way off the man who lost it (a last-play lateral, week 10).
+// - A blocked kick is on the kicker's row (xp_blkd, fg_blkd): blk_kick for the other side, unless the blocker has a
+//   row of his own. A blocked PUNT can have no row at all, only "blocked the kick" in the text (weeks 1 and 6).
+// - A return touchdown is on the returner's row (st_td): def_st_td for his team. Some have no row either, only
+//   TOUCHDOWN on a kick (a 95-yard kickoff return, week 8; a blocked punt run in, week 6): the side that recovered
+//   last scored, or else the side receiving the kick. A blocked try run back for two ("recovers the blocked kick,
+//   good") is the blocking side's def_2pt (week 7).
+// - Where the defence's own row carries a sack's yards, it also decides the sack: yards and no sack (a sack-fumble
+//   credited to the team as a whole) is not one (week 2).
+// A stat the defence's own team row already carries on the play is never added twice, and a play wiped out by a
+// penalty credits nothing from its words.
 function defCredits(rows, md) {
     const offense = md.possession, other = offense && md.team && md.opponent ? (offense === md.team ? md.opponent : md.team) : null, out = [], has = new Set();
+    const pt = md.play_type || '', kick = /^(kickoff|punt|field_goal|extra_point)/.test(pt);
     const ind = rows.filter(r => /^\d+$/.test(String(r.player_id)));
     for (const r of rows) if (!ind.includes(r)) for (const k in r.stats || {}) has.add(`${r.player_id}:${k}`);
+    const sideOf = (r) => { const t = teamAt(String(r.player_id)); return t && (t === md.team || t === md.opponent) ? t : null; };
+    const vsOf = (own) => own ? (own === md.team ? md.opponent : md.team) : other;
+    const forced = (own) => own === offense ? 'ff' : kick ? 'def_st_ff' : 'ff_misc';
     const blocker = ind.some(r => (r.stats || {}).idp_blk_kick);
+    const teamSack = has.has(`${other}:sack_yd`) && !has.has(`${other}:sack`);
+    const swap = kick || md.review_result === 'overturned' || ind.some(r => { const st = r.stats || {}; return st.fum_lost || st.pass_int || st.idp_int; });
     for (const r of ind) {
-        const st = r.stats || {}, t = (P(String(r.player_id)) || {}).team, own = t && (t === md.team || t === md.opponent) ? t : null, vs = own ? (own === md.team ? md.opponent : md.team) : other;
-        if (st.pass_sack) out.push([other, 'sack', st.pass_sack]);
+        const st = r.stats || {}, own = sideOf(r), vs = vsOf(own);
+        if (st.pass_sack && !teamSack) out.push([other, 'sack', st.pass_sack]);
         for (const k in st) {
             const v = st[k]; if (typeof v !== 'number') continue;
             if (/^(xp|fg|punt)_blkd$/.test(k)) { if (!blocker) out.push([vs, 'blk_kick', v]); continue; }
             if (k === 'st_td') { out.push([own || other, 'def_st_td', v]); continue; }
             const kk = IDP_TO_TEAM[k]; if (!kk || kk === 'sack') continue;
-            if (k !== 'idp_ff' || !st.fum || !own || !offense) { out.push([other, kk, v]); continue; }
-            out.push([vs, own === offense ? 'ff' : /^(kickoff|punt)/.test(md.play_type || '') ? 'def_st_ff' : 'ff_misc', v]);
+            if (k !== 'idp_ff') { out.push([swap && own || other, kk, v]); continue; }
+            out.push(st.fum && own && offense ? [vs, forced(own), v] : [other, kk, v]);
+        }
+    }
+    const d = md.description || '';
+    if (other && !/no_play/.test(pt) && !/No Play\./.test(d)) {
+        const rowHas = (re) => rows.some(r => Object.keys(r.stats || {}).some(k => re.test(k)));
+        if (kick && /blocked the kick|is blocked/.test(d) && !rowHas(/_blkd$|^(idp_)?blk_kick$/)) out.push([other, 'blk_kick', 1]);
+        if (/^(kickoff|punt|field_goal)/.test(pt) && /TOUCHDOWN/.test(d) && !/NULLIFIED/i.test(d) && !rowHas(/(^|_)td$/)) {
+            const last = [...d.matchAll(/RECOVERED by ([A-Z]{2,3})-/g)].pop(), t = last && (DESC_TEAM[last[1]] || last[1]);
+            out.push([t === md.team || t === md.opponent ? t : other, 'def_st_td', 1]);
+        }
+        if (/^extra_point/.test(pt) && /recovers the blocked kick, good/i.test(d) && !rowHas(/def_2pt/)) out.push([other, 'def_2pt', 1]);
+        const blank = (d.match(/FUMBLES, forced by\.(\s|$)/g) || []).length;
+        if (blank) {
+            const lost = ind.find(r => (r.stats || {}).fum_lost && !(r.stats || {}).idp_ff), own = lost && sideOf(lost);
+            if (own && offense) out.push([vsOf(own), forced(own), blank]);
         }
     }
     return out.filter(c => c[0] && !has.has(`${c[0]}:${c[1]}`));
@@ -3520,7 +3754,7 @@ function buildLedger(A, a, B, b) {
         if (ppos(pid) === 'DEF') Object.assign(raw, defSettled(pid));
         return scoreStats(raw) || 0;
     };
-    const teamOf = (pid) => (P(pid) || {}).team || pid;
+    const teamOf = (pid) => teamAt(pid) || pid;   // his team THAT week, so a player traded since reads his own game's clock
     const fracLeft = (pid) => {
         const g = gameOfTeam[teamOf(pid)];
         // No plays yet AT THIS POINT OF THE REPLAY means his game hasn't
@@ -3895,7 +4129,7 @@ function matchupHeader(roster, compact) {
     // A finished matchup keeps its windows: who scored what in the early games,
     // the late ones and the night games is the story of how it was won. Only a
     // week with no kickoff times on record falls back to the bare score.
-    const g = muGauge(A, mm.mine, B, mm.opp, { started, done, fA, fB }) || (done ? { rowA: null, rowB: null, rail: h('div', { class: 'mgrail' }, h('div', { class: 'wins' }), h('span', { class: 'mlamp' }, 'FINAL')) } : null);
+    const g = muGauge(A, mm.mine, B, mm.opp, { started, done, fA, fB }) || (done ? { rowA: null, rowB: null, rail: null } : null);
     const rankOf = (R) => R ? ordinal(rosterRank().findIndex(r => r.roster_id === R.roster_id) + 1) : '';
     const blk = (R, sideK, sVal, lead, gRow) => h('div', { class: `tmblk ${sideK}` },
         h('div', { class: 'tline' },
@@ -3929,16 +4163,21 @@ function matchupHeader(roster, compact) {
         h('span', { class: 'bar split mfcb' }, h('i', { style: `width:${wA}%` }), h('i', { style: `width:${100 - wA}%` })),
         h('span', { class: 'mono dim' }, `${100 - wA}%`));
     return h('div', { style: 'display:contents' },
-        // Both cards carry a title row like every other card: it names what the card shows and
-        // holds the copy button, so the content beneath runs the card's full width.
+        // The score card needs no title (two teams and their scores say what it is). Its top row
+        // holds the game's state instead, top left, the same tag the game cards at the top of the
+        // Scoreboard carry, so the two always agree; it used to be a lamp at the end of the
+        // window rail, read last (the user, 2026-11-22). The row keeps the copy button's corner
+        // clear and the first line level with "Win probability" beside it.
         h('div', { class: 'card mscard' },
-            h('div', { class: 'card-h' }, h('h3', null, 'Score by window'), h('span', { class: 'dim', style: 'font-size:12px' }, 'what each window of games has scored')),
+            (() => { const st6 = muState(A, mm.mine, B, mm.opp); return h('div', { class: 'card-h mshd' }, h('span', { class: `s6tag ${st6.state}` }, muTag(st6))); })(),
             fcast,
             blk(A, 'a', sA, sA >= sB, g && g.rowA),
             blk(B, 'b', sB, sB > sA, g && g.rowB),
             g && g.rail),
         h('div', { class: 'card mwpcard' },
-            h('div', { class: 'card-h' }, h('h3', null, pts ? 'Points through the week' : proj ? 'Projected finals' : 'Win probability'), lensEl(false)),
+            // three titles of about one width, so the lens switch stays on the title row whichever is picked: "Points
+            // through the week" pushed it to a second line, and the card grew and its chart jumped (the user, 2026-11-15)
+            h('div', { class: 'card-h' }, h('h3', null, pts ? 'Running score' : proj ? 'Projected finals' : 'Win probability'), lensEl(false)),
             h('div', { class: 'mwp' },
                 wpRow(A, 't', pts ? fmtS(sA) : proj ? fmtS(fA) : `${wA}%`, fA, pre(A, mm.mine)),
                 // the second team's row sits right under the curve, above the window names and the strip a hover fills
@@ -4023,15 +4262,17 @@ function muGauge(A, a, B, b, st2) {
         ? h('span', { class: 'wsc', title: w2.live ? 'Points so far in this window' : 'Points this window scored' }, w2.live ? h('i', { class: 'wlive' }, '\u25cf ') : null, fmt1(w2.pts[sideK])) : null;   // points, like every number on the card: no unit
     const row = (sideK, fProj) => h('div', { class: 'mgrow' },
         ...list.map(w2 => h('div', { class: `mgseg${w2.done ? ' played' : ''}${w2.live ? ' live' + sideK : ''}`, style: `flex:${w2.flex}` }, ...w2[sideK].map(puck), worth(w2, sideK))),
-        h('span', { class: 'mgproj mono' }, st2.started && !st2.done ? ['proj ', h('b', null, fmtS(fProj))] : ''));
+        h('span', { class: `mgproj mono${st2.started && !st2.done ? '' : ' off'}` }, st2.started && !st2.done ? ['proj ', h('b', null, fmtS(fProj))] : ''));
     const rail = h('div', { class: 'mgrail' },
         h('div', { class: 'wins' }, ...list.map(w2 => h('span', { class: `wl${w2.live ? ' on' : ''}`, style: `flex:${w2.flex}` }, WIN_PLAIN[w2.name] || w2.name, w2.done ? ' \u2713' : w2.live ? h('i', { class: 'wlive' }, ' \u25cf') : ''))),
-        h('span', { class: 'mlamp' }, st2.done ? 'FINAL' : st2.started ? '\u25cf LIVE' : 'PROJECTED'));
+        h('span', { class: `mlamp${st2.started && !st2.done ? '' : ' off'}`, 'aria-hidden': 'true' }));   // empty: it mirrors the rows' proj column, so the window names stay over their boxes; the state is on the card's top row
     return { rowA: row('a', st2.fA), rowB: row('b', st2.fB), rail };
 }
 function wpChart(A, a, B, b, ptsOpts) {
     buildLedger(A, a, B, b);   // memoised; the hero renders before the log that would otherwise fill this in
-    const W = 360, H = 118, PAD = 6, series = (S.wpHist && S.wpHist[S.week]) || [];
+    // 88 tall (was 118): the curve card sets the height of the row it shares with the score card, and at 118 the
+    // score card stretched to match with a band of nothing under its state (the user, 2026-11-22: "make the row less tall")
+    const W = 360, H = 88, PAD = 6, series = (S.wpHist && S.wpHist[S.week]) || [];
     if (ptsOpts && ptsOpts.proj) return projChart(A, a, B, b, ptsOpts, W, H, PAD);
     if (ptsOpts) return ptsChart(A, a, B, b, ptsOpts, W, H, PAD);
     const w = winProbFor(A, a, B, b);
@@ -4240,7 +4481,11 @@ function fitGauges(page) {
 // in reach while one is open, and the one that opened it closes it. The bar is
 // shorter in a narrow window, so its height is measured, not assumed, and kept
 // on the root, where the drawer's own rule reads it.
-function syncBar() { const b = $('.topbar'); if (b && root) root.style.setProperty('--bar-h', `${b.offsetHeight}px`); }
+function syncBar() {
+    const b = $('.topbar'); if (b && root) root.style.setProperty('--bar-h', `${b.offsetHeight}px`);
+    // the Scoreboard's switch row stays under the bar as the page scrolls, so whatever else sticks there sits below it
+    const sw = $('.mswitch'); if (sw && root) root.style.setProperty('--sw-h', `${sw.offsetHeight}px`);
+}
 // After a render, read the score bug's box widths and hand them to the
 // curve's panes. A change re-renders once, synchronously — before paint, so
 // nothing flickers — and the second pass measures the same and stops.
@@ -4256,10 +4501,21 @@ function syncPanes() {
     S.ui.wpSyncing = true;
     try { render(); } finally { S.ui.wpSyncing = false; }
 }
+// Where the two end-of-line labels go: each centred on its line's end, and when the ends are closer than a
+// label is tall, parted evenly about their middle, the larger final on top; never past the chart's edges.
+function endLabels(ys, vals, H) {
+    const out = ys.slice(), GAP = 13;
+    if (Math.abs(out[0] - out[1]) < GAP) { const m = (out[0] + out[1]) / 2, up = vals[0] >= vals[1] ? 0 : 1; out[up] = m - GAP / 2; out[1 - up] = m + GAP / 2; }
+    const lo = Math.min(...out), hi = Math.max(...out), shift = lo < GAP / 2 ? GAP / 2 - lo : hi > H - GAP / 2 ? H - GAP / 2 - hi : 0;
+    return out.map((v) => v + shift);
+}
 // The POINTS lens: two scores stepping up from zero across the football
 // played, then dotted to their projected finals — so the chart's right edge
 // agrees with the gauge's proj caps. A hollow ring at the frontier marks
-// each side's pace: where the score would be on projection alone.
+// each side's pace: where the score would be on projection alone. A ring that
+// would sit on a dot or on the other ring is left out (the rows say the pace in
+// words), and the two finals' labels sit on the ends of their tails, parted when
+// they are close, never on a line (the user, 2026-11-15: "sloppy").
 function ptsChart(A, a, B, b, o, W, H, PAD) {
     const L = S.ledger && S.ledger[S.week], ph = (L && L.phist) || [];
     const { svg, mk, box, xmap } = chartFrame(A, a, B, b, W, H, PAD, 'wpsvg pts');
@@ -4271,6 +4527,8 @@ function ptsChart(A, a, B, b, o, W, H, PAD) {
     // faint quarter-lines give the eye a scale without an axis
     for (const q of [0.25, 0.5, 0.75]) svg.appendChild(mk('line', { x1: 0, x2: W, y1: y(top * q), y2: y(top * q), class: 'ptgrid' }));
     svg.appendChild(mk('line', { x1: span.toFixed(1), x2: span.toFixed(1), y1: PAD, y2: H - PAD, class: 'ptfront' }));
+    const labY = endLabels(fin.map((v) => +y(v)), fin, H), dotY = cur.map((v) => +y(v)), ringY = pace.map((v) => +y(v));
+    const ringClear = (i) => [dotY[0], dotY[1], ringY[1 - i]].every((v) => Math.abs(ringY[i] - v) >= 7);
     ['a', 'b'].forEach((k, i) => {
         const pts = ph.length ? ph.map(p => p[i]) : [0];
         let d = `M0,${y(pts[0])}`;
@@ -4280,13 +4538,11 @@ function ptsChart(A, a, B, b, o, W, H, PAD) {
         if (!o.done) {
             svg.appendChild(mk('path', { d: `M${span.toFixed(1)},${y(cur[i])} L${W},${y(fin[i])}`, class: `pttail ${k}` }));
             // pregame the rows already print the projections these tails climb to
-            if (o.started) box.appendChild(h('span', { class: `ptlab ${k}`, style: `top:${y(fin[i])}px`, title: 'Projected final' }, fmt1(fin[i])));
-            if (o.started) svg.appendChild(mk('circle', { cx: Math.max(3.6, Math.min(W - 3, span)).toFixed(1), cy: y(pace[i]), r: 3.4, class: `ptring ${k}` }));
+            if (o.started) box.appendChild(h('span', { class: `ptlab ${k}`, style: `top:${labY[i].toFixed(1)}px`, title: 'Projected final' }, fmtS(fin[i])));
+            if (o.started && ringClear(i)) svg.appendChild(mk('circle', { cx: Math.max(3.6, Math.min(W - 3, span)).toFixed(1), cy: ringY[i].toFixed(1), r: 3.4, class: `ptring ${k}` }));
         }
         svg.appendChild(mk('circle', { cx: Math.max(3.6, Math.min(W - 3, span)).toFixed(1), cy: y(cur[i]), r: 3.6, class: `ptdot ${k}` }));
     });
-    // near-equal projections would stack their labels: the lower one drops under its line
-    if (o.started && !o.done && Math.abs(y(fin[0]) - y(fin[1])) < 11) box.querySelector(`.ptlab.${fin[0] >= fin[1] ? 'b' : 'a'}`).classList.add('below');
     if (L && ph.length) wpHover(box, svg, W, H, L.events.slice().reverse().filter((e) => e.x != null).map((e) => ({ cx: Math.min(span, xmap(e.x)), e, ys: [[+y(e.sa), 'a'], [+y(e.sb), 'b']] })),
         'pts', `${S.week}:${A && A.roster_id}:${B && B.roster_id}:pts`, L.settled, A, B);
     return box;
@@ -4308,10 +4564,9 @@ function projChart(A, a, B, b, o, W, H, PAD) {
         d += ` L${span.toFixed(1)},${y(prev)} L${span.toFixed(1)},${y(fin[i])}`;
         svg.appendChild(mk('path', { d, class: `ptline ${k}` }));
         if (!o.done) svg.appendChild(mk('path', { d: `M${span.toFixed(1)},${y(fin[i])} L${W},${y(fin[i])}`, class: `pttail ${k}` }));
-        box.appendChild(h('span', { class: `ptlab ${k}`, style: `top:${y(fin[i])}px`, title: 'Projected final' }, fmt1(fin[i])));
+        // no label at the line's end: the rows above and below the chart print these same two finals
         svg.appendChild(mk('circle', { cx, cy: y(fin[i]), r: 3.6, class: `ptdot ${k}` }));
     });
-    if (Math.abs(y(fin[0]) - y(fin[1])) < 11) box.querySelector(`.ptlab.${fin[0] >= fin[1] ? 'b' : 'a'}`).classList.add('below');
     if (L && evs.length) wpHover(box, svg, W, H, evs.map((e) => ({ cx: Math.min(span, xmap(e.x)), e, ys: [[+y(e.ta), 'a'], [+y(e.tb), 'b']] })),
         'proj', `${S.week}:${A && A.roster_id}:${B && B.roster_id}:proj`, L.settled, A, B);
     return box;
@@ -4375,25 +4630,34 @@ function seedingNote() {
     return `Seeds follow Sleeper’s default rules: ${nDiv >= 2 ? 'division winners first, then the best records' : 'the best records'}, ties on points for. `
         + 'A league rule that Sleeper’s settings cannot hold, such as a seat for the most points, is not counted here.';
 }
+// An unplayed week's projected total: the best legal lineup by Sleeper's weekly
+// projections. The playoff odds price every remaining week with it, and the
+// points race draws the rest of the season with it, so the two never disagree.
+const projWeekTotal = (R, w) => R ? bestLineup(R, w).reduce((t, pid) => t + (pid !== '0' ? (projOf(pid, w) || 0) : 0), 0) : 0;
 // Today's seeds: the rulebook applied to the table as it stands — a fact, not
 // a forecast, and the same interpreter the sim uses. Empty until a week is
 // final, because twelve 0–0s seed by roster id and that is not information.
-function currentSeeds(live) {
+// `through` carries the table on to a later week of the regular season, each
+// unplayed game going to the side projected higher (projWeekTotal): the seats
+// as they would stand at that week's end. Each seat carries its record there.
+function currentSeeds(live, through) {
     if (S.seasonType !== 'regular' || !(S.curWeek > 1) || !S.rosters) return null;
     const book = poDefaultRules();
     const st = S.league.settings || {}, playoffTeams = Math.min(st.playoff_teams || 6, S.rosters.length);
     const teams = S.rosters.map(R => ({ rid: R.roster_id, w: (R.settings || {}).wins || 0, l: (R.settings || {}).losses || 0, t: (R.settings || {}).ties || 0, pf: pf(R), division: (R.settings || {}).division || 0 }));
     if (!teams.some(t => t.w + t.l + t.t > 0)) return null;
     const H = {}, key = (a, b) => a + ':' + b;
-    const last = live ? S.curWeek : S.curWeek - 1, byRid = Object.fromEntries(teams.map((t) => [t.rid, t]));
-    for (let w = 1; w <= last && w <= regSeasonEnd(); w++) {
+    const last = Math.min(regSeasonEnd(), Math.max(live ? S.curWeek : S.curWeek - 1, through || 0)), byRid = Object.fromEntries(teams.map((t) => [t.rid, t]));
+    const scoreOf = (m, w) => w > S.curWeek ? projWeekTotal(rosterById(m.roster_id), w) : w === S.curWeek ? countedPoints(m) : m.points || 0;
+    for (let w = 1; w <= last; w++) {
         const by = {}; for (const m of (S.matchups[w] || [])) if (m.matchup_id != null) (by[m.matchup_id] = by[m.matchup_id] || []).push(m);
         for (const p of Object.values(by)) if (p.length === 2) {
-            const [x, y] = p, now = live && w === S.curWeek, a = now ? countedPoints(x) : x.points || 0, b = now ? countedPoints(y) : y.points || 0;
+            const [x, y] = p, a = scoreOf(x, w), b = scoreOf(y, w);
             if (a > b) H[key(x.roster_id, y.roster_id)] = (H[key(x.roster_id, y.roster_id)] || 0) + 1;
             else if (b > a) H[key(y.roster_id, x.roster_id)] = (H[key(y.roster_id, x.roster_id)] || 0) + 1;
-            // the week in progress also counts toward the record and points, at its projected final
-            if (live && w === S.curWeek) {
+            // the week in progress also counts toward the record and points, at its projected final, and so does
+            // every later week asked for, at its projected total (the settled ones are already in the rosters' records)
+            if (w >= S.curWeek) {
                 const tx = byRid[x.roster_id], ty = byRid[y.roster_id]; if (!tx || !ty) continue;
                 tx.pf += a; ty.pf += b;
                 if (a > b) { tx.w++; ty.l++; } else if (b > a) { ty.w++; tx.l++; } else { tx.t++; ty.t++; }
@@ -4405,7 +4669,7 @@ function currentSeeds(live) {
     teams.sort((a, b) => (b.w - a.w) || (b.pf - a.pf));
     const res = FBCalc.applyRules(book, teams, (a, b) => [H[key(a, b)] || 0, H[key(b, a)] || 0], playoffTeams);
     const out = {};
-    res.seeds.forEach((sd, i) => { const rule = book.seeds[sd.rule] || {}; out[sd.rid] = { n: i + 1, bye: i < res.byes, how: rule.take === 'division_winners' ? 'div' : rule.take === 'most_pf' ? 'pts' : 'wc' }; });
+    res.seeds.forEach((sd, i) => { const rule = book.seeds[sd.rule] || {}, tm = byRid[sd.rid] || {}; out[sd.rid] = { n: i + 1, bye: i < res.byes, how: rule.take === 'division_winners' ? 'div' : rule.take === 'most_pf' ? 'pts' : 'wc', w: tm.w, l: tm.l, t: tm.t }; });
     return out;
 }
 // A roster's chance of a seat: the share of the simulated seasons it made it in.
@@ -4450,10 +4714,10 @@ function standingsRow(R, i, compact) {
         h('td', { class: `dim mono${live ? ' c' : ''}` }, vault ? (fin === 1 ? '\u{1F3C6}' : fin ? ordinal(fin) : '\u2014')
             : sd ? seedCell(h('span', { class: 'sdcell', title: sd.how === 'div' ? 'Division champ today' : sd.how === 'pts' ? 'The points seat today' : 'Wild card today' }, h('span', { class: `sdbadge${sd.how === 'pts' ? ' pts' : ''}` }, sd.n), sd.bye ? h('span', { class: 'sdcap' }, 'BYE') : null))
             : live ? seedCell(stCtx.pos && stCtx.pos.now[R.roster_id] ? h('span', { class: 'sdnone', title: `${ordinal(stCtx.pos.now[R.roster_id])} overall, outside the playoff seats` }, stCtx.pos.now[R.roster_id]) : h('span', { class: 'sdnone dash' }, '\u2014')) : i + 1),
-        h('td', { style: `font-weight:800;${mine ? 'color:var(--teal)' : ''}` }, h('div', { class: 'tcell' }, avatarEl(R, 'sm'),
+        h('td', { style: `font-weight:800;${mine ? 'color:var(--teal)' : ''}` }, h('div', { class: 'tcell' }, live ? raceMarkEl(stCtx.marks, R.roster_id) : null, avatarEl(R, 'sm'),
             vault ? h('span', null, teamName(R)) : teamLink(R),
             vault && vault.pts && vault.pts.has(R.roster_id) ? h('span', { class: 'chip amber', style: 'font-size:9px;margin-left:6px' }, 'points seat') : null)),
-        h('td', { class: 'r mono' }, lv ? `${lv.w}\u2013${lv.l}${lv.t ? '\u2013' + lv.t : ''}` : record(R), lv && lv.res ? h('span', { class: 'lvres', title: `Week ${S.curWeek} ${liveWord()}: ${fmtS(lv.pts)}\u2013${fmtS(lv.opp)}` }, h('i'), lv.res) : null),
+        h('td', { class: 'r mono' }, lv ? `${lv.w}\u2013${lv.l}${lv.t ? '\u2013' + lv.t : ''}` : record(R), lv && lv.res ? h('span', { class: `lvres res-${lv.res.toLowerCase()}`, title: `Week ${S.curWeek} ${liveWord()}: ${fmtS(lv.pts)}\u2013${fmtS(lv.opp)}` }, h('i'), lv.res) : null),
         (((S.league.settings || {}).divisions || 0) >= 2) ? h('td', { class: 'r mono dim c-div' }, ap && (ap.dw + ap.dl + ap.dt > 0) ? `${ap.dw}\u2013${ap.dl}${ap.dt ? '\u2013' + ap.dt : ''}` : '\u2014') : null,
         h('td', { class: 'r mono c-ap', title: apPlayed ? `${Math.round(100 * ap.w / (ap.w + ap.l))}% of every possible matchup won` : 'Fills in once games are played' }, apPlayed ? `${Math.round(ap.w)}\u2013${Math.round(ap.l)}` : '\u2014'),
         h('td', { class: 'r mono', title: lv ? `${fmt1(pf(R))} settled + ${fmt1(lv.pts)} ${liveWeekProjects() ? 'projected ' : ''}this week` : null }, fmt1(lv ? lv.pf : pf(R))), h('td', { class: 'r mono dim c-pa', title: lv ? `${fmt1(pa(R))} settled + ${fmt1(lv.opp)} ${liveWeekProjects() ? 'projected ' : ''}this week` : null }, fmt1(lv ? lv.pa : pa(R))),
@@ -4490,7 +4754,7 @@ function standingsTable(compact, vaultCtx) {
     // the Home card can count the week in progress as it stands: one switch, shared with the League tab
     const asIs = compact && !vaultCtx && sheetLiveOn();
     stCtx = { ap: allPlayMap(asIs), vault: vaultCtx || null, seeds: compact && !vaultCtx ? currentSeeds(asIs) : null,
-        lv: asIs ? liveStand() : null, was: asIs ? (currentSeeds(false) || {}) : null };
+        lv: asIs ? liveStand() : null, was: asIs ? (currentSeeds(false) || {}) : null, marks: compact && !vaultCtx ? raceMarks(asIs) : null };
     // every team's place in the overall order, settled and as it stands: the seats in seed order, then the rest by record and points
     // (the place also names the teams outside the seats: 7th to last, where a dash used to sit)
     if (compact && !vaultCtx && stCtx.seeds) {
@@ -4500,7 +4764,7 @@ function standingsTable(compact, vaultCtx) {
     const nDiv = ((S.league.settings || {}).divisions || 0);
     // under the Home card's table: the week as it stands, when on, and which rules seeded it
     const note = compact && !vaultCtx && stCtx.seeds ? seedingNote() : null;
-    const under = [asIs ? homeLiveCap() : null, note ? h('div', { class: 'cap seednote' }, note) : null].filter(Boolean);
+    const under = [asIs ? homeLiveCap() : null, stCtx.marks ? h('div', { class: 'cap shkey' }, raceKey(stCtx.marks), '.') : null, note ? h('div', { class: 'cap seednote' }, note) : null].filter(Boolean);
     if (nDiv >= 2) return under.length ? h('div', null, divisionStandings(compact), ...under) : divisionStandings(compact);
     const tbl = h('table', null, standingsHead(compact));
     rosterRank(stCtx.lv).forEach((R, i) => tbl.append(standingsRow(R, i, compact)));
@@ -6955,8 +7219,11 @@ function runStory(txns, me) {
 function openTx(o) {
     if (!S.myRoster) { toast('You do not manage a team in this league', 'err'); return; }
     S.ui.chat = false; S.ui.notes = false; S.ui.composer = null; S.ui.trade = null;
-    const toYou = myTrades().some(t => tradeRole(t) === 'toyou');
-    S.ui.tx = Object.assign({ tab: toYou ? 'trades' : 'waivers', part: 'claims', tpart: 'offers', view: 'list', from: 'list', seenBefore: txSeenAt() }, o || {});
+    // The button opens where there is something for you: an offer waiting on you first, then a waiver run you have
+    // not looked at, on History where it is new (the user, 2026-10-31: "clicking the transaction button should open
+    // directly to the history, where the new stuff is"), else your claims. A caller that names a tab gets that tab.
+    const toYou = myTrades().some(t => tradeRole(t) === 'toyou'), runs = waiverRuns(), fresh = !o && !toYou && !!runs.length && runs[0].at > txSeenAt();
+    S.ui.tx = Object.assign({ tab: toYou ? 'trades' : 'waivers', part: fresh ? 'history' : 'claims', tpart: 'offers', view: 'list', from: 'list', seenBefore: txSeenAt() }, o || {});
     txLoad(); render();
 }
 function closeTx() { S.ui.tx = null; S.ui.composer = null; S.ui.trade = null; render(); }
@@ -8385,13 +8652,16 @@ function muStatLine(pid) {
     if (st.fum_lost) bits.push(`${st.fum_lost} fum lost`);
     return bits.length ? h('div', { class: 'statl' }, bits.join(' \u00b7 ')) : null;
 }
-// His face, ringed by his game's clock (the user, 2026-10-25): a full ring before kickoff (all sixty minutes to play),
-// an arc that empties as they run, none once it is final. Teal for the left team, blue for the right, as on the win chart.
+// His face, ringed by his game's clock (the user, 2026-10-25): an arc that empties as the game runs, none once it is
+// final. Teal for the left team, blue for the right, as on the win chart, and only while he is playing: before kickoff
+// the ring is a solid grey (the user, 2026-11-22). A full coloured ring used to mean "not started", and a game a
+// minute old is all but full, so at Q1 14:51 a player on the field read the same as one whose game was hours away.
 function clockFace(pid, right) {
     const left = Math.min(1, gameFracLeft(pid)), pre = left >= 1, live = left > 0 && left < 1, r = 21.5, c = 2 * Math.PI * r;
-    const ring = left > 0 ? sv('circle', { cx: 23, cy: 23, r, fill: 'none', class: `cfarc ${right ? 'op' : 'me'}`, 'stroke-dasharray': `${(c * left).toFixed(1)} ${c.toFixed(1)}`, transform: 'rotate(-90 23 23)' }) : null;
+    const ring = pre ? sv('circle', { cx: 23, cy: 23, r, fill: 'none', class: 'cfwait' })
+        : live ? sv('circle', { cx: 23, cy: 23, r, fill: 'none', class: `cfarc ${right ? 'op' : 'me'}`, 'stroke-dasharray': `${(c * left).toFixed(1)} ${c.toFixed(1)}`, transform: 'rotate(-90 23 23)' }) : null;
     return h('span', { class: 'cface', title: pre ? 'His game has not started' : live ? `About ${Math.max(1, Math.round(left * 60))} of 60 minutes left in his game` : 'His game is over' },
-        sv('svg', { viewBox: '0 0 46 46', 'aria-hidden': 'true' }, sv('circle', { cx: 23, cy: 23, r, fill: 'none', class: 'cftrack' }), ring),
+        sv('svg', { viewBox: '0 0 46 46', 'aria-hidden': 'true' }, pre ? null : sv('circle', { cx: 23, cy: 23, r, fill: 'none', class: 'cftrack' }), ring),
         h('img', { src: headshot(pid), alt: '', loading: 'lazy', onerror: hideBroken }));
 }
 function muPlayerCell(pid, right, m, slot) {
@@ -8406,13 +8676,20 @@ function muPlayerCell(pid, right, m, slot) {
         return h('td', { class: `${cls} emptyslot` }, h('div', { class: 'nm warn' }, '\u26a0 Empty slot'));
     }
     const pos = ppos(pid);
-    // Same token order on both sides — only the alignment mirrors. The bye is
-    // left out here: this is the week's matchup, so a bye eleven weeks off is
-    // noise, and a D/ST's name already says its team.
+    // Same token order on both sides — only the alignment mirrors. The name line
+    // holds the name, his tag and the news; his position and team get a line of
+    // their own under it, and his game the line under that (the user, 2026-11-23):
+    // sharing one line, the name was the only thing that could give, and at 1280
+    // one name in five lost its surname. The bye is left out here: this is the
+    // week's matchup, so a bye eleven weeks off is noise, and a D/ST's name
+    // already says its team. A name that still will not fit becomes "W. Robinson"
+    // (muFitNames), never "Wan'Dal…".
+    const pl = P(pid) || {};
     const nm = h('div', { class: 'nm', onclick: () => { S.ui.sel = pid; render(); } },
-        h('span', { class: 'mnm', title: pname(pid) }, pname(pid)), pos === 'DEF' ? null : h('span', { class: 'posl' }, pos), teamMeta(pid, true),
+        h('span', { class: 'mnm', title: pname(pid), 'data-short': pos !== 'DEF' && pl.first_name && pl.last_name ? `${pl.first_name[0]}. ${pl.last_name}` : null }, pname(pid)),
         S.fracDone ? null : injuryChip(pid, true), S.fracDone ? null : newsIcon(pid));
-    const text = h('div', { class: 'mutx' }, nm, S.fracDone ? muStatLine(pid) : gameSub(pid)), face = clockFace(pid, right);
+    const who = pos === 'DEF' ? null : h('div', { class: 'mupos' }, h('span', { class: 'posl' }, pos), teamMeta(pid, true));
+    const text = h('div', { class: 'mutx' }, nm, who, S.fracDone ? muStatLine(pid) : gameSub(pid)), face = clockFace(pid, right);
     return h('td', { class: `${cls}${willNotPlay(pid) ? ' np' : ''}` }, h('div', { class: `mucell${right ? ' r' : ''}` }, right ? [text, face] : [face, text]));
 }
 // One cell per side rather than two: what he has, large, and a projection small
@@ -8434,6 +8711,19 @@ function muPts(pid, m, right, live, slot) {
     if (left <= 0) return cell(fmtS(actual), `${fmtS(proj)} proj`);
     return cell(fmtS(actual), `${fmtS(actual + proj * left)} proj`);
 }
+// A name that will not fit its line shows as initial and surname, the way Sleeper shortens one (the user, 2026-11-23):
+// the surname is the part you know a player by, and the ellipsis used to cut it ("Wan'Dal…"). Measured, not guessed,
+// so a name that fits stays whole; measured again whenever the card changes width, since a wider card may fit it again.
+function muFitNames(tbl) {
+    for (const el of tbl.querySelectorAll('.mnm[data-short]')) {
+        if (el.textContent !== el.title) el.textContent = el.title;
+        if (el.scrollWidth > el.clientWidth + 0.5) el.textContent = el.dataset.short;
+    }
+}
+// The swap waits a frame, so it never changes the size of what is being observed inside the observer's own callback.
+const muNameFit = typeof ResizeObserver === 'function' ? new ResizeObserver((es) => requestAnimationFrame(() => {
+    for (const e of es) { if (!e.target.isConnected) muNameFit.unobserve(e.target); else muFitNames(e.target); }
+})) : null;
 function muMirror(A, a, B, b) {
     const slots = starterSlots();
     const anyLive = [...muStarters(A, a), ...muStarters(B, b)].some(pid => pid && pid !== '0' && muLocked(pid));
@@ -8469,6 +8759,7 @@ function muMirror(A, a, B, b) {
             muPlayerCell(pB, true, b)));
     }
     const view = muH2HView();
+    if (view === 'players' && muNameFit) muNameFit.observe(tbl);
     return h('div', { class: 'card mumir' }, h('div', { class: 'card-h' }, h('h3', null, 'Head to head'),
             h('span', { class: 'wlens' }, ...[['players', 'PLAYERS'], ['positions', 'POSITIONS']].map(([k, t]) => h('span', { class: view === k ? 'on' : '', onclick: () => setMuH2HView(k) }, t)))),
         h('div', { class: 'muscroll', 'data-keep': `mumir-${view}` }, view === 'positions' ? muPositions(A, a, B, b, anyLive) : tbl));
@@ -8821,34 +9112,120 @@ function chyron(g) {
 // ── a Wall cell ──────────────────────────────────────────────────────────────
 // Win % to the LEFT of the name, as a number (the favourite in teal). The 3px
 // bar it replaces could not tell 54/46 from a coin flip. Under each name, how
-// many are left to play and where that lands.
+// many are left to play, after the team's record and place in the standings
+// (the matchup card's "7–3 · 4th", from the same two helpers, so the two never
+// disagree). While the game is on, two number columns: the
+// projected final (PROJ) and the points so far (ACT). The projection is the
+// quieter of the two, smaller and grey, the team projected ahead one shade
+// lighter, so it never competes with the score. Before kickoff the score IS
+// the projection, and a final has none left, so the PROJ column is only there
+// while the game is on. The game's state leads the top line, top left.
 function sixCell(g, viewId) {
     const { A, B, m, o, st, mine } = g;
     const viewing = viewId != null && g.m.matchup_id === viewId;
     const fin = st.state === 'fin';
+    const pjCol = !!B && (st.state === 'live' || st.state === 'idle');
     // an empty starting slot is the one fact about a lineup worth a tile's line before kickoff
     const holeOf = (R, mm) => { const stt = muStarters(R, mm), i2 = stt.findIndex(pid => !pid || pid === '0'); return i2 >= 0 ? `${slotLabel(starterSlots()[i2])} slot empty` : null; };
-    const side = (R, mm, w, v, pj, lead, fav) => {
+    const ranks = rosterRank();
+    const standing = (R) => { const i = ranks.findIndex(r => r.roster_id === R.roster_id); return [h('span', { class: 's6rec' }, record(R)), i >= 0 ? ` · ${ordinal(i + 1)}` : '']; };
+    const side = (R, mm, w, v, pj, lead, fav, pjLead) => {
         const n = toPlay(R, mm);
-        const k = st.state === 'proj' ? nextKick(R, mm) : null;
-        // Final: the score is the fact — no odds, no "all played". Before kickoff the
-        // kickoff time lives once, in the chyron, not on both team lines.
+        // Final: the score is the fact — no odds, no "all played"; the record and place stay.
+        // Before kickoff the kickoff time lives once, in the chyron, not on both team lines.
         const hole = st.state === 'proj' ? holeOf(R, mm) : null;
-        const sub = fin ? null : (st.state !== 'proj' && n === 0) ? 'all played'
-            : st.state === 'proj' ? `${n} to play${hole ? ' \u00b7 ' + hole : ''}`
-                : [h('b', null, String(n)), ` to play · proj ${fmtS(pj)}`];
+        const sub = [standing(R), fin ? null : (st.state !== 'proj' && n === 0) ? ' · all played'
+            : st.state === 'proj' ? ` · ${n} to play${hole ? ' · ' + hole : ''}`
+                : [' · ', h('b', null, String(n)), ' to play']];
         return h('div', { class: 's6tr' },
             h('span', { class: `s6pct ${fav && !fin ? 's6f' : ''}`.trim(), title: fin ? null : 'Chance of winning' }, fin ? '' : `${w}%`),
             avatarEl(R, 'sm'),
-            h('span', { class: 's6nmw' }, h('span', { class: `s6nm ${lead ? '' : 'lo'}`.trim(), title: teamName(R) }, teamName(R)), sub ? h('span', { class: 's6sub' }, sub) : null),
-            h('span', { class: `s6sc mono ${lead ? '' : 'lo'}`.trim() }, fmtS(v)));
+            h('span', { class: 's6nmw' }, h('span', { class: `s6nm ${lead ? '' : 'lo'}`.trim(), title: teamName(R) }, teamName(R)), h('span', { class: 's6sub' }, sub)),
+            pjCol ? h('span', { class: `s6pj mono ${pjLead ? 'lead' : ''}`.trim(), title: `Projected final ${fmtS(pj)}: points so far plus what is still projected` }, fmt1(pj)) : null,
+            h('span', { class: `s6sc mono ${lead ? '' : 'lo'}`.trim(), title: pjCol ? 'Actual points so far' : null }, fmtS(v)));
     };
-    return h('div', { class: `s6cell ${mine ? 'me' : ''} ${viewing ? 'view' : ''}`.replace(/\s+/g, ' ').trim(), title: viewing ? 'On screen below' : 'Open this matchup', onclick: () => openGame(g) },
-        h('div', { class: 's6top' }, mine ? h('span', { class: 's6you' }, 'YOUR GAME') : viewing ? h('span', { class: 's6view' }, 'VIEWING') : null, h('span', { class: `s6tag ${st.state}` }, muTag(st))),
-        side(A, m, st.wX, st.vX, st.pX, st.vX >= st.vY, st.wX > 50),
-        B ? side(B, o, 100 - st.wX, st.vY, st.pY, st.vY > st.vX, st.wX < 50)
+    return h('div', { class: `s6cell ${mine ? 'me' : ''} ${viewing ? 'view' : ''} ${pjCol ? 'pjc' : ''}`.replace(/\s+/g, ' ').trim(), title: viewing ? 'On screen below' : 'Open this matchup', onclick: () => openGame(g) },
+        h('div', { class: 's6top' },
+            h('span', { class: 's6tl' }, h('span', { class: `s6tag ${st.state}` }, muTag(st)), mine ? h('span', { class: 's6you' }, 'YOUR GAME') : viewing ? h('span', { class: 's6view' }, 'VIEWING') : null),
+            pjCol ? h('span', { class: 's6ch', title: 'Projected final: points so far plus what is still projected' }, 'PROJ') : null,
+            pjCol ? h('span', { class: 's6ch', title: 'Actual points so far' }, 'ACT') : null),
+        side(A, m, st.wX, st.vX, st.pX, st.vX >= st.vY, st.wX > 50, st.pX >= st.pY),
+        B ? side(B, o, 100 - st.wX, st.vY, st.pY, st.vY > st.vX, st.wX < 50, st.pY > st.pX)
             : h('div', { class: 's6tr' }, h('span'), h('span'), h('span', { class: 's6nm lo' }, 'Bye')),
+        s6Strip(g),
         chyron(g));
+}
+// ── the game's chance over time, under the teams ─────────────────────────────
+// The same replay that finds the BIG PLAY (g.L, from ledgerFor) carries the
+// win-% history the matchup page's big chart draws, so this costs nothing new.
+// The whole week runs left to right, measured in its football as the big chart
+// does: the part still to play is left empty and the dot sits at now. Up means
+// the team listed first is more likely to win; their faces at the left edge
+// say which way is whose. In your game the line wears your teal and your
+// opponent's blue; elsewhere it stays grey, because teal means you. Words say
+// where it started and where it is, so the line is never the only signal.
+function s6Strip(g) {
+    const { A, B, m, o, st, L } = g;
+    if (!B) return null;
+    const ends = h('span', { class: 's6ends', title: `Up: ${teamName(A)} more likely to win. Down: ${teamName(B)}.` }, avatarEl(A, 'xs'), avatarEl(B, 'xs'));
+    const hist = L && L.hist && L.hist.length ? L.hist : null;
+    if (!hist) {
+        // Before the week's first snap there is nothing to trace and no strip at all. Once
+        // football is being played, the strip keeps its place while the plays load.
+        if (st.state === 'proj' || S.plays[S.week]) return null;
+        return h('div', { class: 's6wp' }, ends, h('div', { class: 's6plot' }, h('span', { class: 's6wait' }, 'Reading this week’s plays…')));
+    }
+    const fin = st.state === 'fin', W = 1000, H = 100;
+    const yOf = (v) => 4 + (1 - v) * (H - 8), mid = yOf(0.5);
+    const front = fin ? 1 : muTimeFrac(A, m, B, o);
+    const now = fin ? hist[hist.length - 1] : st.wX / 100;
+    const xh = L.xhist && L.xhist.length === hist.length ? L.xhist : null;
+    const pts = []; let last = 0;
+    hist.forEach((v, i) => { const x = Math.min(front, Math.max(last, xh ? xh[i] : (i / Math.max(1, hist.length - 1)) * front)); last = x; pts.push([x * W, yOf(v)]); });
+    pts.push([front * W, yOf(now)]);
+    const meTop = !!(g.mine && S.myRoster && A.roster_id === S.myRoster.roster_id);
+    const mk = (tag, attrs) => { const e = document.createElementNS(SVG_NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+    const svg = mk('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', 'aria-hidden': 'true' });
+    // ids are per game: six of these share a shadow root with the matchup chart's own gradients
+    const id = `s6g${g.m.matchup_id}`, defs = mk('defs', {});
+    const grad = (gid, stops) => { const e = mk('linearGradient', { id: gid, gradientUnits: 'userSpaceOnUse', x1: 0, y1: 0, x2: 0, y2: H }); stops.forEach(([off, c]) => e.appendChild(mk('stop', { offset: off, 'stop-color': c }))); defs.appendChild(e); };
+    const up = meTop ? '32,206,184' : '91,156,245', dn = meTop ? '91,156,245' : '32,206,184';
+    if (g.mine) {
+        grad(`${id}f`, [['0', `rgba(${up},0.42)`], ['0.5', `rgba(${up},0)`], ['0.5', `rgba(${dn},0)`], ['1', `rgba(${dn},0.42)`]]);
+        grad(`${id}s`, [['0', `rgb(${up})`], ['0.5', `rgb(${up})`], ['0.5', `rgb(${dn})`], ['1', `rgb(${dn})`]]);
+    } else grad(`${id}f`, [['0', 'rgba(163,174,193,0.3)'], ['0.5', 'rgba(163,174,193,0)'], ['1', 'rgba(163,174,193,0.3)']]);
+    svg.appendChild(defs);
+    svg.appendChild(mk('line', { x1: 0, x2: W, y1: mid, y2: mid, class: 's6wmid' }));
+    const d = pts.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+    svg.appendChild(mk('path', { d: `${d} L${(front * W).toFixed(1)},${mid} L0,${mid} Z`, fill: `url(#${id}f)` }));
+    svg.appendChild(mk('path', { d, class: 's6line', stroke: g.mine ? `url(#${id}s)` : '#a3aec1' }));
+    const dotCls = g.mine ? ((now >= 0.5) === meTop ? 'me' : 'op') : '';
+    const dot = h('i', { class: `s6dot ${dotCls}`.trim(), style: `left:${Math.max(0.6, Math.min(99.4, front * 100)).toFixed(1)}%;top:${yOf(now).toFixed(1)}%` });
+    // the words sit in the part of the week still to play; where that is too narrow for them,
+    // at the left, in whichever half the early line stays out of
+    const pc = (v) => `${Math.max(1, Math.min(99, Math.round(v * 100)))}%`;
+    const won = st.vX > st.vY ? 'won' : st.vX < st.vY ? 'lost' : 'tied';
+    const words = st.state === 'proj' ? [h('b', null, pc(now)), ' before kickoff']
+        : [`${pc(hist[0])} at kickoff `, h('span', { class: 's6ar' }, '→'), ' ', h('b', null, fin ? won : `${st.wX}%`), fin ? '' : ' now'];
+    const early = pts.filter(([x]) => x <= 0.45 * W), hi = early.reduce((t, [, y]) => t + y, 0) / Math.max(1, early.length) <= mid;
+    const aside = `left:6px;${hi ? 'bottom:4px' : 'top:4px'}`;
+    const ahead = !fin && front <= 0.62;
+    const face = teamAvatar(A);
+    const key = h('span', { class: 's6key', style: ahead ? `left:calc(${(front * 100).toFixed(1)}% + 8px);top:50%;transform:translateY(-50%)` : aside }, face ? h('img', { src: face, alt: '' }) : null, ...words);
+    const plot = h('div', { class: 's6plot', title: `${teamName(A)}’s chance to win, from the week’s first snap to ${fin ? 'the final whistle' : 'now'}` }, svg, dot, key);
+    // Cards run 330 to 520px wide, so whether the words fit after the dot, and which half of
+    // the left they keep clear of the line and the dot, is only known on screen: measure the
+    // words, and count the stretch of line under each corner.
+    requestAnimationFrame(() => {
+        const pw = plot.clientWidth, ph = plot.clientHeight;
+        if (!key.isConnected || !pw || !ph || (ahead && key.offsetLeft + key.offsetWidth <= pw - 4)) return;
+        const span = (12 + key.offsetWidth) / pw * W, band = (6 + key.offsetHeight) / ph * H;
+        // the dot (now) is never covered: under the words it outweighs any stretch of line
+        const under = pts.filter(([x]) => x <= span), dy = yOf(now), dotIn = front * W <= span + 12 / pw * W;
+        const top = under.filter(([, y]) => y < band).length + (dotIn && dy < band + 8 ? 1e4 : 0), bot = under.filter(([, y]) => y > H - band).length + (dotIn && dy > H - band - 8 ? 1e4 : 0);
+        key.style.cssText = `left:6px;${(top !== bot ? top < bot : !hi) ? 'top:4px' : 'bottom:4px'}`;
+    });
+    return h('div', { class: 's6wp' }, ends, plot);
 }
 // ── the four charts ──────────────────────────────────────────────────────────
 const s6Head = (title, sub) => h('div', { class: 'card-h' }, h('h3', null, title), h('span', { class: 'dim', style: 'font-size:12px' }, sub));
@@ -9871,6 +10248,7 @@ const yesNo = (b) => b ? 'yes' : 'no';
 const SHEET_LENSES = [
     ['record', 'Record', 'the schedule, added and removed'],
     ['scoring', 'Scoring', 'what the roster actually does'],
+    ['race', 'Points race', 'every team’s points for, week by week'],
     ['manager', 'Manager skill', 'decisions, priced'],
     ['luck', 'Luck', 'what you earned against what you got'],
     ['ahead', 'Playoffs', 'each team’s chances: seeds, the odds, and what this week is worth'],
@@ -9968,10 +10346,12 @@ function sheetInput(live) {
         positionOf[pid] = (pl && pl.fantasy_positions && pl.fantasy_positions.length) ? pl.fantasy_positions.join(',') : (ppos(pid) || null);
     }
     const odds = {};
-    // Each team's odds, once the season has been played out 3,000 times.
-    if (!Object.keys(odds).length && S.po && S.po.res && S.po.res.teams && S.po.res.n) {
-        const n = S.po.res.n;
-        for (const [rid, t] of S.po.res.teams) odds[rid] = { in: t.in_ / n, bye: t.bye / n, magic: t.magic,
+    // Each team's odds, once the season has been played out 3,000 times; as projected, the season played out
+    // from the week after this one, this one decided at its projected finals (never the forecast: it still plays it).
+    const sim = live ? S.poProj : S.po;
+    if (!Object.keys(odds).length && sim && sim.res && sim.res.teams && sim.res.n) {
+        const n = sim.res.n;
+        for (const [rid, t] of sim.res.teams) odds[rid] = { in: t.in_ / n, bye: t.bye / n, magic: t.magic,
             seed: Object.fromEntries(Object.entries(t.seed || {}).map(([k, v]) => [String(k), v / n])),
             leverage: t.winN > n * 0.02 && t.loseN > n * 0.02 ? { win: t.winIn / t.winN, lose: t.loseIn / t.loseN } : null };
     }
@@ -9989,7 +10369,7 @@ function seasonSheet(live) {
     const inp = sheetInput(live); if (!inp) return null;
     // as it stands, every new point is a new sheet
     const liveKey = live ? (S.matchups[S.curWeek] || []).map((m) => `${m.roster_id}=${countedPoints(m)}`).join(',') : '';
-    const key = `${Object.keys(inp.weeks).length}:${inp.futureGames.length}:${S.curWeek}:${liveKey}:${Object.keys(inp.odds || {}).length}:${(S.po && S.po.res && S.po.key) || ''}`;
+    const key = `${Object.keys(inp.weeks).length}:${inp.futureGames.length}:${S.curWeek}:${liveKey}:${Object.keys(inp.odds || {}).length}:${(S.po && S.po.res && S.po.key) || ''}:${(live && S.poProj && S.poProj.res && S.poProj.key) || ''}`;
     if (S.sheet && S.sheet.key === key) return S.sheet.val;
     let val = null;
     try { val = FBCalc.computeSeasonSheet(inp); }
@@ -10101,14 +10481,13 @@ function lgStandingsTab() {
     const wkOpp = (rid) => { const m = wk[rid]; if (!m || m.matchup_id == null) return null; return Object.values(wk).find((x) => x.matchup_id === m.matchup_id && x.roster_id !== rid) || null; };
     const wkPts = (rid) => { const m = wk[rid]; return m ? countedPoints(m) : null; };
     const wkRes = (rid) => { const m = wk[rid], o = wkOpp(rid); if (!m || !o) return null; const a = countedPoints(m), b = countedPoints(o); return a > b ? 'W' : a < b ? 'L' : 'T'; };
-    const verdict = {};
-    for (const v of SH.verdicts) verdict[v.rosterId] = v;
     const nDiv = (S.league.settings || {}).divisions || 0, byDiv = sheetGroup() === 'division';
 
     let lens = S.ui.sheetLens || 'record';
     const blocked = (k) => (k === 'luck' && SH.thin.luck) || (k === 'manager' && SH.thin.manager) || (k === 'scoring' && SH.thin.shape);
     if (blocked(lens)) lens = 'record';
-    if (lens === 'ahead') poRun();   // the Playoffs view needs the odds; nothing else on this tab asks for them
+    if (lens === 'ahead' && live) poProjRun();   // as projected, its own season, played from the week after
+    else if (lens === 'ahead') poRun();   // the Playoffs view needs the odds; nothing else on this tab asks for them
     // Who each team has had to beat: every week the league's scores are ranked, 1 for the
     // week's top scorer, and a team's number is the average rank of the opponents it met.
     const oppRank = {}, nTeams = S.rosters.length;
@@ -10127,6 +10506,24 @@ function lgStandingsTab() {
     const m = (txt, cls) => h('span', { class: `mono ${cls || ''}` }, txt);
     const pc = (x, d) => `${(x * 100).toFixed(d == null ? 0 : d)}%`;
     const sg = (x, d) => { const t = x.toFixed(d == null ? 1 : d); return Number(t) === 0 ? t.replace('-', '') : `${x > 0 ? '+' : ''}${t}`; };   // a value that rounds to zero is 0, not "-0"
+    // The controls sit the way the Players tab's do: labelled groups in one row. Lens is how the
+    // table is arranged (overall, or by division); View is which columns it shows. The points race
+    // is a chart, not a table, so it has no Lens.
+    const grp = (label, ...kids) => h('div', { class: 'fgroup' }, h('span', { class: 'flab' }, label), ...kids);
+    const viewRow = () => h('div', { class: 'filters fbrow lgview' },
+        nDiv >= 2 && lens !== 'race' ? grp('Lens', h('div', { class: 'tabs' }, ...[['overall', 'Overall', 'Every team in one table, the playoff seats first'], ['division', 'By division', 'The same teams under their divisions']].map(([k, label, tip]) =>
+            h('span', { class: (byDiv ? 'division' : 'overall') === k ? 'on' : '', title: tip, onclick: () => setSheetGroup(k) }, label)))) : null,
+        grp('View', h('div', { class: 'tabs' }, ...SHEET_LENSES.map(([k, label, note]) => h('span', {
+            class: `${k === lens ? 'on' : ''} ${blocked(k) ? 'off' : ''}`,
+            style: k === lens ? 'background:var(--blue);border-color:var(--blue);color:#fff' : '',
+            title: blocked(k) ? 'Needs four settled weeks — three is noise, not a season' : note,
+            onclick: () => { if (blocked(k)) return; S.ui.sheetLens = k; render(); },
+        }, label)))),
+        liveSwitch('sheetlive'),
+        h('span', { class: 'dim', style: 'font-size:11.5px;margin-left:auto' }, (SHEET_LENSES.find(x => x[0] === lens) || [])[2] || ''));
+    if (lens === 'race') return h('div', null, viewRow(), raceView(live));
+    const clinch = lens === 'ahead' ? clinchNumbers(live ? poProjPoints() : null) : null;   // the strict magic numbers, for the Playoffs view; as projected, from the week after
+    const marks = raceMarks(live);   // and their letters beside the seed, on every view
     const LENS = {
         record: {
             head: [['PF'], ['PA'], ['All-play', 'Your record against every team every week — the schedule removed'], ['Luck', 'Wins minus what all-play expected of you'], ['Sched pts', 'Points faced against the league average'], ['1-score', 'Record in games decided by under 10'], ['Highs', 'Weeks you were the league top scorer']],
@@ -10164,12 +10561,13 @@ function lgStandingsTab() {
                 t.unluckiest ? h('span', { class: 'dim', style: 'font-size:11.5px' }, `wk${t.unluckiest.week} · ${fmt1(t.unluckiest.points)} vs ${fmt1(t.unluckiest.oppPoints)}`) : h('span', { class: 'dim' }, '—')]; },
         },
         ahead: {
-            head: [[`Seed 1–${seats} · miss`, 'The whole distribution, not the one number we usually draw out of it'], ['Playoff %'], ['Bye %'], ['If W → if L', 'Your playoff odds if you win this week, against if you lose'], ['Leverage', 'How much this Sunday is worth'], ['SOS left', 'Mean all-play % of the opponents you have left']],
+            head: [[`Seed 1–${seats} · miss`, 'The whole distribution, not the one number we usually draw out of it'], ['Playoff %'], ['Bye %'], ['Magic #', 'Wins of its own that put a team in, whatever else happens: every tie broken against it, and a seat decided by points never counted on. Point at a number for more.'], ['If W → if L', `Your playoff odds if you win ${live ? `week ${S.curWeek + 1}` : 'this week'}, against if you lose`], ['Leverage', `How much ${live ? `week ${S.curWeek + 1}` : 'this Sunday'} is worth`], ['SOS left', 'Mean all-play % of the opponents you have left']],
             row: t => {
                 const o = t.odds, lev = o && o.leverage;
                 return [elSeedbar(t, seats),
                     m(o ? pc(o.in) : '—', o && o.in >= 0.6 ? 'teal' : o && o.in < 0.2 ? 'dim' : ''),
                     m(o && o.bye ? pc(o.bye) : '—', o && o.bye >= 0.3 ? 'teal' : 'dim'),
+                    magicCell(clinch && clinch.get(t.rosterId), o && o.magic, teamName(rosterById(t.rosterId)), t.rosterId, live),
                     m(lev ? `${Math.round(lev.win * 100)} → ${Math.round(lev.lose * 100)}` : '—', 'dim'),
                     m(lev ? `${Math.round((lev.win - lev.lose) * 100)}pp` : '—', lev && (lev.win - lev.lose) >= 0.4 ? 'amber' : 'dim'),
                     m(t.sosRemaining == null ? '—' : pc(t.sosRemaining), t.sosRemaining >= 0.54 ? 'amber' : t.sosRemaining <= 0.48 ? 'green' : 'dim')];
@@ -10183,20 +10581,21 @@ function lgStandingsTab() {
         ...(() => {
             const place = {}; rows.forEach((t, i) => { place[t.rosterId] = i + 1; });
             const rowEl = (t, cut) => {
-                const R = rosterById(t.rosterId), sd = seeds && seeds[t.rosterId], v = verdict[t.rosterId], at = sd ? sd.n : place[t.rosterId];
+                const R = rosterById(t.rosterId), sd = seeds && seeds[t.rosterId], at = sd ? sd.n : place[t.rosterId];
                 const mine = S.myRoster && t.rosterId === S.myRoster.roster_id, was = settledAt[t.rosterId];
                 return h('tr', { class: `${mine ? 'me' : ''} ${cut ? 'cut' : ''}`, style: 'cursor:pointer', title: `Open ${teamName(R)}`, onclick: () => goTeam(t.rosterId) },
                     h('td', { class: 'l' }, h('div', { class: 'shteam' },
                         h('span', { class: `shseed ${sd && sd.bye ? 'bye' : place[t.rosterId] <= seats ? 'in' : ''}` }, at),
+                        raceMarkEl(marks, t.rosterId),
                         // as it stands, every row keeps the mover's slot, filled or not, so the names line up
                         !live ? null : was && was !== at
                             ? h('span', { class: `lvmv ${was > at ? 'up' : 'dn'}`, title: `${ordinal(was)} on settled weeks` }, `${was > at ? '▲' : '▼'}${Math.abs(was - at)}`)
                             : h('span', { class: 'lvmv', 'aria-hidden': 'true' }),
                         avatarEl(R, 'sm'),
-                        h('span', { class: `shnm ${mine ? 'teal' : ''}` }, teamName(R)),
-                        // the tag carries its own reason now that the three cards above the table are gone
-                        v ? h('span', { class: `vchip v-${v.key}`, title: verdictWhy(v, t) }, v.label) : null)),
-                    h('td', { class: 'c mono' }, `${t.wins}–${t.losses}${t.ties ? '–' + t.ties : ''}`, live && wkRes(t.rosterId) ? h('span', { class: 'lvres', title: `Week ${S.curWeek} ${liveWord()}: ${fmtS(wkPts(t.rosterId))}–${fmtS(wkOpp(t.rosterId) ? countedPoints(wkOpp(t.rosterId)) : null)}` }, h('i'), wkRes(t.rosterId)) : null),
+                        // no tag after the name (the user, 2026-11-09: "i dont like the badges after the names"):
+                        // the Luck and Manager lenses carry the numbers those tags summed up
+                        h('span', { class: `shnm ${mine ? 'teal' : ''}` }, teamName(R)))),
+                    h('td', { class: 'c mono' }, `${t.wins}–${t.losses}${t.ties ? '–' + t.ties : ''}`, live && wkRes(t.rosterId) ? h('span', { class: `lvres res-${wkRes(t.rosterId).toLowerCase()}`, title: `Week ${S.curWeek} ${liveWord()}: ${fmtS(wkPts(t.rosterId))}–${fmtS(wkOpp(t.rosterId) ? countedPoints(wkOpp(t.rosterId)) : null)}` }, h('i'), wkRes(t.rosterId)) : null),
                     ...L.row(t).map(c => h('td', null, c)));
             };
             if (!byDiv) return rows.map((t, i) => rowEl(t, i === seats - 1));
@@ -10210,50 +10609,181 @@ function lgStandingsTab() {
             return out;
         })());
 
-    // The controls sit the way the Players tab's do: labelled groups in one row. Lens is how the
-    // table is arranged (overall, or by division); View is which columns it shows.
-    const grp = (label, ...kids) => h('div', { class: 'fgroup' }, h('span', { class: 'flab' }, label), ...kids);
     return h('div', null,
-        h('div', { class: 'filters fbrow lgview' },
-            nDiv >= 2 ? grp('Lens', h('div', { class: 'tabs' }, ...[['overall', 'Overall', 'Every team in one table, the playoff seats first'], ['division', 'By division', 'The same teams under their divisions']].map(([k, label, tip]) =>
-                h('span', { class: (byDiv ? 'division' : 'overall') === k ? 'on' : '', title: tip, onclick: () => setSheetGroup(k) }, label)))) : null,
-            grp('View', h('div', { class: 'tabs' }, ...SHEET_LENSES.map(([k, label, note]) => h('span', {
-                class: `${k === lens ? 'on' : ''} ${blocked(k) ? 'off' : ''}`,
-                style: k === lens ? 'background:var(--blue);border-color:var(--blue);color:#fff' : '',
-                title: blocked(k) ? 'Needs four settled weeks — three is noise, not a season' : note,
-                onclick: () => { if (blocked(k)) return; S.ui.sheetLens = k; render(); },
-            }, label)))),
-            liveSwitch('sheetlive'),
-            h('span', { class: 'dim', style: 'font-size:11.5px;margin-left:auto' }, (SHEET_LENSES.find(x => x[0] === lens) || [])[2] || '')),
+        viewRow(),
         h('div', { class: 'scroll-x', style: 'margin-top:10px' }, tbl),
         live ? sheetLiveCap(seeds, settledAt, seats) : null,
         h('div', { class: 'cap', style: 'margin-top:8px' },
             `Weeks 1–${SH.weeks[SH.weeks.length - 1]}${live ? `, week ${S.curWeek} ${liveWord()}` : ''} · ${byDiv ? `a teal number is one of the ${seats} playoff seats` : 'the dashed line is the playoff cut'} · click a team to open it.`,
+            marks ? h('span', { class: 'shkey' }, ' ', raceKey(marks), '.') : null,
             SH.thin.luck ? ' Luck and Manager need four settled weeks.' : '',
             seeds && seedingNote() ? ` ${seedingNote()}` : '',
             lens === 'ahead' && !Object.keys((sheetInput() || {}).odds || {}).length ? ' The odds are still being worked out; this view fills in when they land.' : ''));
 }
-// The chip states the verdict; this states the evidence, in the same words the
-// lens uses. Every clause is a number off the row — never an opinion.
-function verdictWhy(v, t) {
-    if (!t) return '';
-    switch (v.key) {
-        case 'paperChampion': return `Best all-play in the league at ${Math.round(t.allPlayW)}–${Math.round(t.allPlayL)}, and not top of the table.`;
-        case 'highwire': return `${t.wins}–${t.losses} on a ${Math.round(t.allPlayW)}–${Math.round(t.allPlayL)} all-play — ${sgnw(t.luck)} wins of schedule.`;
-        case 'robbed': return t.oneScoreL >= 3 && !t.oneScoreW ? `${t.oneScoreW}–${t.oneScoreL} in one-score games.${t.unluckiest ? ` Week ${t.unluckiest.week}: ${fmt1(t.unluckiest.points)}, lost by ${fmt1(t.unluckiest.oppPoints - t.unluckiest.points)}.` : ''}` : `${sgnw(t.luck)} wins against an average schedule.`;
-        case 'boomBust': return `σ of ${fmt1(t.sd)} — floor ${fmt1(t.floor)}, ceiling ${fmt1(t.ceiling)}${t.weeklyHighs ? `, ${t.weeklyHighs} weekly high${t.weeklyHighs === 1 ? '' : 's'}` : ''}.`;
-        case 'metronome': return `σ of ${fmt1(t.sd)} — never above ${fmt1(Math.max(...t.scores))}, never below ${fmt1(Math.min(...t.scores))}.`;
-        case 'selfInflicted': return `${t.selfInflicted} losses their own bench would have won. Efficiency ${(t.efficiency * 100).toFixed(1)}%, ${fmt1(t.benchLost)} points left behind.`;
-        case 'gauntlet': return `Faced ${sgnw(t.schedulePoints, 0)} points against the average schedule — the most in the league.`;
-        case 'freeRide': return `${t.wins}–${t.losses} off a ${Math.round(t.allPlayW)}–${Math.round(t.allPlayL)} all-play, and ${fmt1(Math.abs(t.schedulePoints))} fewer points faced than average.`;
-        case 'triggerHappy': return `${t.adds} adds and ${t.failedBids} losing bids — outbid more often than anyone.`;
-        case 'oneAndDone': return `${t.adds} adds all season${t.avgBid != null ? ` at $${t.avgBid.toFixed(2)} a bid` : ''}, and an all-play of ${(t.allPlayPct * 100).toFixed(0)}%.`;
-        case 'perfectPointless': return `${t.perfectWeeks} perfect lineups, and a ${t.wins}–${t.losses} record. Managed the roster it had.`;
-        case 'theCeiling': return `${fmt1(t.ceiling)} at the 85th percentile — the highest ceiling in the league.`;
-        default: return '';
-    }
+
+// ── the points race ──────────────────────────────────────────────────────────
+// Every team's points for, week by week, three ways (the user, 2026-11-22): how
+// far behind first, with the lead over second shaded under the top line, so a
+// fading leader is a band you watch thin; the place in points; and against the
+// league's average, where a leader fading is a line going flat. Your team is
+// teal, one other is in focus in white (point at its line or its name), the rest
+// grey. Through the week in progress it follows the standings' "as projected"
+// switch. Through the end of the regular season, the week in progress counts as
+// projected and every later week is each team's best lineup by Sleeper's
+// projections (projWeekTotal, the playoff odds' own numbers), each game going to
+// the side projected higher, so the seats there are projected too.
+const RACE_SHOW = [['gap', 'Behind first', 'How far each team is behind the most points that week'], ['rank', 'Place', 'Where each team stood in points after each week'], ['avg', 'Vs average', 'Points for minus the average team’s, after each week']];
+function raceEnsure() {
+    // the rest of the season's matchups and projections, loaded as the playoff odds load them: one
+    // request at a time, and while they are still arriving a retry from a timer, never a render loop
+    if (S.raceReady === S.curWeek || S.raceBusy) return;
+    S.raceBusy = true;
+    poEnsureData().then((games) => {
+        S.raceBusy = false;
+        if (games) { S.raceReady = S.curWeek; render(); } else if (!S.raceRetry) S.raceRetry = setTimeout(() => { S.raceRetry = null; render(); }, 1500);
+    }).catch((e) => { S.raceBusy = false; console.warn(TAG, 'points race:', e.message); });
 }
-const sgnw = (x, d) => `${x > 0 ? '+' : ''}${x.toFixed(d == null ? 1 : d)}`;
+function raceView(live) {
+    const end = regSeasonEnd(), cur = S.curWeek, open = S.seasonType === 'regular' && cur <= end, lastFinal = Math.min(cur - 1, end);
+    if (lastFinal < 1) return h('div', { class: 'empty' }, 'The race starts once a week is final.');
+    const canEnd = open && cur < end, thru = canEnd && S.ui.raceThru === 'end' ? 'end' : 'now';
+    if (thru === 'end') raceEnsure();
+    const ready = thru !== 'end' || S.raceReady === cur;
+    const N = thru === 'end' && ready ? end : open && live ? cur : lastFinal;
+    const seeds = currentSeeds(open && (live || thru === 'end'), thru === 'end' && ready ? end : null);
+    const mOf = (rid, w) => (S.matchups[w] || []).find((m) => m.roster_id === rid);
+    const ptsAt = (R, w) => w <= lastFinal ? ((mOf(R.roster_id, w) || {}).points || 0) : w === cur ? (mOf(R.roster_id, w) ? countedPoints(mOf(R.roster_id, w)) : 0) : projWeekTotal(R, w);
+    const all = S.rosters.map((R) => { const c = []; let t = 0; for (let w = 1; w <= N; w++) { t += ptsAt(R, w); c.push(t); } return { R, rid: R.roster_id, c }; });
+    let raceOn = false, racers = all;
+
+    const shown = raceOn ? racers : all, n = shown.length, me = S.myRoster ? S.myRoster.roster_id : null;
+    const kind = RACE_SHOW.some((x) => x[0] === S.ui.raceShow) ? S.ui.raceShow : 'gap';
+    const top = [], sec = [], avg = [], rk = [];
+    for (let w = 0; w < N; w++) {
+        const o = shown.slice().sort((a, b) => b.c[w] - a.c[w]);
+        top.push(o[0].c[w]); sec.push((o[1] || o[0]).c[w]); rk.push(new Map(o.map((x, i) => [x.rid, i + 1])));
+        avg.push(all.reduce((t, x) => t + x.c[w], 0) / all.length);
+    }
+    const val = (x, w) => kind === 'gap' ? x.c[w] - top[w] : kind === 'rank' ? rk[w].get(x.rid) : x.c[w] - avg[w];
+    const sgn = (v) => `${v > 0.05 ? '+' : v < -0.05 ? '−' : ''}${fmt1(Math.abs(v))}`;
+    const shownVal = (x, w) => kind === 'rank' ? ordinal(rk[w].get(x.rid)) : kind === 'gap' ? (rk[w].get(x.rid) === 1 ? 'leads' : sgn(val(x, w))) : sgn(val(x, w));
+    // the frame: one scale for every line, so a gap reads as a distance
+    const W = 760, H = 330, L = 50, RM = 156, T = 14, B = 28, pw = W - L - RM, ph = H - T - B;
+    let lo, hi, ticks;
+    if (kind === 'rank') { lo = n; hi = 1; ticks = n <= 8 ? Array.from({ length: n }, (_, i) => i + 1) : [...new Set([1, Math.round(n / 4), Math.round(n / 2), Math.round(3 * n / 4), n])]; }
+    else {
+        const vs = shown.flatMap((x) => x.c.map((_, w) => val(x, w))), mn = Math.min(...vs), mx = kind === 'gap' ? 0 : Math.max(...vs);
+        const step = [10, 20, 25, 50, 100, 200, 250, 500].find((s) => (mx - mn) / s <= 7) || 1000;
+        lo = Math.floor(mn / step) * step; hi = kind === 'gap' ? 0 : Math.ceil(mx / step) * step; if (hi === lo) hi = lo + step;
+        ticks = []; for (let v = lo; v <= hi + 1e-9; v += step) ticks.push(v);
+    }
+    const x = (w) => L + (N === 1 ? pw / 2 : (w / (N - 1)) * pw), y = (v) => T + ((hi - v) / ((hi - lo) || 1)) * ph;
+    const txt = (attrs, s) => sv('text', attrs, document.createTextNode(s));
+    const svg = sv('svg', { viewBox: `0 0 ${W} ${H}`, class: 'rcsvg', role: 'img', 'aria-label': 'Points for, week by week' });
+    const projFrom = lastFinal - 1;   // the last final week's index: the dashes start there
+    if (N > lastFinal) {
+        svg.appendChild(sv('rect', { class: 'rcproj', x: x(projFrom).toFixed(1), y: T, width: (x(N - 1) - x(projFrom)).toFixed(1), height: ph }));
+        svg.appendChild(txt({ class: 'rcprojl', x: ((x(projFrom) + x(N - 1)) / 2).toFixed(1), y: T + ph - 6, 'text-anchor': 'middle' }, N - lastFinal > 1 ? 'PROJECTED' : 'PROJ'));
+    }
+    for (const v of ticks) {
+        svg.appendChild(sv('line', { class: kind !== 'rank' && v === 0 ? 'rczero' : 'rcgrid', x1: L, x2: L + pw, y1: y(v).toFixed(1), y2: y(v).toFixed(1) }));
+        svg.appendChild(txt({ class: 'rcax', x: L - 8, y: (y(v) + 4).toFixed(1), 'text-anchor': 'end' }, kind === 'rank' ? ordinal(v) : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v)}`));
+    }
+    for (let w = 0; w < N; w++) if (N <= 18 || w % 2 === 0 || w === N - 1) svg.appendChild(txt({ class: 'rcax', x: x(w).toFixed(1), y: H - 8, 'text-anchor': 'middle' }, String(w + 1)));
+    svg.appendChild(txt({ class: 'rcax', x: L - 8, y: H - 8, 'text-anchor': 'end' }, 'Wk'));
+    if (kind === 'gap' && n > 1) {   // the lead over second, as a band under the top line; labelled where it was widest, clear of the end labels
+        const pts = []; for (let w = 0; w < N; w++) pts.push(`${x(w).toFixed(1)},${y(0).toFixed(1)}`);
+        for (let w = N - 1; w >= 0; w--) pts.push(`${x(w).toFixed(1)},${y(sec[w] - top[w]).toFixed(1)}`);
+        svg.appendChild(sv('polygon', { class: 'rcband', points: pts.join(' ') }));
+        const cand = []; for (let w = 0; w < N - 2; w++) cand.push([top[w] - sec[w], w]);
+        const big = cand.sort((a, b) => b[0] - a[0])[0];
+        if (big && y(sec[big[1]] - top[big[1]]) - y(0) >= 26) {
+            const cy = (y(0) + y(sec[big[1]] - top[big[1]])) / 2;
+            svg.appendChild(txt({ class: 'rcbandv', x: x(big[1]).toFixed(1), y: (cy + 1).toFixed(1), 'text-anchor': 'middle' }, fmt1(big[0])));
+            svg.appendChild(txt({ class: 'rcbandk', x: x(big[1]).toFixed(1), y: (cy + 13).toFixed(1), 'text-anchor': 'middle' }, 'lead over 2nd'));
+        }
+    }
+    const gLines = sv('g', {}), gLabs = sv('g', {}), guide = sv('line', { class: 'rcguide', x1: 0, x2: 0, y1: T, y2: T + ph, visibility: 'hidden' });
+    svg.appendChild(gLines); svg.appendChild(gLabs); svg.appendChild(guide);
+    const path = (xx, a, b) => { let d = ''; for (let w = a; w <= b; w++) d += `${w === a ? 'M' : 'L'}${x(w).toFixed(1)},${y(val(xx, w)).toFixed(1)}`; return d; };
+    const solidTo = N > lastFinal ? projFrom : N - 1;
+    const byRid = new Map(shown.map((s2) => [s2.rid, s2]));
+    // in focus: the one you last pointed at, else the points seat's holder in its race, else the top team that is not you
+    const order0 = shown.slice().sort((a, b) => b.c[N - 1] - a.c[N - 1]);
+    let focus = byRid.get(S.ui.raceFocus) && S.ui.raceFocus !== me ? byRid.get(S.ui.raceFocus)
+        : (raceOn && order0.find((s2) => seeds[s2.rid] && seeds[s2.rid].how === 'pts')) || order0.find((s2) => s2.rid !== me) || null;
+    const legend = h('div', { class: 'rcleg' });
+    const draw = () => {
+        gLines.replaceChildren(); gLabs.replaceChildren();
+        const ord = shown.slice().sort((a, b) => ((a === focus || a.rid === me) - (b === focus || b.rid === me)));
+        for (const s2 of ord) {
+            const c = s2.rid === me ? ' me' : s2 === focus ? ' fo' : '';
+            gLines.appendChild(sv('path', { class: `rcln${c}`, d: path(s2, 0, solidTo) }));
+            if (N > lastFinal) gLines.appendChild(sv('path', { class: `rcln fut${c}`, d: path(s2, projFrom, N - 1) }));
+            const hit = sv('path', { class: 'rchit', d: path(s2, 0, N - 1) }); hit.addEventListener('mouseenter', () => setFocus(s2)); gLines.appendChild(hit);
+        }
+        // a name and its number at the line's end for the two lines in colour, nudged apart when they would touch
+        const em = [shown.find((s2) => s2.rid === me), focus].filter((s2, i, a) => s2 && a.indexOf(s2) === i).map((s2) => ({ s2, yy: y(val(s2, N - 1)) })).sort((a, b) => a.yy - b.yy);
+        if (em.length === 2 && em[1].yy - em[0].yy < 26) { const m2 = (em[0].yy + em[1].yy) / 2; em[0].ly = m2 - 13; em[1].ly = m2 + 13; }
+        for (const e of em) {
+            const c = e.s2.rid === me ? 'me' : 'fo', nm = teamName(e.s2.R), short = nm.length > 17 ? nm.slice(0, 16) + '…' : nm;
+            gLabs.appendChild(sv('circle', { class: `rcdot ${c}`, cx: x(N - 1).toFixed(1), cy: e.yy.toFixed(1), r: 4 }));
+            const t = txt({ class: `rclab ${c}`, x: (x(N - 1) + 10).toFixed(1), y: ((e.ly ?? e.yy) + 4).toFixed(1) }, `${short} `);
+            t.appendChild(sv('tspan', { class: 'v' }, document.createTextNode(shownVal(e.s2, N - 1)))); gLabs.appendChild(t);
+        }
+        for (const r of legend.querySelectorAll('.rcrw')) r.classList.toggle('fo', focus && Number(r.dataset.rid) === focus.rid);
+    };
+    const setFocus = (s2) => { if (!s2 || s2.rid === me || s2 === focus) return; focus = s2; S.ui.raceFocus = s2.rid; draw(); };
+    // the list: every team on the chart, most points first, with its seat where it has one
+    const seatTag = (rid) => { const sd = seeds && seeds[rid]; if (!sd) return null;
+        const when = thru === 'end' && ready ? ' at the season’s end, as projected' : live && open ? ` ${liveWord()}` : ' today';
+        return sd.how === 'pts' ? h('span', { class: 'rcseat pts', title: `Holds the points seat${when}` }, 'PTS SEAT') : h('span', { class: 'rcseat', title: `${sd.how === 'div' ? 'Division winner' : 'Wild card'}${when}` }, sd.how === 'div' ? 'DIV' : 'WC'); };
+    legend.append(h('div', { class: 'rclh' }, h('span', null, '#'), h('span'), h('span', null, 'TEAM'), h('span', null, kind === 'rank' ? 'PF' : kind === 'gap' ? 'BEHIND' : 'VS AVG')),
+        ...order0.map((s2, i) => { const mine = s2.rid === me;
+            const row = h('div', { class: `rcrw${mine ? ' me' : ''}`, 'data-rid': String(s2.rid), tabindex: '0', title: `${teamName(s2.R)} · ${fmt1(s2.c[N - 1])} points for` },
+                h('span', { class: 'rk' }, String(i + 1)), avatarEl(s2.R, 'xs'), h('span', { class: 'nmw' }, h('span', { class: 'nm' }, teamName(s2.R)), seatTag(s2.rid)),
+                h('span', { class: 'v' }, kind === 'rank' ? fmt1(s2.c[N - 1]) : kind === 'gap' ? (rk[N - 1].get(s2.rid) === 1 ? '—' : sgn(val(s2, N - 1))) : sgn(val(s2, N - 1))));
+            row.addEventListener('mouseenter', () => setFocus(s2)); row.addEventListener('focus', () => setFocus(s2));
+            return row; }));
+    // the week under the pointer: a guide, and where the leaders, you and the team in focus stood
+    const plot = h('div', { class: 'rcplot' }, svg), tip = h('div', { class: 'rctip' }); tip.hidden = true; plot.append(tip);
+    svg.addEventListener('mousemove', (e) => {
+        const r = svg.getBoundingClientRect(); if (!r.width) return;
+        const px = (e.clientX - r.left) * (W / r.width), w = Math.max(0, Math.min(N - 1, Math.round(N === 1 ? 0 : ((px - L) / pw) * (N - 1))));
+        guide.setAttribute('x1', x(w).toFixed(1)); guide.setAttribute('x2', x(w).toFixed(1)); guide.setAttribute('visibility', 'visible');
+        const o = shown.slice().sort((a, b) => b.c[w] - a.c[w]), pick = [...o.slice(0, 3), shown.find((s2) => s2.rid === me), focus].filter((s2, i, a) => s2 && a.indexOf(s2) === i);
+        tip.replaceChildren(h('div', { class: 'h' }, `WEEK ${w + 1}${w + 1 > lastFinal ? (w + 1 === cur ? ` · ${liveWord().toUpperCase()}` : ' · PROJECTED') : ''}`),
+            ...pick.map((s2) => h('div', { class: `r${s2.rid === me ? ' me' : s2 === focus ? ' fo' : ''}` }, h('span', { class: 'p' }, ordinal(o.indexOf(s2) + 1)), h('span', { class: 'n' }, teamName(s2.R)), h('span', { class: 'v' }, shownVal(s2, w)))));
+        tip.hidden = false;
+        const pr = plot.getBoundingClientRect(), lx = e.clientX - pr.left, ly = e.clientY - pr.top;
+        tip.style.left = `${Math.max(0, Math.min(lx + 14, pr.width - tip.offsetWidth - 4))}px`; tip.style.top = `${Math.max(0, ly - tip.offsetHeight - 10)}px`;
+    });
+    svg.addEventListener('mouseleave', () => { tip.hidden = true; guide.setAttribute('visibility', 'hidden'); });
+    draw();
+    const titles = {
+        gap: ['Points behind first, week by week', 'the top line is whoever led in points that week; the band under it is the lead over second'],
+        rank: ['Place in points, week by week', 'points for, ranked after each week'],
+        avg: ['Points above the league average', 'points for minus the average team’s, after each week'],
+    };
+    const [tt, ts] = titles[kind];
+    const pills = (cur2, list, set) => h('div', { class: 'tabs' }, ...list.map(([k, label, tip2]) => h('span', { class: cur2 === k ? 'on' : '', title: tip2, onclick: () => { set(k); render(); } }, label)));
+    const grp = (label, ...kids) => h('div', { class: 'fgroup' }, h('span', { class: 'flab' }, label), ...kids);
+    const nowWeek = open && live ? cur : lastFinal;
+    const controls = h('div', { class: 'filters fbrow rcrow' },
+        grp('Show', pills(kind, RACE_SHOW, (k) => { S.ui.raceShow = k; })),
+        null,
+        canEnd ? grp('Through', pills(thru, [['now', `Week ${nowWeek}`, open && live ? `Through this week, ${liveWord()}` : 'Through the last final week'], ['end', `Week ${end} · season end`, 'The rest of the regular season, by Sleeper’s projections']], (k) => { S.ui.raceThru = k; })) : null);
+    let out = null;
+
+    const foot = [`Weeks 1–${lastFinal} final`, N >= cur && open ? `week ${cur} ${thru === 'end' ? 'as projected' : liveWord()}` : null,
+        N > cur ? `weeks ${cur + 1}–${N}: each team’s best lineup by Sleeper’s projections, the numbers the playoff odds use` : null].filter(Boolean).join(' · ');
+    return h('div', { class: 'rcwrap' },
+        controls,
+        h('div', { class: 'rchd' }, h('b', null, tt), h('span', { class: 'dim' }, ts)),
+        h('div', { class: 'rcbody' }, plot, h('div', null, legend, out)),
+        h('div', { class: 'cap', style: 'margin-top:8px' }, foot, N > lastFinal ? ', dashed' : '', ' · point at a line or a name to follow that team.',
+            thru === 'end' && !ready ? [' ', h('span', { class: 'spin' }), ' Reading the rest of the season’s projections…'] : null));
+}
 
 function lgSettingsTab() {
     const st = S.league.settings || {}, rp = rosterPositions();

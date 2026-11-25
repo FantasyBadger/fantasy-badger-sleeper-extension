@@ -500,6 +500,7 @@
 
 /* ── mirrored matchup ── */
 .bl table.mu { table-layout: fixed; width: 100%; }
+.bl table.mu td { vertical-align: top; }   /* each row reads straight across its first line: name, points, position, points, name; the extra lines hang below (the user, 2026-11-22) */
 .bl .mu td.me { text-align: left; } .bl .mu td.op { text-align: right; }
 .bl .mu td.slotc { text-align: center; width: 58px; }
 .bl .mu td.ptsL { text-align: right; font-family: var(--mono); width: 62px; font-variant-numeric: tabular-nums; }
@@ -510,27 +511,26 @@
 .bl .mu .nm { font-weight: 800; cursor: pointer; display: flex; align-items: center; gap: 5px; white-space: nowrap; }
 .bl .mu td.op .nm { justify-content: flex-end; }
 
-/* a starter who will not play: a red rail in the outer margin and his number in
-   red. The type is untouched — the marker sits where the eye can run down it. */
+/* a starter who will not play: his number in red, and his half of the row marked the way an empty slot is (below).
+   The type is untouched, and so is the face: the marker sits where the eye can run down it. */
 .bl .mu td.me, .bl .mu td.op { position: relative; }
 /* the face beside the name, as tall as its three lines, ringed by his game's clock */
 .bl .mu .mucell { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }   /* the face sits level with the name and game lines; the stat lines run on under it */
 .bl .mu .mucell.r { justify-content: flex-end; }
 .bl .mu .mutx { min-width: 0; flex: 0 1 auto; }
 .bl .mu .mutx .nm { min-width: 0; } .bl .mu .mutx .nm > * { flex: none; }
-.bl .mu .mutx .nm > .mnm { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }   /* the name gives way, never the chips */
-/* as tall as the name and game lines, not the stat line too (the user, 2026-10-25) */
+.bl .mu .mutx .nm > .mnm { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }   /* the name gives way, never the chips (and becomes "W. Robinson" before it is cut) */
+/* his position and team, a line of their own under the name (the user, 2026-11-23) */
+.bl .mu .mupos { font: 600 10.5px var(--mono); color: var(--ink-3); line-height: 1.35; white-space: nowrap; }
+.bl .mu .mupos .posl { margin-right: 4px; }
+/* as tall as the name and the line under it (his position, since 2026-11-23), not the lines below too (the user, 2026-10-25) */
 .bl .cface { position: relative; width: 34px; height: 34px; flex: none; display: grid; place-items: center; }
 .bl .cface svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .bl .cface img { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; background: var(--card-2); }
 .bl .cface .cftrack { stroke: var(--line); stroke-width: 3; }
 .bl .cface .cfarc { stroke-width: 3; stroke-linecap: round; }
 .bl .cface .cfarc.me { stroke: var(--teal); } .bl .cface .cfarc.op { stroke: var(--blue); }
-.bl .mu td.me.np { padding-left: 16px; }
-.bl .mu td.op.np { padding-right: 16px; }
-.bl .mu td.me.np::before, .bl .mu td.op.np::before { content: ''; position: absolute; top: 5px; bottom: 5px; width: 3px; background: var(--red); }
-.bl .mu td.me.np::before { left: 0; border-radius: 0 2px 2px 0; }
-.bl .mu td.op.np::before { right: 0; border-radius: 2px 0 0 2px; }
+.bl .cface .cfwait { stroke: var(--ink-3); stroke-width: 2; }   /* his game is still to come: colour is for a game being played */
 .bl .mu td.ptsL.np, .bl .mu td.ptsR.np { color: var(--red); }
 .bl .mu .nm:hover { color: var(--teal); }
 .bl .mu .sub { font-size: 10.5px; color: var(--ink-3); font-family: var(--mono); white-space: normal; line-height: 1.35; }   /* a long stat line wraps instead of running under the score */
@@ -830,7 +830,7 @@
    the chart keeps an axis and a legible width, and the card ends up shorter
    than the old hero with its bar. Under 900px they stack. */
 /* S3v3: the stacked bug — one keeled block per team */
-.bl .mscard { align-self: stretch; display: flex; flex-direction: column; justify-content: center; gap: 11px; }   /* the two hero cards share a row height; the shorter centres in it */
+.bl .mscard { align-self: stretch; display: flex; flex-direction: column; justify-content: space-between; gap: 9px; }   /* the two hero cards share a row height: the state row stays level with the curve card's title, the rail at the bottom */
 .bl .tmblk { border-left: 2px solid var(--teal); padding-left: 11px; min-width: 0; }
 .bl .tmblk.b { border-left-color: var(--blue, #5b9cf5); }
 .bl .tmblk .tline { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
@@ -846,13 +846,14 @@
 .bl .mgseg.liveb { border-color: rgba(91,156,245,0.45); }
 .bl .wsc { margin-left: auto; padding-left: 4px; font: 600 9px var(--mono); color: var(--ink-3); white-space: nowrap; flex: none; font-variant-numeric: tabular-nums; }
 .bl .mgseg.livea .wsc, .bl .mgseg.liveb .wsc { color: var(--ink); }
-.bl .mgproj { margin-left: 6px; font-size: 10px; color: var(--ink-3); white-space: nowrap; flex: none; min-width: 56px; text-align: right; }
+.bl .mgproj { margin-left: 6px; font-size: 10px; color: var(--ink-3); white-space: nowrap; flex: none; width: 74px; text-align: right; }   /* one width with the rail's .mlamp, so the window names sit over their boxes */
 .bl .mgproj b { color: var(--ink); font-weight: 700; }
+.bl .mgproj.off, .bl .mlamp.off { width: 0; margin-left: 0; }   /* before kickoff and once final there is no projection: the windows take the room */
 .bl .mgrail { display: flex; align-items: center; gap: 3px; padding-left: 13px; }
 .bl .mgrail .wins { display: flex; gap: 3px; flex: 1; min-width: 0; }
 .bl .mgrail .wl { font: 600 8px var(--mono); letter-spacing: 0.07em; color: var(--ink-3); min-width: 0; overflow: hidden; white-space: nowrap; }
 .bl .mgrail .wl.on { color: var(--ink); }
-.bl .mlamp { font: 800 9px var(--mono); letter-spacing: 0.08em; color: var(--ink); flex: none; min-width: 56px; text-align: right; margin-left: 6px; }
+.bl .mlamp { font: 800 9px var(--mono); letter-spacing: 0.08em; color: var(--ink); flex: none; width: 74px; text-align: right; margin-left: 6px; }
 .bl .mwpcard { align-self: stretch; display: flex; flex-direction: column; justify-content: center; }
 .bl .mhero.compact { display: block; }
 .bl .mleft { padding-left: 16px;  display: grid; grid-template-columns: 1fr auto 1fr; gap: 16px; align-items: center; padding: 2px 4px 2px 0; }
@@ -889,8 +890,8 @@
 .bl .pttail { fill: none; stroke-width: 1.4; stroke-dasharray: 3 3; opacity: 0.7; vector-effect: non-scaling-stroke; }
 .bl .pttail.a { stroke: var(--teal); } .bl .pttail.b { stroke: var(--blue); }
 .bl .ptbox { position: relative; }
-.bl .ptlab { position: absolute; right: 2px; transform: translateY(-100%); font: 600 8.5px var(--mono); line-height: 1; padding-bottom: 3px; pointer-events: none; }
-.bl .ptlab.below { transform: none; padding: 3px 0 0; }
+/* a final's label sits ON its tail's end, on the card's own colour, so no line runs through the digits */
+.bl .ptlab { position: absolute; right: 0; transform: translateY(-50%); font: 600 8.5px var(--mono); line-height: 1; padding: 2px 0 2px 4px; background: var(--card); pointer-events: none; }
 .bl .ptlab.a { color: var(--teal); } .bl .ptlab.b { color: var(--blue); }
 .bl .ptdot { stroke: var(--card); stroke-width: 2; } .bl .ptdot.a { fill: var(--teal); } .bl .ptdot.b { fill: var(--blue); }
 .bl .ptring { fill: none; stroke-width: 1.5; opacity: 0.8; } .bl .ptring.a { stroke: var(--teal); } .bl .ptring.b { stroke: var(--blue); }
@@ -956,8 +957,12 @@
 .bl table.plog tr.a td.lgp { box-shadow: inset 2px 0 0 rgba(32,206,184,0.45); }
 .bl table.plog tr.b td.lgp { box-shadow: inset 2px 0 0 rgba(91,156,245,0.45); }
 .bl table.plog tr.maj td { background: rgba(232,176,75,0.045); }
-.bl .seg.lseg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 99px; overflow: hidden; }
+/* The side filter and Big swings sit on one line, centred and the same height: the generic .seg rule pins a
+   control to the top with a bottom margin, which left this one riding above the toggle beside it. */
+.bl .seg.lseg { display: inline-flex; align-self: center; margin: 0; border: 1px solid var(--line-2); border-radius: 99px; overflow: hidden; }
 .bl .seg.lseg span { font-size: 9.5px; font-weight: 800; padding: 3px 10px; color: var(--ink-3); cursor: pointer; }
+.bl .seg.lseg > span { display: inline-flex; align-items: center; box-sizing: border-box; height: 20px; padding-block: 0; }
+.bl .card-h .tog { display: inline-flex; align-items: center; box-sizing: border-box; height: 22px; padding-block: 0; }
 .bl .seg.lseg span.on { background: var(--card-2); color: var(--teal); }
 .bl .tog { font-size: 9.5px; font-weight: 800; padding: 3px 10px; border-radius: 99px; border: 1px solid var(--line-2); color: var(--ink-3); cursor: pointer; white-space: nowrap; }
 .bl .tog.on { border-color: var(--amber); color: var(--amber); background: rgba(232,176,75,0.1); }
@@ -972,13 +977,15 @@
 .bl .mu td.mustack.np .big { color: var(--red); }
 
 /* an empty starting slot is a guaranteed zero you can still fix — shade only
-   the half of the row that owns it */
-.bl .mu td.emptyslot { background: rgba(239,90,90,0.07); }
-.bl .mu td.me.emptyslot { box-shadow: inset 3px 0 0 var(--red); }
-.bl .mu td.op.emptyslot { box-shadow: inset -3px 0 0 var(--red); }
+   the half of the row that owns it. A player who will not play is the same zero, so
+   he gets the same look: the faint shade over his name and points, the line at the
+   outer edge, drawn inside the cell so his face keeps the row's own edge (the user,
+   2026-11-23: room carved out for a separate rail set his face 9px in) */
+.bl .mu td.emptyslot, .bl .mu td.np { background: rgba(239,90,90,0.07); }
+.bl .mu td.me.emptyslot, .bl .mu td.me.np { box-shadow: inset 3px 0 0 var(--red); }
+.bl .mu td.op.emptyslot, .bl .mu td.op.np { box-shadow: inset -3px 0 0 var(--red); }
 .bl .mu .nm.warn { color: var(--red); font-weight: 800; }
 .bl .mu .sub.warn { color: var(--amber); }
-/* and a starter who will produce nothing keeps the rail he already had */
 .bl .mu td.mustack.np .big { color: var(--red); }
 
 /* ── playoff picture (Home) ─────────────────────────────────────────────── */
@@ -1140,6 +1147,18 @@
 .bl .shteam { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .bl .shseed { font: 700 10px var(--mono); color: var(--ink-3); width: 15px; text-align: right; flex: none; }
 .bl .shseed.in { color: var(--teal); } .bl .shseed.bye { color: var(--teal); font-weight: 800; }
+/* the race in a letter beside the seed, the sports page's way (the user, 2026-11-24): green for clinched and red for
+   eliminated, the one place those two mark a state rather than a direction, so the letter and the key under the
+   table always say it as well */
+.bl .shmk { font: 700 11px var(--mono); width: 12px; flex: none; text-align: center; color: var(--ink-3); }
+.bl .shmk.m-x, .bl .shmk.m-y, .bl .shmk.m-z { color: var(--green); }
+.bl .shmk.m-e { color: var(--red); }
+.bl .shkey .shmk { display: inline; width: auto; }
+/* the Magic # cell's words: eliminated in its letter's red; a second line, when there is one, in quiet type under it */
+.bl .mgk { display: inline-grid; justify-items: end; line-height: 1.2; }
+.bl .mgk .w { font-size: 11.5px; }
+.bl .mgk .s { font: 600 11px var(--mono); color: var(--ink-3); }
+.bl .mgk.c-e .w { color: var(--red); }
 .bl .shnm { font-weight: 700; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* micro-visualisations, at the size they appear in a row */
 .bl .spark, .bl .whisk, .bl .dumb { display: block; margin-left: auto; }
@@ -1148,21 +1167,6 @@
 .bl .heat { display: inline-flex; gap: 2px; }
 .bl .heat i { width: 7px; height: 14px; border-radius: 2px; display: block; background: var(--card-2); }
 .bl .heat i.w { background: rgba(32,206,184,.75); } .bl .heat i.l { background: rgba(239,90,90,.55); }
-/* verdicts: one line of English per team, fired by a threshold */
-.bl .vchip { font: 800 9px var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 2px 6px;
-  border-radius: 4px; background: var(--card-2); color: var(--ink-2); white-space: nowrap; }
-.bl .vchip.v-paperChampion { background: rgba(91,156,245,.15); color: var(--blue); }
-.bl .vchip.v-highwire, .bl .vchip.v-gauntlet, .bl .vchip.v-triggerHappy { background: rgba(232,176,75,.15); color: var(--amber); }
-.bl .vchip.v-boomBust { background: rgba(189,102,255,.15); color: var(--k); }
-.bl .vchip.v-metronome { background: rgba(32,206,184,.15); color: var(--teal); }
-.bl .vchip.v-selfInflicted, .bl .vchip.v-robbed { background: rgba(239,90,90,.15); color: var(--red); }
-.bl .vchip.v-freeRide, .bl .vchip.v-theCeiling { background: rgba(79,196,108,.15); color: var(--green); }
-.bl .vchip.v-oneAndDone { background: rgba(91,156,245,.15); color: var(--blue); }
-.bl .verds { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin: 10px 0 0; }
-.bl .verd { background: var(--card-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
-.bl .verd:hover { border-color: var(--line-2); }
-.bl .verd .vteam { font-weight: 800; font-size: 13.5px; margin: 5px 0 2px; }
-.bl .verd .vwhy { font-size: 12px; color: var(--ink-2); line-height: 1.45; }
 
 /* ── claim drawer: the move priced over two horizons ── */
 /* Every rule scoped under .twoup/.byeline: .val and .sub are both live class
@@ -1373,8 +1377,10 @@
 .bl .s6cell:hover { border-color: var(--line-2); }
 .bl .s6cell.me { border-color: rgba(32, 206, 184, 0.45); }
 .bl .s6top { display: flex; align-items: baseline; gap: 8px; min-height: 12px; }
-.bl .s6you { font-size: 8.5px; font-weight: 800; letter-spacing: 0.08em; color: var(--teal); }
-.bl .s6tag { margin-left: auto; font-size: 8.5px; font-weight: 800; letter-spacing: 0.08em; color: var(--ink-3); }
+/* the state leads, top left; while the game is on, the PROJ and ACT heads sit over their columns */
+.bl .s6tl { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.bl .s6you { font-size: 11px; font-weight: 800; letter-spacing: 0.06em; color: var(--teal); }
+.bl .s6tag { font-size: 11px; font-weight: 800; letter-spacing: 0.06em; color: var(--ink-3); white-space: nowrap; }
 .bl .s6tag.live { color: var(--red); }
 .bl .s6tag.fin { color: var(--ink-2); }
 .bl .s6tr { display: grid; grid-template-columns: 34px 24px minmax(0, 1fr) auto; column-gap: 7px; align-items: center; padding: 2px 0; }
@@ -1385,8 +1391,29 @@
 .bl .s6nm.lo { color: var(--ink-2); font-weight: 700; }
 .bl .s6sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10.5px; color: var(--ink-3); line-height: 1.3; }
 .bl .s6sub b { color: var(--ink-2); font-weight: 700; }
+.bl .s6sub .s6rec { color: var(--ink-2); font-weight: 700; }
 .bl .s6sc { font-size: 16px; font-weight: 700; text-align: right; min-width: 50px; font-variant-numeric: tabular-nums; }
 .bl .s6sc.lo { color: var(--ink-3); font-weight: 500; }
+.bl .s6cell.pjc .s6top { display: grid; grid-template-columns: minmax(0, 1fr) 46px 54px; column-gap: 7px; }
+.bl .s6cell.pjc .s6tr { grid-template-columns: 34px 24px minmax(0, 1fr) 46px 54px; }
+.bl .s6ch { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; color: var(--ink-3); text-align: right; }
+/* the projected final: smaller and greyer than the score, the team projected ahead one shade lighter */
+.bl .s6pj { font-size: 11.5px; font-weight: 500; text-align: right; color: var(--ink-3); font-variant-numeric: tabular-nums; padding-top: 3px; }
+.bl .s6pj.lead { color: var(--ink-2); font-weight: 600; }
+/* the game's chance over time: faces say which way is whose, the plot runs the week */
+.bl .s6wp { display: grid; grid-template-columns: 17px minmax(0, 1fr); column-gap: 6px; margin-top: 7px; }
+.bl .s6ends { display: flex; flex-direction: column; justify-content: space-between; padding: 2px 0; }
+.bl .s6plot { position: relative; height: 52px; border-radius: 6px; background: rgba(15, 19, 27, 0.55); overflow: hidden; }
+.bl .s6plot svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.bl .s6wmid { stroke: var(--line-2); stroke-width: 1; stroke-dasharray: 4 4; vector-effect: non-scaling-stroke; }
+.bl .s6line { fill: none; stroke-width: 1.75; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.bl .s6dot { position: absolute; width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border-radius: 50%; background: var(--ink); box-shadow: 0 0 0 2px var(--card-2); }
+.bl .s6dot.me { background: var(--teal); } .bl .s6dot.op { background: var(--blue); }
+.bl .s6key { position: absolute; display: flex; align-items: center; gap: 6px; padding: 1px 6px; border-radius: 4px; font: 600 11px var(--mono); color: var(--ink-3); white-space: nowrap; background: rgba(15, 19, 27, 0.72); }
+.bl .s6key b { color: var(--ink); font-weight: 700; }
+.bl .s6key img { width: 14px; height: 14px; border-radius: 50%; object-fit: cover; }
+.bl .s6key .s6ar { color: var(--line-2); }
+.bl .s6wait { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--ink-3); }
 /* the chyron: a lower third, full-bleed to the cell's edges */
 .bl .chy { display: flex; align-items: stretch; margin: 7px -11px -8px; height: 26px; background: #121722; border-top: 1px solid var(--line); font-size: 11.5px; }
 .bl .chybug { display: flex; align-items: center; gap: 5px; padding: 0 9px 0 7px; flex: none; font-size: 9.5px; font-weight: 800; letter-spacing: 0.07em; color: var(--ink); background: #1b2232; white-space: nowrap; }
@@ -1930,6 +1957,9 @@
 
 /* Scoreboard switch row: Matchups · NFL games, a breadcrumb and stepper on a game, My matchup at the right */
 .bl .swrap.mswitch { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 10px; }
+/* it stays on screen under the top bar as the page scrolls (the user, 2026-11-22); the strip between them is painted in the
+   page's ground, so nothing scrolls through the gap, and a soft shadow lifts it off what passes beneath */
+.bl .swrap.mswitch { position: sticky; top: calc(var(--bar-h, 56px) + 8px); z-index: 30; box-shadow: 0 -8px 0 0 var(--bg), 0 10px 18px -10px rgba(0, 0, 0, 0.6); }
 .bl .mtabs { display: inline-flex; align-items: center; background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 99px; padding: 3px; flex: none; }
 .bl .mtabs span { padding: 5px 14px; border-radius: 99px; font-weight: 800; font-size: 13px; color: var(--ink-2); cursor: pointer; white-space: nowrap; }
 .bl .mtabs span:hover { color: var(--ink); }
@@ -1953,6 +1983,8 @@
 .bl .mmine .mmst.live { color: var(--red); }
 .bl .mmine.on { background: var(--teal); color: var(--teal-ink); cursor: default; }
 .bl .mmine.on .mmst { color: var(--teal-ink); opacity: .75; }
+/* LIVE stays red on the lit button too, on a dark chip of its own: red on the teal fill is about 1.7:1, on the chip about 6:1 */
+.bl .mmine.on .mmst.live { color: var(--red); opacity: 1; background: var(--teal-ink); border-radius: 99px; padding: 1px 7px; }
 @media (max-width: 1100px) { .bl .crumbpick { max-width: 260px; } .bl .mmine .mmlab { display: none; } }
 
 /* Play log: side filters and headers carry the avatar and an ellipsis, not a sliced name */
@@ -1987,7 +2019,7 @@
    and the chyron bleeds to the edges with its own background, so it hid the
    ring along the bottom. An outline paints above them. */
 .bl .s6cell.view { border-color: transparent; outline: 2px solid var(--ink); outline-offset: -2px; }
-.bl .s6view { font-size: 8.5px; font-weight: 800; letter-spacing: 0.08em; color: var(--ink); background: var(--card); border-radius: 3px; padding: 0 5px; }
+.bl .s6view { font-size: 11px; font-weight: 800; letter-spacing: 0.06em; color: var(--ink); background: var(--card); border-radius: 3px; padding: 0 5px; }
 
 /* the gauge: position pucks, plain windows, totals in points */
 .bl .wpk2 { display: inline-flex; flex: none; align-items: center; justify-content: center; min-width: 22px; height: 18px; padding: 0 4px; border-radius: 4px; font: 700 11px var(--mono); color: var(--teal-ink); cursor: default; }
@@ -2591,7 +2623,7 @@
 /* A guide line and a dot on the chart; the moment's numbers in the card's own
    rows; the play in the strip under the chart, which keeps its height either way. */
 .bl .ptbox .wfoot { min-height: 24px; align-items: center; }
-.bl .wpcatch { position: absolute; left: 0; top: 0; width: 100%; height: 118px; cursor: crosshair; touch-action: pan-y; }
+.bl .wpcatch { position: absolute; left: 0; top: 0; width: 100%; height: 88px; cursor: crosshair; touch-action: pan-y; }   /* the chart's own height (wpChart's H), so pointing below it reaches the rows */
 .bl .wpcatch:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 4px; }
 .bl .wpguide { position: absolute; top: 0; width: 0; border-left: 1px dashed rgba(230,235,242,.6); pointer-events: none; }
 .bl .wphdot { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; border: 2px solid var(--card); pointer-events: none; }
@@ -2628,6 +2660,10 @@
 @media (prefers-reduced-motion: reduce) { .bl .lvsw .tg::after { transition: none; } }
 .bl .lvres { display: inline-flex; align-items: center; gap: 3px; margin-left: 6px; font: 700 11px var(--mono); color: var(--ink-2); border: 1px solid var(--line-2); border-radius: 4px; padding: 0 4px; vertical-align: 1px; }
 .bl .lvres i { width: 5px; height: 5px; border-radius: 50%; background: var(--red); }
+/* the week's result as a tinted chip, the letter in its colour; a tie keeps the grey outline */
+.bl .lvres.res-w, .bl .lvres.res-l { border-color: transparent; }
+.bl .lvres.res-w { color: var(--green); background: color-mix(in srgb, var(--green) 16%, transparent); }
+.bl .lvres.res-l { color: var(--red); background: color-mix(in srgb, var(--red) 16%, transparent); }
 .bl .lvsub { display: block; font: 500 11px var(--mono); color: var(--ink-3); }
 .bl .lvmv { display: inline-block; flex: none; width: 24px; font: 700 11px var(--mono); white-space: nowrap; } .bl .lvmv.up { color: var(--green); } .bl .lvmv.dn { color: var(--red); }
 .bl .sdrow { display: inline-flex; align-items: center; gap: 3px; } .bl .sdrow .lvmv { width: 20px; text-align: left; }
@@ -2641,7 +2677,23 @@
 .bl .lvcap b { color: var(--ink-2); }
 .bl .cap.seednote { margin-top: 8px; font-size: 12px; color: var(--ink-3); }
 .bl .mwpcard > .card-h, .bl .mscard > .card-h { align-items: center; margin-bottom: 8px; }
+.bl .mscard > .card-h.mshd { min-height: 20px; margin-bottom: 0; }   /* the state's row: no taller than its tag */
 .bl .mwpcard > .card-h .wlens { margin-left: auto; font-size: 11px; border-radius: 6px; } .bl .mwpcard > .card-h .wlens span { padding: 3px 9px; }
+/* The curve card's title row is one line in every lens: the title never wraps, and the lens switch and the copy
+   button are both 24px tall on the title's centre (the button rode 2px high and stood 2px taller) */
+.bl .mwpcard > .card-h { flex-wrap: nowrap; }
+.bl .mwpcard > .card-h h3 { white-space: nowrap; }
+.bl .mwpcard > .card-h .wlens { box-sizing: border-box; height: 24px; }
+.bl .mwpcard > .card-h .wlens span { display: inline-flex; align-items: center; padding-block: 0; }
+.bl .mwpcard > .cpy { top: 14px; }
+/* the narrowest the card gets (360px, a 1121px window) still fits the row with the switch a size down; the query
+   reads the content width: 36px kept for the copy button + the longest title 113 + 10 + the switch 206 = 365 */
+.bl .mwpcard { container-type: inline-size; }
+@container (max-width: 364px) {
+  .bl .mwpcard > .card-h { gap: 8px; }
+  .bl .mwpcard > .card-h .wlens { font-size: 10px; }
+  .bl .mwpcard > .card-h .wlens span { padding-inline: 5px; }
+}
 
 /* the standings sheet by division: each division's name over its rows */
 .bl .shtbl tr.secrow td { text-align: left; padding: 7px 10px; background: var(--bg); border-top: 1px solid var(--line-2); border-bottom: 1px solid var(--line-2); font: 800 11px var(--sans); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-2); cursor: default; }
@@ -2652,7 +2704,10 @@
 /* A section tab switches everything below it; a pill filters inside a section. Bigger
    type on a rule, the open section underlined in teal. */
 .bl .lgcard > .card-h.lgtabs { align-items: flex-end; border-bottom: 1px solid var(--line-2); margin-bottom: 14px; gap: 14px; flex-wrap: nowrap; }
-.bl .ptabs { display: flex; gap: 24px; flex: 1; min-width: 0; overflow-x: auto; }
+/* scrolls sideways when the tabs outrun a narrow card, never up and down: the open tab's underline hangs 1px past the
+   bar, and overflow-x alone made that pixel a vertical scroll, which drew a scrollbar wherever scrollbars always show
+   (Windows) and in a copied card (2026-11-24). Hidden, the underline looks as it always has. */
+.bl .ptabs { display: flex; gap: 24px; flex: 1; min-width: 0; overflow-x: auto; overflow-y: hidden; }
 .bl .ptabs button { all: unset; cursor: pointer; white-space: nowrap; padding: 4px 2px 10px; font: 800 15px var(--sans); color: var(--ink-3); border-bottom: 2px solid transparent; margin-bottom: -1px; }
 .bl .ptabs button:hover { color: var(--ink-2); }
 .bl .ptabs button.on { color: var(--ink); border-bottom-color: var(--teal); }
@@ -2749,24 +2804,35 @@
 
 /* ── the league in a rail beside the page, wherever the page has two columns (the user, 2026-10-25: first "D", the
    rail on wide windows only, then "keep it on the side in this view, but hide the Score now column from play log").
-   Stacked, the League strip and the matchup picker stay and the rail is hidden. ── */
+   Stacked, down to 861px, the slim rail stays beside the single column (the user, 2026-11-22: "would love to still
+   have the side rail league's score bugs at this width"); narrower than that, the League strip and the matchup
+   picker come back and the rail is hidden. ── */
 .bl .murail { display: none; }
 @media (min-width: 1600px) { .bl .page.matchup.mtabbed { grid-template-columns: 204px minmax(0, 1.5fr) minmax(0, 1fr); } }
-/* narrower, the play log gives up Score now and its column narrows, so Head to head keeps its names */
-@media (min-width: 1121px) and (max-width: 1599px) {
-  .bl .page.matchup.mtabbed { grid-template-columns: 84px minmax(0, 1.7fr) minmax(0, 1fr); }
-  /* the slim rail: each team its avatar and score (the name in the tooltip), the state under the pair. Measured at
-     1280: Head to head 713px and 11 of 30 names shortened (738 and 7 with the strip), the play text as wide as today */
+/* the slim rail: each team its avatar and score (the name in the tooltip), the state under the pair. Measured at
+   1280: Head to head 713px and 11 of 30 names shortened (738 and 7 with the strip), the play text as wide as today */
+@media (min-width: 861px) and (max-width: 1599px) {
   .bl .page.matchup.mtabbed .murail .ram { justify-content: center; text-align: center; padding: 9px 6px; font-size: 12px; line-height: 1.25; } .bl .page.matchup.mtabbed .murail .ram span { display: none; }
   .bl .page.matchup.mtabbed .murail h4 { padding: 9px 4px 3px; text-align: center; letter-spacing: .04em; }
   .bl .page.matchup.mtabbed .murail .rmg { padding: 7px 8px; }
   .bl .page.matchup.mtabbed .murail .rmt { grid-template-columns: 22px minmax(0, 1fr); gap: 6px; } .bl .page.matchup.mtabbed .murail .rmt .nm { display: none; } .bl .page.matchup.mtabbed .murail .rmt .sc { text-align: right; font-size: 12px; }
   .bl .page.matchup.mtabbed .murail .rms { padding-left: 0; text-align: center; } .bl .page.matchup.mtabbed .murail .rms .rpc { display: none; }
+}
+/* narrower, the play log gives up Score now and its column narrows, so Head to head keeps its names */
+@media (min-width: 1121px) and (max-width: 1599px) {
+  .bl .page.matchup.mtabbed { grid-template-columns: 84px minmax(0, 1.7fr) minmax(0, 1fr); }
   .bl .page.matchup.mtabbed .plcard table.plog col:nth-child(3), .bl .page.matchup.mtabbed .plcard table.plog tr > :nth-child(3) { display: none; }
 }
-@media (min-width: 1121px) {
+@media (min-width: 861px) {
   .bl .page.matchup.mtabbed > .wallcard, .bl .page.matchup.mtabbed .mswitch .mcrumb { display: none; }
-  .bl .page.matchup.mtabbed > .murail { display: block; grid-column: 1; grid-row: 2 / span 5; align-self: start; position: sticky; top: calc(var(--bar-h, 56px) + 12px); }
+  .bl .page.matchup.mtabbed > .murail { display: block; grid-column: 1; grid-row: 2 / span 5; align-self: start; position: sticky; top: calc(var(--bar-h, 56px) + 8px + var(--sw-h, 52px) + 12px); }   /* below the sticky switch row */
+}
+/* stacked beside the rail: every card in the one column to its right, in page order; the switch row spans both */
+@media (min-width: 861px) and (max-width: 1120px) {
+  .bl .page.matchup.mtabbed { grid-template-columns: 84px minmax(0, 1fr); }
+  .bl .page.matchup.mtabbed > :not(.murail):not(.mswitch) { grid-column: 2; }
+}
+@media (min-width: 1121px) {
   .bl .page.matchup.mtabbed > .mutabs { grid-column: 2 / 4; grid-row: 2; }
   .bl .page.matchup.mtabbed > .mscard { grid-column: 2; grid-row: 3; } .bl .page.matchup.mtabbed > .mwpcard { grid-column: 3; grid-row: 3; }
   .bl .page.matchup.mtabbed > .mumir { grid-column: 2; grid-row: 4 / span 2; } .bl .page.matchup.mtabbed > .plcard { grid-column: 3; grid-row: 4 / span 2; }
@@ -2903,3 +2969,54 @@
 .bl .pctf .tiprog { margin: 0; } .bl .pctf .tipl { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; } .bl .pctf .tipl .mono { color: var(--ink-3); font-size: 11px; }
 .bl .pctf .tipb { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; } .bl .pctf .tipb i { display: block; height: 100%; border-radius: 3px; background: var(--teal); transition: width .4s ease; }
 @media (prefers-reduced-motion: reduce) { .bl .pctf .tipb i { transition: none; } }
+
+/* ── the points race: Standings › View › Points race ─────────────────────────────────────────────
+   Focus and context: you in teal, one team in focus in white, the rest grey; one scale for every line. */
+.bl .rcrow { margin: 2px 0 8px; }
+.bl .rchd { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; margin: 4px 0 6px; }
+.bl .rchd b { font-size: 14px; font-weight: 800; }
+.bl .rchd .dim { font-size: 12px; }
+.bl .rcbody { display: grid; grid-template-columns: minmax(0, 1fr) 272px; gap: 14px; align-items: start; }
+@media (max-width: 900px) { .bl .rcbody { grid-template-columns: minmax(0, 1fr); } }
+.bl .rcplot { position: relative; min-width: 0; }
+.bl .rcsvg { display: block; width: 100%; height: auto; overflow: visible; }
+.bl .rcax { font: 600 11px var(--mono); fill: var(--ink-3); }
+.bl .rcgrid { stroke: var(--line); stroke-width: 1; }
+.bl .rczero { stroke: var(--line-2); stroke-width: 1.25; }
+.bl .rcproj { fill: rgba(163, 174, 193, 0.06); }
+.bl .rcprojl { font: 700 10.5px var(--mono); letter-spacing: 0.04em; fill: var(--ink-3); }
+.bl .rcband { fill: rgba(230, 235, 242, 0.09); }
+.bl .rcbandv { font: 700 11px var(--mono); fill: var(--ink); }
+.bl .rcbandk { font: 600 11px var(--sans); fill: var(--ink-3); }
+.bl .rcbandv, .bl .rcbandk, .bl .rclab { paint-order: stroke; stroke: var(--card); stroke-width: 3px; stroke-linejoin: round; }   /* a halo, so a label stays readable over the lines */
+.bl .rcln { fill: none; stroke: #3d485f; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.bl .rcln.fut { stroke-dasharray: 4 4; }
+.bl .rcln.me { stroke: var(--teal); stroke-width: 2.5; }
+.bl .rcln.fo { stroke: var(--ink); stroke-width: 2.5; }
+.bl .rchit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: pointer; }
+.bl .rcdot { stroke: var(--card); stroke-width: 2; } .bl .rcdot.me { fill: var(--teal); } .bl .rcdot.fo { fill: var(--ink); }
+.bl .rclab { font: 700 11px var(--sans); } .bl .rclab.me { fill: var(--teal); } .bl .rclab.fo { fill: var(--ink); }
+.bl .rclab .v { font: 600 11px var(--mono); fill: var(--ink-3); }
+.bl .rcguide { stroke: var(--ink-3); stroke-width: 1; }
+.bl .rctip { position: absolute; z-index: 3; pointer-events: none; min-width: 190px; padding: 7px 9px; border: 1px solid var(--line-2); border-radius: 8px; background: #0b0f16; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4); font-size: 12px; }
+.bl .rctip .h { font: 700 11px var(--mono); letter-spacing: 0.04em; color: var(--ink-3); margin-bottom: 4px; }
+.bl .rctip .r { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; gap: 6px; align-items: center; line-height: 1.55; }
+.bl .rctip .p { font: 600 11px var(--mono); color: var(--ink-3); text-align: right; }
+.bl .rctip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.bl .rctip .v { font: 600 11.5px var(--mono); color: var(--ink-2); text-align: right; }
+.bl .rctip .r.me .n, .bl .rctip .r.me .v { color: var(--teal); } .bl .rctip .r.fo .n, .bl .rctip .r.fo .v { color: var(--ink); }
+.bl .rcleg { display: grid; gap: 1px; }
+.bl .rclh, .bl .rcrw { display: grid; grid-template-columns: 22px 18px minmax(0, 1fr) auto; gap: 7px; align-items: center; }
+.bl .rclh { font: 700 11px var(--mono); letter-spacing: 0.05em; color: var(--ink-3); padding: 0 6px 4px; }
+.bl .rcrw { padding: 4px 6px; border-radius: 6px; cursor: default; outline: none; }
+.bl .rcrw:hover, .bl .rcrw.fo, .bl .rcrw:focus-visible { background: var(--card-2); }
+.bl .rcrw:focus-visible { box-shadow: 0 0 0 2px var(--teal); }
+.bl .rcrw .rk { font: 600 11px var(--mono); color: var(--ink-3); text-align: right; }
+.bl .rcrw .nmw { display: flex; align-items: baseline; min-width: 0; }
+.bl .rcrw .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 700; color: var(--ink-2); }
+.bl .rcrw.me .nm { color: var(--teal); } .bl .rcrw.fo .nm { color: var(--ink); }
+.bl .rcrw .v { font: 600 11.5px var(--mono); color: var(--ink-2); text-align: right; font-variant-numeric: tabular-nums; }
+.bl .rcseat { flex: none; white-space: nowrap; margin-left: 5px; padding: 0 4px; border: 1px solid var(--line-2); border-radius: 4px; font: 700 11px var(--mono); letter-spacing: 0.04em; color: var(--ink-3); }
+.bl .rcseat.pts { color: var(--teal-ink); background: var(--ink-2); border-color: var(--ink-2); }
+.bl .rcout { margin-top: 8px; padding: 7px 9px; border-radius: 8px; background: var(--card-2); color: var(--ink-3); font-size: 12px; line-height: 1.5; }
+.bl .rcout b { color: var(--ink-2); } .bl .rcout b.teal { color: var(--teal); }

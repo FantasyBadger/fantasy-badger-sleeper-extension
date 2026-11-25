@@ -7,6 +7,23 @@
 // say adds none and rides under the latest one.
 globalThis.BADGER_NOTES = [
     {
+        v: '2026.11.25', when: 'November 25, 2026', title: 'Magic numbers, and who has clinched or is out',
+        items: [
+            '<b>Playoffs</b> in League › Standings has a <b>Magic #</b> column: how many more wins put each team in, whatever else happens. It says <b>clinched</b> once a team is in, <b>needs help</b> when winning out is not enough on its own, and <b>eliminated</b> when no seat is left. Your own number is on your standings line.',
+            'A letter beside the seed on every standings view and on Home’s standings: green <b>x</b> clinched a seat, <b>y</b> clinched the division, <b>z</b> clinched a bye, red <b>e</b> eliminated. The key is under the table.',
+            'With <b>Week N as projected</b> switched on, the Playoffs view counts this week at its projected finals too: the odds, the magic numbers, the seeds and what next week is worth.',
+            '<b>Points race</b>, a new standings view: every team’s points for, week by week, as points behind first, place in points or against the league average, up to today or on to the end of the season by Sleeper’s projections.',
+            'The Scoreboard’s game cards show <b>PROJ</b> beside <b>ACT</b>, the game’s state at the top left, each side’s chance to win through the week in a strip, and each team’s record, place and players still to play.',
+            'Your matchup’s score card starts with the game’s state (LIVE, players to play, or FINAL) where its title was, and its row is shorter.',
+            'Head to head: a face is ringed in colour only while his game is on, and grey before kickoff. Each row lines up along its first line, position and team sit on a line of their own under the name, and a name too long for its space becomes an initial and surname.',
+            'A starter who won’t play is marked the way an empty slot is, and his face stays in line with everyone else’s.',
+            'On a narrower window the league’s other games stay beside yours in the slim rail, and the row with <b>Matchups</b> and <b>NFL games</b> stays in view as you scroll.',
+            'D/ST points in the play by play now match Sleeper’s on fumbles, blocked kicks and return touchdowns.',
+            'The standings no longer put tags such as “boom-bust” after team names; the Luck and Manager skill views carry those numbers.',
+            'Tabs no longer show a stray scrollbar on Windows or in a copied card.',
+        ],
+    },
+    {
         v: '2026.10.31', when: 'October 31, 2026', title: 'Trade for a player, right from his card',
         items: [
             'A player on another team has <b>Trade for him</b> on his card: the best offers his team comes out even on or gains from, each with what it does to your playoff odds and a <b>Propose</b> button.',
